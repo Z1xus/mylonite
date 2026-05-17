@@ -58,6 +58,24 @@ export function storePassphrase(app: App, settings: MyloniteSettings, passphrase
   settings.passphraseStorage = "plugin-data";
 }
 
+export function clearDevicePrivateKey(app: App, settings: MyloniteSettings): void {
+  const storage = secretStorage(app);
+  if (storage) {
+    storage.setSecret("mylonite-device-key", "");
+  }
+  settings.devicePrivateKeyHex = "";
+  settings.devicePrivateKeyStorage = "none";
+}
+
+export function clearPassphrase(app: App, settings: MyloniteSettings): void {
+  const storage = secretStorage(app);
+  if (storage) {
+    storage.setSecret("mylonite-vault-passphrase", "");
+  }
+  settings.passphraseDevelopmentFallback = "";
+  settings.passphraseStorage = "none";
+}
+
 export function loadDevicePairingPrivateKey(app: App, settings: MyloniteSettings): string {
   const storage = secretStorage(app);
   if (storage) {

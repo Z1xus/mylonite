@@ -11,7 +11,9 @@ import {
   randomHex,
 } from "./crypto";
 import {
+  clearDevicePrivateKey,
   clearDevicePairingPrivateKey,
+  clearPassphrase,
   loadDevicePairingPrivateKey,
   loadDevicePrivateKey,
   loadPassphrase,
@@ -206,6 +208,31 @@ export default class MylonitePlugin extends Plugin {
 
   async restoreLatestSnapshot(): Promise<void> {
     await this.syncEngine.restoreLatestSnapshot();
+  }
+
+  async unpairDevice(): Promise<void> {
+    const confirmed = window.confirm("Unpair this device from Mylonite? Local sync credentials will be removed from this Obsidian vault.");
+    if (!confirmed) {
+      return;
+    }
+    this.syncEngine.close();
+    clearDevicePrivateKey(this.app, this.settings);
+    clearDevicePairingPrivateKey(this.app, this.settings);
+    clearPassphrase(this.app, this.settings);
+    this.settings.vaultId = "";
+    this.settings.vaultSaltHex = "";
+    this.settings.deviceId = "";
+    this.settings.devicePublicKeyHex = "";
+    this.settings.pairingToken = "";
+    this.settings.devicePairingRequest = "";
+    this.settings.devicePairingResponse = "";
+    this.settings.lamport = 0;
+    this.settings.lastServerSeq = 0;
+    this.settings.pendingOps = [];
+    this.vaultKeys = null;
+    await this.saveSettings();
+    this.updateStatus("unpaired");
+    new Notice("Mylonite unpaired on this device.");
   }
 
   updateStatus(state: string): void {

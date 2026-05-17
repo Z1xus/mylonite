@@ -53,6 +53,7 @@ type MyloniteSettingsPlugin = Plugin & {
   completeDevicePairing(): Promise<void>;
   createSnapshot(): Promise<void>;
   restoreLatestSnapshot(): Promise<void>;
+  unpairDevice(): Promise<void>;
 };
 
 export class MyloniteSettingTab extends PluginSettingTab {
@@ -109,6 +110,17 @@ export class MyloniteSettingTab extends PluginSettingTab {
           .setButtonText("Restore")
           .onClick(async () => {
             await this.plugin.restoreLatestSnapshot();
+          }));
+
+      new Setting(containerEl)
+        .setName("Unpair this device")
+        .setDesc("Remove local Mylonite credentials and stop syncing this Obsidian vault.")
+        .addButton((button) => button
+          .setButtonText("Unpair")
+          .setWarning()
+          .onClick(async () => {
+            await this.plugin.unpairDevice();
+            this.display();
           }));
 
       new Setting(containerEl)
