@@ -14,8 +14,33 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    outputs:
+      server: ${{ steps.filter.outputs.server }}
+      plugin: ${{ steps.filter.outputs.plugin }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            server:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'server/**'
+              - 'crates/**'
+              - '.github/workflows/ci.yml'
+            plugin:
+              - 'plugin/**'
+              - '.github/workflows/ci.yml'
+
   server:
     name: Server
+    needs: changes
+    if: needs.changes.outputs.server == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -41,6 +66,8 @@ jobs:
 
   plugin:
     name: Plugin
+    needs: changes
+    if: needs.changes.outputs.plugin == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -51,7 +78,9 @@ jobs:
 
       - uses: actions/cache@v4
         with:
-          path: ~/.bun/install/cache
+          path: |
+            ~/.bun/install/cache
+            plugin/node_modules
           key: bun-${{ runner.os }}-${{ hashFiles('plugin/bun.lock') }}
           restore-keys: |
             bun-${{ runner.os }}-

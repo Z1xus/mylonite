@@ -1,0 +1,9 @@
+FROM debian:trixie-slim
+RUN useradd --system --create-home --home-dir /var/lib/mylonite mylonite
+COPY dist/mylonite-x86_64-unknown-linux-gnu /usr/local/bin/mylonite
+RUN chmod 755 /usr/local/bin/mylonite
+USER mylonite
+WORKDIR /var/lib/mylonite
+EXPOSE 9821
+ENTRYPOINT ["/usr/local/bin/mylonite"]
+CMD ["serve", "--config", "/etc/mylonite/config.toml"]

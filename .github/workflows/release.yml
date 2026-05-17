@@ -32,7 +32,9 @@ jobs:
 
       - uses: actions/cache@v4
         with:
-          path: ~/.bun/install/cache
+          path: |
+            ~/.bun/install/cache
+            plugin/node_modules
           key: bun-${{ runner.os }}-${{ hashFiles('plugin/bun.lock') }}
           restore-keys: |
             bun-${{ runner.os }}-
@@ -100,13 +102,6 @@ jobs:
             . -> target
           key: ${{ matrix.target }}
 
-      - name: Test server
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          cargo fmt --check
-          cargo clippy -p mylonite --all-targets -- -D warnings
-          cargo test -p mylonite
-
       - name: Build server
         run: cargo build --release -p mylonite --target ${{ matrix.target }}
 
@@ -123,9 +118,15 @@ jobs:
 
   docker:
     name: Docker
+    needs: server
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: mylonite-x86_64-unknown-linux-gnu
+          path: dist
 
       - uses: docker/setup-buildx-action@v3
 
@@ -146,6 +147,7 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: .
+          file: Dockerfile.release
           push: ${{ startsWith(github.ref, 'refs/tags/') }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
