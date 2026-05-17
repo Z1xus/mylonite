@@ -14,6 +14,7 @@ use tokio::time::{Duration, timeout};
 use tracing::warn;
 
 use super::{ApiError, AppState, auth::verify_ws_challenge_signature, validation};
+use crate::storage::EncryptedOpRecord;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct WsQuery {
@@ -80,6 +81,11 @@ async fn handle_socket(state: AppState, vault_id: String, device_id: String, soc
                             break;
                         }
                     }
+                    Ok(frame) if frame.kind == ClientMsgKind::OpPush as u8 => {
+                        if let Err(error) = append_pushed_op(&state, &vault_id, &device_id, &frame.payload) {
+                            warn!(?error, "websocket op push rejected");
+                        }
+                    }
                     Ok(_) => {
                         warn!("unsupported websocket client message");
                     }
@@ -94,6 +100,44 @@ async fn handle_socket(state: AppState, vault_id: String, device_id: String, soc
             }
         }
     }
+}
+
+fn append_pushed_op(
+    state: &AppState,
+    vault_id: &str,
+    authenticated_device_id: &str,
+    payload: &[u8],
+) -> Result<(), ApiError> {
+    if payload.len() > state.max_op_json_body_bytes {
+        return Err(ApiError(anyhow::anyhow!(
+            "request body exceeds configured JSON size limit"
+        )));
+    }
+    let request: super::routes::AppendOpRequest = serde_json::from_slice(payload)?;
+    validation::validate_op_request(&request, state.max_op_ciphertext_bytes)?;
+    if request.device_id != authenticated_device_id {
+        return Err(ApiError(anyhow::anyhow!(
+            "request body device id does not match websocket device"
+        )));
+    }
+    let mut op = EncryptedOpRecord {
+        vault_id: vault_id.to_string(),
+        server_seq: 0,
+        client_op_id: request.client_op_id,
+        device_id: request.device_id,
+        lamport: request.lamport,
+        kind: request.kind,
+        key_version: request.key_version,
+        nonce_hex: request.nonce_hex,
+        ciphertext_hex: request.ciphertext_hex,
+        accepted_at_unix: 0,
+    };
+    let append = state.storage.append_op(op.clone())?;
+    op.server_seq = append.server_seq;
+    if append.inserted {
+        let _ = state.op_broadcast.send(op);
+    }
+    Ok(())
 }
 
 async fn authenticate_socket(

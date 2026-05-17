@@ -1,13 +1,18 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { TFile } from "obsidian";
 import {
+  MARKDOWN_DEBOUNCE_MS,
+  SyncEngine,
   parseWebSocketChallenge,
   racedPaths,
   retainUnflushedPendingOps,
   validateRemoteOpRecord,
   validateRemotePayload,
   validateSnapshotRecord,
+  webSocketReconnectDelay,
 } from "./sync-engine";
 import { PendingEncryptedOp } from "./sync-types";
+import { ServerMsgKind, encodeFrame } from "./protocol";
 
 describe("pending op queue", () => {
   it("keeps the failed op and later queued ops after a flush failure", () => {
@@ -22,6 +27,150 @@ describe("sync race detection", () => {
     const localPaths = new Set(["Notes/a.md", "assets/image.png"]);
 
     expect(racedPaths(["Notes\\a.md", "other.md"], localPaths)).toEqual(["Notes/a.md"]);
+  });
+});
+
+describe("markdown debounce", () => {
+  beforeEach(() => {
+    vi.stubGlobal("window", globalThis);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("pushes one markdown update after the debounce delay and resets on repeated edits", () => {
+    vi.useFakeTimers();
+    const engine = new SyncEngine(testHost());
+    const pushMarkdownUpdate = vi.fn().mockResolvedValue(undefined);
+    (engine as unknown as { pushMarkdownUpdate: typeof pushMarkdownUpdate }).pushMarkdownUpdate = pushMarkdownUpdate;
+    const file = testFile("Notes/a.md", "md");
+
+    callPrivate(engine, "scheduleMarkdownUpdate", file);
+    vi.advanceTimersByTime(MARKDOWN_DEBOUNCE_MS - 1);
+    callPrivate(engine, "scheduleMarkdownUpdate", file);
+    vi.advanceTimersByTime(MARKDOWN_DEBOUNCE_MS - 1);
+
+    expect(pushMarkdownUpdate).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(1);
+
+    expect(pushMarkdownUpdate).toHaveBeenCalledTimes(1);
+    expect(pushMarkdownUpdate).toHaveBeenCalledWith(file);
+  });
+
+  it("flushes scheduled markdown updates when the engine closes", () => {
+    vi.useFakeTimers();
+    const engine = new SyncEngine(testHost());
+    const pushMarkdownUpdate = vi.fn().mockResolvedValue(undefined);
+    (engine as unknown as { pushMarkdownUpdate: typeof pushMarkdownUpdate }).pushMarkdownUpdate = pushMarkdownUpdate;
+    const file = testFile("Notes/a.md", "md");
+
+    callPrivate(engine, "scheduleMarkdownUpdate", file);
+    engine.close();
+    vi.runAllTimers();
+
+    expect(pushMarkdownUpdate).toHaveBeenCalledTimes(1);
+    expect(pushMarkdownUpdate).toHaveBeenCalledWith(file);
+  });
+});
+
+describe("websocket reconnect", () => {
+  beforeEach(() => {
+    vi.stubGlobal("window", globalThis);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("uses bounded reconnect delays", () => {
+    expect([0, 1, 2, 3, 4, 99].map(webSocketReconnectDelay)).toEqual([1_000, 2_000, 5_000, 15_000, 15_000, 15_000]);
+  });
+
+  it("reconnects after socket close while started", () => {
+    vi.useFakeTimers();
+    const sockets: MockWebSocket[] = [];
+    vi.stubGlobal("WebSocket", class extends MockWebSocket {
+      constructor(url: string) {
+        super(url);
+        sockets.push(this);
+      }
+    });
+    const engine = new SyncEngine(testHost());
+
+    engine.start();
+    expect(sockets).toHaveLength(1);
+
+    sockets[0].onclose?.({} as CloseEvent);
+    vi.advanceTimersByTime(999);
+    expect(sockets).toHaveLength(1);
+
+    vi.advanceTimersByTime(1);
+    expect(sockets).toHaveLength(2);
+  });
+
+  it("does not reconnect after explicit close", () => {
+    vi.useFakeTimers();
+    const sockets: MockWebSocket[] = [];
+    vi.stubGlobal("WebSocket", class extends MockWebSocket {
+      constructor(url: string) {
+        super(url);
+        sockets.push(this);
+      }
+    });
+    const engine = new SyncEngine(testHost());
+
+    engine.start();
+    engine.close();
+    vi.advanceTimersByTime(15_000);
+
+    expect(sockets).toHaveLength(1);
+  });
+});
+
+describe("websocket gap repair", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("runs catch-up instead of directly applying a broadcast when a sequence gap is detected", async () => {
+    const host = testHost();
+    host.settings.lastServerSeq = 3;
+    const engine = new SyncEngine(host);
+    const catchUp = vi.fn().mockResolvedValue(undefined);
+    const applyRemoteOp = vi.fn().mockResolvedValue(undefined);
+    (engine as unknown as { catchUp: typeof catchUp; applyRemoteOp: typeof applyRemoteOp }).catchUp = catchUp;
+    (engine as unknown as { applyRemoteOp: typeof applyRemoteOp }).applyRemoteOp = applyRemoteOp;
+
+    await callPrivate(engine, "handleSocketMessage", opBroadcast({ server_seq: 5 }));
+
+    expect(catchUp).toHaveBeenCalledTimes(1);
+    expect(applyRemoteOp).not.toHaveBeenCalled();
+    expect(host.settings.lastServerSeq).toBe(3);
+  });
+
+  it("applies the next contiguous live broadcast directly", async () => {
+    const host = testHost();
+    host.settings.lastServerSeq = 3;
+    host.settings.pendingOps = [testOp("a".repeat(64))];
+    const engine = new SyncEngine(host);
+    const catchUp = vi.fn().mockResolvedValue(undefined);
+    const applyRemoteOp = vi.fn().mockResolvedValue(undefined);
+    (engine as unknown as { catchUp: typeof catchUp; applyRemoteOp: typeof applyRemoteOp }).catchUp = catchUp;
+    (engine as unknown as { applyRemoteOp: typeof applyRemoteOp }).applyRemoteOp = applyRemoteOp;
+
+    await callPrivate(engine, "handleSocketMessage", opBroadcast({ server_seq: 4, lamport: 8 }));
+
+    expect(catchUp).not.toHaveBeenCalled();
+    expect(applyRemoteOp).toHaveBeenCalledTimes(1);
+    expect(host.settings.lastServerSeq).toBe(4);
+    expect(host.settings.lamport).toBe(8);
+    expect(host.settings.pendingOps).toEqual([]);
   });
 });
 
@@ -122,4 +271,71 @@ function testSnapshot() {
     ciphertext_hex: "11".repeat(32),
     created_at_unix: 123,
   };
+}
+
+function testHost() {
+  return {
+    app: {
+      vault: {
+        getFiles: () => [],
+        on: vi.fn(),
+      },
+    },
+    settings: {
+      serverUrl: "https://example.test",
+      vaultId: "vault-a",
+      deviceId: "d" + "1".repeat(32),
+      lastServerSeq: 0,
+      lamport: 0,
+      pendingOps: [],
+      debugLogging: false,
+    },
+    createApiClient: () => ({
+      websocketUrl: () => "wss://example.test/ws",
+      listOps: vi.fn().mockResolvedValue([]),
+    }),
+    debug: vi.fn(),
+    loadVaultKeys: vi.fn(),
+    registerEvent: vi.fn(),
+    registerInterval: vi.fn(),
+    saveSettings: vi.fn().mockResolvedValue(undefined),
+    updateStatus: vi.fn(),
+  } as unknown as ConstructorParameters<typeof SyncEngine>[0];
+}
+
+function testFile(path: string, extension: string): TFile {
+  const file = Object.create(TFile.prototype) as TFile & { path: string; extension: string };
+  file.path = path;
+  file.extension = extension;
+  return file;
+}
+
+function callPrivate<T>(target: unknown, name: string, ...args: unknown[]): T {
+  return (target as Record<string, (...args: unknown[]) => T>)[name](...args);
+}
+
+function opBroadcast(overrides: Partial<ReturnType<typeof testBroadcastOp>> = {}): ArrayBuffer {
+  const op = { ...testBroadcastOp(), ...overrides };
+  const encoded = encodeFrame({
+    kind: ServerMsgKind.OpBroadcast,
+    flags: 0,
+    payload: new TextEncoder().encode(JSON.stringify(op)),
+  });
+  return encoded.buffer.slice(encoded.byteOffset, encoded.byteOffset + encoded.byteLength) as ArrayBuffer;
+}
+
+class MockWebSocket {
+  binaryType: BinaryType = "blob";
+  onclose: ((event: CloseEvent) => void) | null = null;
+  onerror: ((event: Event) => void) | null = null;
+  onmessage: ((event: MessageEvent<ArrayBuffer>) => void) | null = null;
+  onopen: ((event: Event) => void) | null = null;
+
+  constructor(readonly url: string) {}
+
+  close(): void {
+    this.onclose?.({} as CloseEvent);
+  }
+
+  send(): void {}
 }

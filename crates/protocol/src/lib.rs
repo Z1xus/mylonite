@@ -135,6 +135,16 @@ mod tests {
     }
 
     #[test]
+    fn websocket_sync_kind_numbers_are_stable() {
+        assert_eq!(ClientMsgKind::Hello as u8, 1);
+        assert_eq!(ClientMsgKind::OpPush as u8, 3);
+        assert_eq!(ClientMsgKind::Ping as u8, 9);
+        assert_eq!(super::ServerMsgKind::HelloAck as u8, 2);
+        assert_eq!(super::ServerMsgKind::OpBroadcast as u8, 4);
+        assert_eq!(super::ServerMsgKind::Pong as u8, 10);
+    }
+
+    #[test]
     fn decode_rejects_invalid_magic() {
         let mut encoded = Frame::new(ClientMsgKind::Ping as u8, 0, Vec::new())
             .encode()

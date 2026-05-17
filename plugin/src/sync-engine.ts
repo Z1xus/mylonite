@@ -18,6 +18,10 @@ import {
 } from "./yjs-markdown";
 
 const OP_PAGE_SIZE = 512;
+export const MARKDOWN_DEBOUNCE_MS = 75;
+export const OFFLINE_POLL_INTERVAL_MS = 15_000;
+export const LIVE_POLL_INTERVAL_MS = 60_000;
+export const WEBSOCKET_RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 15_000] as const;
 
 export interface SyncEngineHost extends Plugin {
   settings: MyloniteSettings;
@@ -32,23 +36,32 @@ export class SyncEngine {
   private readonly suppressedPaths = new Set<string>();
   private readonly locallyDirtyPaths = new Set<string>();
   private readonly pendingOpPaths = new Map<string, string[]>();
-  private readonly modifyTimers = new Map<string, number>();
+  private readonly modifyTimers = new Map<string, { file: TFile; timer: number }>();
   private readonly ydoc = new Y.Doc();
   private readonly ytree = this.ydoc.getMap<Y.Map<unknown>>("tree");
   private socket: WebSocket | null = null;
+  private reconnectTimer: number | null = null;
+  private reconnectAttempt = 0;
+  private socketLive = false;
+  private manuallyClosed = false;
+  private lastPeriodicCatchUpAt = 0;
   private started = false;
 
   constructor(private readonly host: SyncEngineHost) {}
 
   start(): void {
+    this.manuallyClosed = false;
     if (!this.started) {
       this.registerVaultEvents();
       this.host.registerInterval(window.setInterval(() => {
+        if (!this.shouldRunPeriodicCatchUp(Date.now())) {
+          return;
+        }
         void this.catchUp().catch((error) => {
           this.host.updateStatus("catch-up error");
           this.host.debug(`poll failed: ${String(error)}`);
         });
-      }, 15_000));
+      }, OFFLINE_POLL_INTERVAL_MS));
       this.host.debug(`initial visible files: ${this.host.app.vault.getFiles().length}`);
       this.started = true;
     }
@@ -60,6 +73,10 @@ export class SyncEngine {
   }
 
   close(): void {
+    this.manuallyClosed = true;
+    this.flushScheduledMarkdownUpdates();
+    this.clearReconnectTimer();
+    this.socketLive = false;
     this.socket?.close();
     this.socket = null;
   }
@@ -220,11 +237,7 @@ export class SyncEngine {
     if (!this.host.settings.vaultId || !this.host.settings.deviceId) {
       return;
     }
-    const pendingModify = this.modifyTimers.get(normalizedPath);
-    if (pendingModify !== undefined) {
-      window.clearTimeout(pendingModify);
-      this.modifyTimers.delete(normalizedPath);
-    }
+    this.clearScheduledMarkdownUpdate(normalizedPath);
     if (this.suppressedPaths.delete(normalizedPath)) {
       this.host.debug(`suppressed remote delete echo ${normalizedPath}`);
       return;
@@ -251,11 +264,7 @@ export class SyncEngine {
       return;
     }
     for (const path of [normalizedOldPath, normalizedNewPath]) {
-      const pendingModify = this.modifyTimers.get(path);
-      if (pendingModify !== undefined) {
-        window.clearTimeout(pendingModify);
-        this.modifyTimers.delete(path);
-      }
+      this.clearScheduledMarkdownUpdate(path);
     }
     if (this.suppressedPaths.delete(normalizedNewPath) || this.suppressedPaths.delete(normalizedOldPath)) {
       this.host.debug(`suppressed remote rename echo ${normalizedOldPath} -> ${normalizedNewPath}`);
@@ -289,8 +298,13 @@ export class SyncEngine {
     const normalizedChangedPaths = changedPaths.map((path) => normalizeVaultPath(path));
     this.pendingOpPaths.set(op.client_op_id, normalizedChangedPaths);
     try {
-      await this.host.createApiClient().appendOp(this.host.settings.vaultId, op);
-      this.clearDirtyPathsForOp(op.client_op_id);
+      if (this.canPushOpOverWebSocket()) {
+        this.queuePendingOp(op);
+        this.sendWebSocketOpPush(op);
+      } else {
+        await this.host.createApiClient().appendOp(this.host.settings.vaultId, op);
+        this.clearDirtyPathsForOp(op.client_op_id);
+      }
     } catch (error) {
       this.host.settings.pendingOps.push(op);
       this.host.debug(`queued op ${op.client_op_id}: ${String(error)}`);
@@ -323,9 +337,10 @@ export class SyncEngine {
   }
 
   private connectWebSocket(): void {
-    if (!this.host.settings.vaultId || !this.host.settings.deviceId || this.socket) {
+    if (this.manuallyClosed || !this.host.settings.vaultId || !this.host.settings.deviceId || this.socket) {
       return;
     }
+    this.clearReconnectTimer();
     try {
       const socket = new WebSocket(this.host.createApiClient().websocketUrl(this.host.settings.vaultId));
       socket.binaryType = "arraybuffer";
@@ -337,13 +352,20 @@ export class SyncEngine {
         });
       };
       socket.onclose = () => {
+        this.socketLive = false;
         this.socket = null;
         this.host.updateStatus("offline polling");
+        this.scheduleWebSocketReconnect();
       };
-      socket.onerror = () => this.host.updateStatus("live sync error");
+      socket.onerror = () => {
+        this.socketLive = false;
+        this.host.updateStatus("live sync error");
+        socket.close();
+      };
       this.socket = socket;
     } catch (error) {
       this.host.debug(`websocket connect failed: ${String(error)}`);
+      this.scheduleWebSocketReconnect();
     }
   }
 
@@ -354,6 +376,8 @@ export class SyncEngine {
       return;
     }
     if (frame.kind === ServerMsgKind.HelloAck) {
+      this.reconnectAttempt = 0;
+      this.socketLive = true;
       this.host.updateStatus("live");
       return;
     }
@@ -365,9 +389,15 @@ export class SyncEngine {
     if (op.server_seq <= this.host.settings.lastServerSeq) {
       return;
     }
+    if (op.server_seq > this.host.settings.lastServerSeq + 1) {
+      await this.catchUp();
+      return;
+    }
     await this.applyRemoteOp(op);
     this.host.settings.lastServerSeq = Math.max(this.host.settings.lastServerSeq, op.server_seq);
     this.host.settings.lamport = Math.max(this.host.settings.lamport, op.lamport);
+    this.clearDirtyPathsForOp(op.client_op_id);
+    this.removePendingOp(op.client_op_id);
     await this.host.saveSettings();
   }
 
@@ -384,12 +414,27 @@ export class SyncEngine {
     this.socket.send(bytes.buffer);
   }
 
+  private canPushOpOverWebSocket(): boolean {
+    return this.socketLive && this.socket?.readyState === WebSocket.OPEN;
+  }
+
+  private sendWebSocketOpPush(op: PendingEncryptedOp): void {
+    if (!this.socket) {
+      throw new Error("websocket is not connected");
+    }
+    const payload = new TextEncoder().encode(JSON.stringify(op));
+    const frame = encodeFrame({ kind: ClientMsgKind.OpPush, flags: 0, payload });
+    const bytes = new Uint8Array(frame.byteLength);
+    bytes.set(frame);
+    this.socket.send(bytes.buffer);
+  }
+
   private scheduleMarkdownUpdate(file: TFile): void {
     const path = normalizeVaultPath(file.path);
     this.locallyDirtyPaths.add(path);
     const existing = this.modifyTimers.get(path);
     if (existing !== undefined) {
-      window.clearTimeout(existing);
+      window.clearTimeout(existing.timer);
     }
     const timer = window.setTimeout(() => {
       this.modifyTimers.delete(path);
@@ -397,8 +442,58 @@ export class SyncEngine {
         this.host.updateStatus("sync error");
         this.host.debug(`push failed: ${String(error)}`);
       });
-    }, 750);
-    this.modifyTimers.set(path, timer);
+    }, MARKDOWN_DEBOUNCE_MS);
+    this.modifyTimers.set(path, { file, timer });
+  }
+
+  private clearScheduledMarkdownUpdate(path: string): void {
+    const pendingModify = this.modifyTimers.get(path);
+    if (pendingModify === undefined) {
+      return;
+    }
+    window.clearTimeout(pendingModify.timer);
+    this.modifyTimers.delete(path);
+  }
+
+  private flushScheduledMarkdownUpdates(): void {
+    const pending = Array.from(this.modifyTimers.entries());
+    this.modifyTimers.clear();
+    for (const [, { file, timer }] of pending) {
+      window.clearTimeout(timer);
+      void this.pushMarkdownUpdate(file).catch((error) => {
+        this.host.updateStatus("sync error");
+        this.host.debug(`flush before close failed: ${String(error)}`);
+      });
+    }
+  }
+
+  private shouldRunPeriodicCatchUp(now: number): boolean {
+    const interval = this.socketLive ? LIVE_POLL_INTERVAL_MS : OFFLINE_POLL_INTERVAL_MS;
+    if (now - this.lastPeriodicCatchUpAt < interval) {
+      return false;
+    }
+    this.lastPeriodicCatchUpAt = now;
+    return true;
+  }
+
+  private scheduleWebSocketReconnect(): void {
+    if (this.manuallyClosed || !this.started || !this.host.settings.vaultId || !this.host.settings.deviceId || this.reconnectTimer !== null) {
+      return;
+    }
+    const delay = webSocketReconnectDelay(this.reconnectAttempt);
+    this.reconnectAttempt += 1;
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connectWebSocket();
+    }, delay);
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer === null) {
+      return;
+    }
+    window.clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
   }
 
   private async applyRemoteOp(op: EncryptedOpRecord): Promise<void> {
@@ -440,6 +535,17 @@ export class SyncEngine {
       this.locallyDirtyPaths.delete(path);
     }
     this.pendingOpPaths.delete(clientOpId);
+  }
+
+  private queuePendingOp(op: PendingEncryptedOp): void {
+    if (this.host.settings.pendingOps.some((pending) => pending.client_op_id === op.client_op_id)) {
+      return;
+    }
+    this.host.settings.pendingOps.push(op);
+  }
+
+  private removePendingOp(clientOpId: string): void {
+    this.host.settings.pendingOps = this.host.settings.pendingOps.filter((op) => op.client_op_id !== clientOpId);
   }
 
   private updateMarkdownYjs(path: string, content: string): string {
@@ -515,6 +621,10 @@ export class SyncEngine {
     }
     return decryptBlobEnvelope(keys, this.host.settings.vaultId, entry.blobId, blobBytes);
   }
+}
+
+export function webSocketReconnectDelay(attempt: number): number {
+  return WEBSOCKET_RECONNECT_DELAYS_MS[Math.min(attempt, WEBSOCKET_RECONNECT_DELAYS_MS.length - 1)];
 }
 
 export function retainUnflushedPendingOps(pendingOps: PendingEncryptedOp[], firstFailedIndex: number): PendingEncryptedOp[] {
