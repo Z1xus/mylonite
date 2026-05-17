@@ -93,9 +93,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.85.0
         with:
-          toolchain: 1.85.0
           targets: ${{ matrix.target }}
 
       - uses: mozilla-actions/sccache-action@v0.0.10

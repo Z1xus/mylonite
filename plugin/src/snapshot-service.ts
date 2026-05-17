@@ -5,6 +5,8 @@ import { VaultKeys, randomHex } from "./crypto";
 import { decryptSnapshot, encryptBlob, encryptSnapshot } from "./sync-codec";
 import { SnapshotBinaryEntry, SnapshotEntry, SnapshotPayload } from "./sync-types";
 import { applyBinaryUpsert, applyMarkdownUpsert, normalizeVaultPath } from "./vault-adapter";
+import { VaultStateIndex } from "./state-index";
+import { hashBytes, hashText, newFileId, VaultStateSnapshot } from "./sync-state";
 
 export interface EncryptedSnapshotUpload {
   snapshotId: string;
@@ -18,22 +20,31 @@ export async function createEncryptedSnapshot(
   vaultId: string,
   coversThroughSeq: number,
   putBlob: (blobId: string, bytes: Uint8Array) => Promise<void>,
+  state?: VaultStateSnapshot,
 ): Promise<EncryptedSnapshotUpload> {
   const entries: SnapshotEntry[] = [];
+  const index = VaultStateIndex.fromSnapshot(state);
   for (const file of vault.getFiles()) {
     const path = normalizeVaultPath(file.path, "invalid snapshot path");
     if (file.extension === "md") {
-      entries.push({ kind: "markdown", path, content: await vault.read(file) });
+      const content = await vault.read(file);
+      const contentHash = hashText(content);
+      const fileId = index.byPath(path)?.fileId ?? newFileId();
+      entries.push({ kind: "markdown", path, fileId, contentHash, content });
       continue;
     }
     const bytes = new Uint8Array(await vault.readBinary(file as TFile));
     const { blobId, envelope } = encryptBlob(keys, vaultId, bytes);
     await putBlob(blobId, envelope);
-    entries.push({ kind: "binary", path, blobId, size: bytes.byteLength });
+    entries.push({ kind: "binary", path, fileId: index.byPath(path)?.fileId ?? newFileId(), contentHash: hashBytes(bytes), blobId, size: bytes.byteLength });
   }
 
   const snapshotId = randomHex(16);
-  const encrypted = encryptSnapshot(keys, vaultId, snapshotId, coversThroughSeq, { version: 1, entries });
+  const encrypted = encryptSnapshot(keys, vaultId, snapshotId, coversThroughSeq, {
+    version: 1,
+    entries,
+    state: state ?? { version: 1, files: [], tombstones: [] },
+  });
   return {
     snapshotId,
     nonceHex: encrypted.nonceHex,
@@ -49,7 +60,7 @@ export async function restoreEncryptedSnapshot(
   snapshot: SnapshotRecord,
   loadBlob: (entry: SnapshotBinaryEntry) => Promise<Uint8Array>,
   deleteMissing = false,
-): Promise<void> {
+): Promise<SnapshotPayload> {
   const payload = decryptSnapshot<SnapshotPayload>(
     keys,
     vaultId,
@@ -72,7 +83,7 @@ export async function restoreEncryptedSnapshot(
     }
   }
   if (!deleteMissing) {
-    return;
+    return payload;
   }
   for (const file of vault.getFiles()) {
     const path = normalizeVaultPath(file.path, "invalid snapshot path");
@@ -81,6 +92,7 @@ export async function restoreEncryptedSnapshot(
       await vault.delete(file);
     }
   }
+  return payload;
 }
 
 export function validateSnapshotPayload(payload: unknown): asserts payload is SnapshotPayload {

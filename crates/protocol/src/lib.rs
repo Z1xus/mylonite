@@ -33,6 +33,37 @@ pub enum ServerMsgKind {
     Error = 255,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum OpKind {
+    FileCreate = 1,
+    FileUpdate = 2,
+    FileRename = 3,
+    FileDelete = 4,
+    FileCopy = 5,
+}
+
+impl TryFrom<u8> for OpKind {
+    type Error = OpKindError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::FileCreate),
+            2 => Ok(Self::FileUpdate),
+            3 => Ok(Self::FileRename),
+            4 => Ok(Self::FileDelete),
+            5 => Ok(Self::FileCopy),
+            _ => Err(OpKindError::Unsupported(value)),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum OpKindError {
+    #[error("unsupported op kind {0}")]
+    Unsupported(u8),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub kind: u8,
@@ -124,7 +155,7 @@ impl Frame {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClientMsgKind, Frame, FrameError, HEADER_LEN, MAX_PAYLOAD_LEN};
+    use super::{ClientMsgKind, Frame, FrameError, HEADER_LEN, MAX_PAYLOAD_LEN, OpKind};
 
     #[test]
     fn frame_round_trips() {
@@ -142,6 +173,16 @@ mod tests {
         assert_eq!(super::ServerMsgKind::HelloAck as u8, 2);
         assert_eq!(super::ServerMsgKind::OpBroadcast as u8, 4);
         assert_eq!(super::ServerMsgKind::Pong as u8, 10);
+    }
+
+    #[test]
+    fn sync_op_kind_numbers_are_stable() {
+        assert_eq!(OpKind::FileCreate as u8, 1);
+        assert_eq!(OpKind::FileUpdate as u8, 2);
+        assert_eq!(OpKind::FileRename as u8, 3);
+        assert_eq!(OpKind::FileDelete as u8, 4);
+        assert_eq!(OpKind::FileCopy as u8, 5);
+        assert_eq!(OpKind::try_from(6), Err(super::OpKindError::Unsupported(6)));
     }
 
     #[test]

@@ -2,6 +2,7 @@ use super::{
     ApiError,
     routes::{AppendOpRequest, PairFirstDeviceRequest, PutSnapshotRequest, RegisterDeviceRequest},
 };
+use mylonite_protocol::OpKind;
 
 pub(super) fn validate_pairing_request(request: &PairFirstDeviceRequest) -> Result<(), ApiError> {
     validate_device_label(&request.label)?;
@@ -44,7 +45,7 @@ pub(super) fn validate_op_request(
 ) -> Result<(), ApiError> {
     validate_hex_field("client_op_id", &request.client_op_id, 64)?;
     validate_device_id(&request.device_id)?;
-    if !(1..=7).contains(&request.kind) {
+    if OpKind::try_from(request.kind).is_err() {
         return Err(ApiError(anyhow::anyhow!("invalid op kind")));
     }
     validate_key_version(request.key_version)?;
@@ -153,13 +154,14 @@ mod tests {
     use super::{
         validate_blob_id, validate_op_list_limit, validate_op_request, validate_snapshot_request,
     };
+    use mylonite_protocol::OpKind;
 
     fn valid_op_request(ciphertext_hex: &str) -> AppendOpRequest {
         AppendOpRequest {
             client_op_id: "a".repeat(64),
             device_id: format!("d{}", "b".repeat(32)),
             lamport: 1,
-            kind: 5,
+            kind: OpKind::FileUpdate as u8,
             key_version: 1,
             nonce_hex: "c".repeat(48),
             ciphertext_hex: ciphertext_hex.to_string(),

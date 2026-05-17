@@ -175,25 +175,25 @@ describe("websocket gap repair", () => {
 });
 
 describe("remote payload validation", () => {
-  it("accepts well-formed remote payloads", () => {
-    expect(() => validateRemotePayload({ kind: "markdown-upsert", path: "Notes/a.md", content: "hello" })).not.toThrow();
-    expect(() => validateRemotePayload({ kind: "yjs-update", updateHex: "00ff", changedPaths: ["Notes/a.md"] })).not.toThrow();
-    expect(() => validateRemotePayload({ kind: "blob-ref", path: "assets/a.png", blobId: "a".repeat(64), size: 12 })).not.toThrow();
-    expect(() => validateRemotePayload({ kind: "file-delete", path: "Notes/a.md" })).not.toThrow();
-    expect(() => validateRemotePayload({ kind: "file-rename", oldPath: "Notes/a.md", newPath: "Notes/b.md" })).not.toThrow();
+  it("accepts well-formed v2 remote payloads", () => {
+    expect(() => validateRemotePayload(v2Payload({ kind: "file-create", fileKind: "markdown", content: "hello" }))).not.toThrow();
+    expect(() => validateRemotePayload(v2Payload({ kind: "file-update", fileKind: "markdown", contentUpdate: "00ff" }))).not.toThrow();
+    expect(() => validateRemotePayload(v2Payload({ kind: "file-update", fileKind: "binary", blobId: "a".repeat(64), size: 12 }))).not.toThrow();
+    expect(() => validateRemotePayload(v2Payload({ kind: "file-delete", tombstoneId: "t" + "b".repeat(32) }))).not.toThrow();
+    expect(() => validateRemotePayload(v2Payload({ kind: "file-rename", oldPath: "Notes/a.md", newPath: "Notes/b.md" }))).not.toThrow();
   });
 
   it("rejects unsafe vault paths before applying remote writes", () => {
-    expect(() => validateRemotePayload({ kind: "file-delete", path: "../outside.md" })).toThrow("invalid vault path");
-    expect(() => validateRemotePayload({ kind: "markdown-upsert", path: "/absolute.md", content: "hello" })).toThrow("invalid vault path");
-    expect(() => validateRemotePayload({ kind: "file-rename", oldPath: "Notes/a.md", newPath: "Notes/../b.md" })).toThrow("invalid vault path");
+    expect(() => validateRemotePayload(v2Payload({ path: "../outside.md", kind: "file-delete", tombstoneId: "t" + "b".repeat(32) }))).toThrow("invalid vault path");
+    expect(() => validateRemotePayload(v2Payload({ path: "/absolute.md", kind: "file-create", fileKind: "markdown", content: "hello" }))).toThrow("invalid vault path");
+    expect(() => validateRemotePayload(v2Payload({ kind: "file-rename", oldPath: "Notes/a.md", newPath: "Notes/../b.md" }))).toThrow("invalid vault path");
   });
 
-  it("rejects malformed yjs and blob-ref payloads", () => {
-    expect(() => validateRemotePayload({ kind: "yjs-update", updateHex: "abc", changedPaths: ["Notes/a.md"] })).toThrow("invalid yjs update payload");
-    expect(() => validateRemotePayload({ kind: "yjs-update", updateHex: "00", changedPaths: [] })).toThrow("invalid yjs changed paths");
-    expect(() => validateRemotePayload({ kind: "blob-ref", path: "assets/a.png", blobId: "blob-a", size: 1 })).toThrow("invalid blob-ref payload blob id");
-    expect(() => validateRemotePayload({ kind: "blob-ref", path: "assets/a.png", blobId: "a".repeat(64), size: -1 })).toThrow("invalid blob-ref payload size");
+  it("rejects legacy and malformed v2 payloads", () => {
+    expect(() => validateRemotePayload({ kind: "file-update", path: "Notes/a.md" })).toThrow("unsupported remote payload version");
+    expect(() => validateRemotePayload(v2Payload({ kind: "file-update", fileKind: "markdown", contentUpdate: "abc" }))).toThrow("invalid v2 content update");
+    expect(() => validateRemotePayload(v2Payload({ kind: "file-update", fileKind: "binary", blobId: "blob-a", size: 1 }))).toThrow("invalid v2 blob id");
+    expect(() => validateRemotePayload(v2Payload({ kind: "file-update", fileKind: "binary", blobId: "a".repeat(64), size: -1 }))).toThrow("invalid v2 binary size");
   });
 });
 
@@ -273,6 +273,18 @@ function testSnapshot() {
   };
 }
 
+function v2Payload(overrides: Record<string, unknown>) {
+  return {
+    version: 2,
+    kind: "file-update",
+    fileId: "f" + "a".repeat(32),
+    path: "Notes/a.md",
+    fileKind: "markdown",
+    contentHash: "abcd",
+    ...overrides,
+  };
+}
+
 function testHost() {
   return {
     app: {
@@ -288,6 +300,11 @@ function testHost() {
       lastServerSeq: 0,
       lamport: 0,
       pendingOps: [],
+      durableSyncState: {
+        version: 1,
+        index: { version: 1, files: [], tombstones: [] },
+        journal: [],
+      },
       debugLogging: false,
     },
     createApiClient: () => ({

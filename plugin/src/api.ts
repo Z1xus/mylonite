@@ -1,4 +1,5 @@
 import { signRequest, signWebSocketChallenge } from "./crypto";
+import { OpKind } from "./protocol";
 
 export interface PairFirstDeviceResponse {
   vault_id: string;
@@ -302,7 +303,7 @@ function validateAppendOpRequest(op: AppendOpRequest): void {
   validateHexField("client op id", op.client_op_id, 64);
   validateDeviceId(op.device_id);
   validateSequence("lamport", op.lamport, 0);
-  if (!Number.isSafeInteger(op.kind) || op.kind < 1 || op.kind > 7) {
+  if (!Number.isSafeInteger(op.kind) || op.kind < OpKind.FileCreate || op.kind > OpKind.FileCopy) {
     throw new Error("invalid op kind");
   }
   validateKeyVersion(op.key_version);

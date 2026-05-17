@@ -1,6 +1,6 @@
 import { App, Plugin, PluginSettingTab, Setting } from "obsidian";
 
-import { PendingEncryptedOp } from "./sync-types";
+import { DurableSyncState, PendingEncryptedOp } from "./sync-types";
 
 export interface MyloniteSettings {
   serverUrl: string;
@@ -11,6 +11,7 @@ export interface MyloniteSettings {
   lamport: number;
   lastServerSeq: number;
   pendingOps: PendingEncryptedOp[];
+  durableSyncState: DurableSyncState;
   deviceId: string;
   devicePrivateKeyHex: string;
   devicePublicKeyHex: string;
@@ -32,6 +33,11 @@ export const DEFAULT_SETTINGS: MyloniteSettings = {
   lamport: 0,
   lastServerSeq: 0,
   pendingOps: [],
+  durableSyncState: {
+    version: 1,
+    index: { version: 1, files: [], tombstones: [] },
+    journal: [],
+  },
   deviceId: "",
   devicePrivateKeyHex: "",
   devicePublicKeyHex: "",

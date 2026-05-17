@@ -3,12 +3,22 @@ import * as Y from "yjs";
 
 import { EncryptedOpRecord, MyloniteApiClient, SnapshotRecord } from "./api";
 import { VaultKeys } from "./crypto";
-import { ClientMsgKind, ServerMsgKind, decodeFrame, encodeFrame } from "./protocol";
+import { ClientMsgKind, OpKind, ServerMsgKind, decodeFrame, encodeFrame } from "./protocol";
 import { createEncryptedSnapshot, restoreEncryptedSnapshot } from "./snapshot-service";
 import { decodeEncryptedOpPayload, decryptBlobEnvelope, encodeEncryptedOp, encryptBlob } from "./sync-codec";
-import { PendingEncryptedOp, RemoteBlobRef, RemotePayload, RemoteYjsUpdate, SnapshotBinaryEntry } from "./sync-types";
-import { applyBinaryUpsert, applyFileDelete, applyFileRename, applyMarkdownUpsert, normalizeVaultPath } from "./vault-adapter";
+import { PendingEncryptedOp, RemotePayload, RemoteV2Payload, SnapshotBinaryEntry } from "./sync-types";
+import {
+  applyBinaryUpsertWithCollision,
+  applyFileDelete,
+  applyFileRenameWithCollision,
+  applyMarkdownUpsertWithCollision,
+  normalizeVaultPath,
+} from "./vault-adapter";
 import { MyloniteSettings } from "./settings";
+import { decideRemoteV2Apply } from "./conflict-policy";
+import { LocalEventClassifier } from "./local-event-classifier";
+import { VaultStateIndex } from "./state-index";
+import { FileKind, SyncJournalEntry } from "./sync-state";
 import {
   applyMarkdownUpdate,
   encodeMarkdownDeleteUpdate,
@@ -35,7 +45,11 @@ export interface SyncEngineHost extends Plugin {
 export class SyncEngine {
   private readonly suppressedPaths = new Set<string>();
   private readonly locallyDirtyPaths = new Set<string>();
+  private readonly locallyDirtyFileIds = new Set<string>();
   private readonly pendingOpPaths = new Map<string, string[]>();
+  private readonly pendingOpFileIds = new Map<string, string[]>();
+  private stateIndex: VaultStateIndex;
+  private classifier: LocalEventClassifier;
   private readonly modifyTimers = new Map<string, { file: TFile; timer: number }>();
   private readonly ydoc = new Y.Doc();
   private readonly ytree = this.ydoc.getMap<Y.Map<unknown>>("tree");
@@ -47,7 +61,17 @@ export class SyncEngine {
   private lastPeriodicCatchUpAt = 0;
   private started = false;
 
-  constructor(private readonly host: SyncEngineHost) {}
+  constructor(private readonly host: SyncEngineHost) {
+    if (!this.host.settings.durableSyncState) {
+      this.host.settings.durableSyncState = {
+        version: 1,
+        index: { version: 1, files: [], tombstones: [] },
+        journal: [],
+      };
+    }
+    this.stateIndex = VaultStateIndex.fromSnapshot(this.host.settings.durableSyncState?.index);
+    this.classifier = new LocalEventClassifier(this.stateIndex);
+  }
 
   start(): void {
     this.manuallyClosed = false;
@@ -120,6 +144,7 @@ export class SyncEngine {
       this.host.settings.vaultId,
       this.host.settings.lastServerSeq,
       async (blobId, envelope) => this.host.createApiClient().putBlob(this.host.settings.vaultId, blobId, envelope),
+      this.stateIndex.toSnapshot(),
     );
     await this.host.createApiClient().putSnapshot(this.host.settings.vaultId, {
       snapshot_id: encrypted.snapshotId,
@@ -156,7 +181,15 @@ export class SyncEngine {
   }
 
   private registerVaultEvents(): void {
-    this.host.registerEvent(this.host.app.vault.on("create", (file) => this.host.debug(`create ${normalizePath(file.path)}`)));
+    this.host.registerEvent(this.host.app.vault.on("create", (file) => {
+      this.host.debug(`create ${normalizePath(file.path)}`);
+      if (file instanceof TFile) {
+        void this.pushFileCreate(file).catch((error) => {
+          this.host.updateStatus("sync error");
+          this.host.debug(`create push failed: ${String(error)}`);
+        });
+      }
+    }));
     this.host.registerEvent(this.host.app.vault.on("modify", (file) => {
       this.host.debug(`modify ${normalizePath(file.path)}`);
       if (file instanceof TFile) {
@@ -200,12 +233,20 @@ export class SyncEngine {
     }
     this.locallyDirtyPaths.add(normalizedPath);
     const content = await this.host.app.vault.read(file);
+    const transition = this.classifier.classifyModify({ path: normalizedPath, kind: "markdown", content });
+    this.queueTransition(transition);
     const updateHex = this.updateMarkdownYjs(normalizedPath, content);
-    await this.pushEncryptedOp(5, [normalizedPath], {
-      kind: "yjs-update",
-      updateHex,
+    await this.pushEncryptedOp(OpKind.FileUpdate, [normalizedPath], {
+      version: 2,
+      kind: "file-update",
+      fileId: transition.fileId,
+      path: normalizedPath,
+      fileKind: "markdown",
+      contentUpdate: updateHex,
       changedPaths: [normalizedPath],
-    });
+      baseHash: transition.baseHash,
+      contentHash: transition.contentHash,
+    }, [transition.fileId], transition.transitionId);
     this.host.updateStatus("synced local change");
   }
 
@@ -221,14 +262,21 @@ export class SyncEngine {
     this.locallyDirtyPaths.add(normalizedPath);
     const keys = await this.host.loadVaultKeys();
     const plaintext = new Uint8Array(await this.host.app.vault.readBinary(file));
+    const transition = this.classifier.classifyModify({ path: normalizedPath, kind: "binary", content: plaintext });
+    this.queueTransition(transition);
     const { blobId, envelope } = encryptBlob(keys, this.host.settings.vaultId, plaintext);
     await this.host.createApiClient().putBlob(this.host.settings.vaultId, blobId, envelope);
-    await this.pushEncryptedOp(4, [normalizedPath], {
-      kind: "blob-ref",
+    await this.pushEncryptedOp(OpKind.FileUpdate, [normalizedPath], {
+      version: 2,
+      kind: "file-update",
+      fileId: transition.fileId,
       path: normalizedPath,
+      fileKind: "binary",
       blobId,
       size: plaintext.byteLength,
-    });
+      baseHash: transition.baseHash,
+      contentHash: transition.contentHash,
+    }, [transition.fileId], transition.transitionId);
     this.host.updateStatus("synced binary change");
   }
 
@@ -243,17 +291,29 @@ export class SyncEngine {
       return;
     }
     this.locallyDirtyPaths.add(normalizedPath);
+    const transition = this.classifier.classifyDelete(normalizedPath, isMarkdown ? "markdown" : "binary");
+    this.queueTransition(transition);
     if (isMarkdown) {
       const updateHex = this.deleteMarkdownYjs(normalizedPath);
-      await this.pushEncryptedOp(5, [normalizedPath], {
-        kind: "yjs-update",
+      await this.pushEncryptedOp(OpKind.FileDelete, [normalizedPath], {
+        version: 2,
+        kind: "file-delete",
+        fileId: transition.fileId,
+        path: normalizedPath,
+        tombstoneId: transition.tombstoneId,
         updateHex,
         changedPaths: [normalizedPath],
-      });
+      }, [transition.fileId], transition.transitionId);
       this.host.updateStatus("synced local delete");
       return;
     }
-    await this.pushEncryptedOp(2, [normalizedPath], { kind: "file-delete", path: normalizedPath });
+    await this.pushEncryptedOp(OpKind.FileDelete, [normalizedPath], {
+      version: 2,
+      kind: "file-delete",
+      fileId: transition.fileId,
+      path: normalizedPath,
+      tombstoneId: transition.tombstoneId,
+    }, [transition.fileId], transition.transitionId);
     this.host.updateStatus("synced local delete");
   }
 
@@ -274,29 +334,44 @@ export class SyncEngine {
     this.locallyDirtyPaths.add(normalizedNewPath);
     if (file.extension === "md") {
       const content = await this.host.app.vault.read(file);
+      const transition = this.classifier.classifyRename(normalizedOldPath, { path: normalizedNewPath, kind: "markdown", content });
+      this.queueTransition(transition);
       const updateHex = this.renameMarkdownYjs(normalizedOldPath, normalizedNewPath, content);
-      await this.pushEncryptedOp(5, [normalizedOldPath, normalizedNewPath], {
-        kind: "yjs-update",
+      await this.pushEncryptedOp(OpKind.FileRename, [normalizedOldPath, normalizedNewPath], {
+        version: 2,
+        kind: "file-rename",
+        fileId: transition.fileId,
+        oldPath: normalizedOldPath,
+        newPath: normalizedNewPath,
+        path: normalizedNewPath,
         updateHex,
         changedPaths: [normalizedOldPath, normalizedNewPath],
-      });
+      }, [transition.fileId], transition.transitionId);
       this.host.updateStatus("synced local rename");
       return;
     }
-    await this.pushEncryptedOp(3, [normalizedOldPath, normalizedNewPath], {
+    const bytes = new Uint8Array(await this.host.app.vault.readBinary(file));
+    const transition = this.classifier.classifyRename(normalizedOldPath, { path: normalizedNewPath, kind: "binary", content: bytes });
+    this.queueTransition(transition);
+    await this.pushEncryptedOp(OpKind.FileRename, [normalizedOldPath, normalizedNewPath], {
+      version: 2,
       kind: "file-rename",
+      fileId: transition.fileId,
       oldPath: normalizedOldPath,
       newPath: normalizedNewPath,
-    });
+      path: normalizedNewPath,
+    }, [transition.fileId], transition.transitionId);
     this.host.updateStatus("synced local rename");
   }
 
-  private async pushEncryptedOp(kind: number, changedPaths: string[], payloadObject: object): Promise<void> {
+  private async pushEncryptedOp(kind: number, changedPaths: string[], payloadObject: object, changedFileIds: string[] = [], transitionId?: string): Promise<void> {
     const keys = await this.host.loadVaultKeys();
     const lamport = this.host.settings.lamport + 1;
     const op = encodeEncryptedOp(keys, this.host.settings.vaultId, this.host.settings.deviceId, lamport, kind, payloadObject);
     const normalizedChangedPaths = changedPaths.map((path) => normalizeVaultPath(path));
     this.pendingOpPaths.set(op.client_op_id, normalizedChangedPaths);
+    this.pendingOpFileIds.set(op.client_op_id, changedFileIds);
+    this.attachOpToTransition(transitionId, op.client_op_id);
     try {
       if (this.canPushOpOverWebSocket()) {
         this.queuePendingOp(op);
@@ -304,6 +379,7 @@ export class SyncEngine {
       } else {
         await this.host.createApiClient().appendOp(this.host.settings.vaultId, op);
         this.clearDirtyPathsForOp(op.client_op_id);
+        this.acknowledgeTransition(transitionId);
       }
     } catch (error) {
       this.host.settings.pendingOps.push(op);
@@ -311,7 +387,56 @@ export class SyncEngine {
       this.host.updateStatus("queued offline");
     }
     this.host.settings.lamport = lamport;
+    this.persistSyncState();
     await this.host.saveSettings();
+  }
+
+  private async pushFileCreate(file: TFile): Promise<void> {
+    if (!this.host.settings.vaultId || !this.host.settings.deviceId) {
+      return;
+    }
+    const normalizedPath = normalizeVaultPath(file.path);
+    if (this.suppressedPaths.delete(normalizedPath)) {
+      this.host.debug(`suppressed remote create echo ${normalizedPath}`);
+      return;
+    }
+    if (file.extension === "md") {
+      const content = await this.host.app.vault.read(file);
+      const transition = this.classifier.classifyCreate({ path: normalizedPath, kind: "markdown", content });
+      this.queueTransition(transition);
+      const updateHex = this.updateMarkdownYjs(normalizedPath, content);
+      await this.pushEncryptedOp(transition.kind === "file-copy" ? OpKind.FileCopy : OpKind.FileCreate, [normalizedPath], {
+        version: 2,
+        kind: transition.kind,
+        fileId: transition.fileId,
+        sourceFileId: transition.sourceFileId,
+        newFileId: transition.fileId,
+        path: normalizedPath,
+        fileKind: "markdown",
+        content,
+        updateHex,
+        contentHash: transition.contentHash,
+      }, [transition.fileId], transition.transitionId);
+      return;
+    }
+    const keys = await this.host.loadVaultKeys();
+    const plaintext = new Uint8Array(await this.host.app.vault.readBinary(file));
+    const transition = this.classifier.classifyCreate({ path: normalizedPath, kind: "binary", content: plaintext });
+    this.queueTransition(transition);
+    const { blobId, envelope } = encryptBlob(keys, this.host.settings.vaultId, plaintext);
+    await this.host.createApiClient().putBlob(this.host.settings.vaultId, blobId, envelope);
+    await this.pushEncryptedOp(transition.kind === "file-copy" ? OpKind.FileCopy : OpKind.FileCreate, [normalizedPath], {
+      version: 2,
+      kind: transition.kind,
+      fileId: transition.fileId,
+      sourceFileId: transition.sourceFileId,
+      newFileId: transition.fileId,
+      path: normalizedPath,
+      fileKind: "binary",
+      blobId,
+      size: plaintext.byteLength,
+      contentHash: transition.contentHash,
+    }, [transition.fileId], transition.transitionId);
   }
 
   private async flushPendingOps(): Promise<void> {
@@ -324,6 +449,7 @@ export class SyncEngine {
       try {
         await client.appendOp(this.host.settings.vaultId, op);
         this.clearDirtyPathsForOp(op.client_op_id);
+        this.acknowledgeTransitionByClientOp(op.client_op_id);
       } catch (error) {
         remaining.push(...retainUnflushedPendingOps(this.host.settings.pendingOps, index));
         this.host.debug(`pending op flush stopped: ${String(error)}`);
@@ -505,17 +631,8 @@ export class SyncEngine {
     const payload = decodeEncryptedOpPayload(keys, this.host.settings.vaultId, op) as RemotePayload;
     validateRemotePayload(payload);
     this.reportRemoteRace(remotePayloadPaths(payload));
-    if (payload.kind === "markdown-upsert") {
-      await applyMarkdownUpsert(this.host.app.vault, this.suppressedPaths, payload.path, payload.content);
-    } else if (payload.kind === "yjs-update") {
-      await this.applyYjsUpdate(payload);
-    } else if (payload.kind === "blob-ref") {
-      await this.applyBlobRef(payload);
-    } else if (payload.kind === "file-delete") {
-      await applyFileDelete(this.host.app.vault, this.suppressedPaths, payload.path);
-    } else if (payload.kind === "file-rename") {
-      await applyFileRename(this.host.app.vault, this.suppressedPaths, payload.oldPath, payload.newPath);
-    }
+    await this.applyRemoteV2Payload(payload, op.server_seq);
+    this.persistSyncState();
   }
 
   private reportRemoteRace(remotePaths: string[]): void {
@@ -534,7 +651,12 @@ export class SyncEngine {
     for (const path of paths) {
       this.locallyDirtyPaths.delete(path);
     }
+    const fileIds = this.pendingOpFileIds.get(clientOpId) ?? [];
+    for (const fileId of fileIds) {
+      this.locallyDirtyFileIds.delete(fileId);
+    }
     this.pendingOpPaths.delete(clientOpId);
+    this.pendingOpFileIds.delete(clientOpId);
   }
 
   private queuePendingOp(op: PendingEncryptedOp): void {
@@ -542,6 +664,50 @@ export class SyncEngine {
       return;
     }
     this.host.settings.pendingOps.push(op);
+  }
+
+  private queueTransition(entry: SyncJournalEntry): void {
+    this.locallyDirtyFileIds.add(entry.fileId);
+    const journal = this.host.settings.durableSyncState.journal;
+    if (!journal.some((existing) => existing.transitionId === entry.transitionId)) {
+      journal.push({ ...entry, status: "queued" });
+    }
+    this.persistSyncState();
+  }
+
+  private attachOpToTransition(transitionId: string | undefined, clientOpId: string): void {
+    if (!transitionId) {
+      return;
+    }
+    const journal = this.host.settings.durableSyncState.journal;
+    const entry = journal.find((candidate) => candidate.transitionId === transitionId);
+    if (entry) {
+      entry.clientOpId = clientOpId;
+      entry.status = "queued";
+    }
+    this.persistSyncState();
+  }
+
+  private acknowledgeTransition(transitionId: string | undefined): void {
+    if (!transitionId) {
+      return;
+    }
+    const entry = this.host.settings.durableSyncState.journal.find((candidate) => candidate.transitionId === transitionId);
+    if (entry) {
+      entry.status = "acknowledged";
+    }
+  }
+
+  private acknowledgeTransitionByClientOp(clientOpId: string): void {
+    const entry = this.host.settings.durableSyncState.journal.find((candidate) => candidate.clientOpId === clientOpId);
+    if (entry) {
+      entry.status = "acknowledged";
+    }
+  }
+
+  private persistSyncState(): void {
+    this.host.settings.durableSyncState.index = this.stateIndex.toSnapshot();
+    this.host.settings.durableSyncState.journal = this.host.settings.durableSyncState.journal.slice(-2048);
   }
 
   private removePendingOp(clientOpId: string): void {
@@ -560,32 +726,96 @@ export class SyncEngine {
     return encodeMarkdownRenameUpdate(this.ydoc, this.ytree, oldPath, newPath, content);
   }
 
-  private async applyYjsUpdate(payload: RemoteYjsUpdate): Promise<void> {
-    applyMarkdownUpdate(this.ydoc, payload.updateHex);
-    for (const path of payload.changedPaths) {
-      const normalizedPath = normalizeVaultPath(path);
-      const text = getMarkdownText(this.ytree, normalizedPath);
-      if (text) {
-        await applyMarkdownUpsert(this.host.app.vault, this.suppressedPaths, normalizedPath, text.toString());
-      } else {
-        await applyFileDelete(this.host.app.vault, this.suppressedPaths, normalizedPath);
+  private async applyRemoteV2Payload(payload: RemoteV2Payload, serverSeq: number): Promise<void> {
+    const decision = decideRemoteV2Apply(this.stateIndex, payload, this.locallyDirtyFileIds);
+    if (decision.action === "prompt") {
+      this.host.updateStatus("conflict needs input");
+      new Notice(`Mylonite needs input: ${decision.reason}. Keeping local work for now.`);
+      return;
+    }
+    if (decision.action === "noop") {
+      return;
+    }
+    if (payload.kind === "file-rename") {
+      const targetPath = decision.action === "conflict-path" ? decision.path : payload.newPath;
+      const result = await applyFileRenameWithCollision(this.host.app.vault, this.suppressedPaths, payload.oldPath, targetPath, payload.fileId);
+      const finalPath = result.status === "missing-local-file" ? targetPath : result.path;
+      const current = this.stateIndex.byFileId(payload.fileId);
+      this.stateIndex.upsertFile({
+        fileId: payload.fileId,
+        path: finalPath,
+        kind: current?.kind ?? "markdown",
+        contentHash: current?.contentHash ?? "",
+        tombstone: false,
+        lastLocalSeq: current?.lastLocalSeq ?? 0,
+        lastRemoteSeq: serverSeq,
+        updatedAtMs: Date.now(),
+      });
+      return;
+    }
+    if (payload.kind === "file-delete") {
+      await applyFileDelete(this.host.app.vault, this.suppressedPaths, payload.path);
+      this.stateIndex.deleteFile(payload.fileId, payload.path, Date.now(), payload.tombstoneId);
+      return;
+    }
+    if (payload.kind === "file-create" || payload.kind === "file-copy") {
+      const fileId = payload.kind === "file-copy" ? payload.newFileId : payload.fileId;
+      const path = decision.action === "conflict-path" ? decision.path : payload.path;
+      await this.applyRemoteV2Content({ ...payload, fileId, path }, false, serverSeq);
+      return;
+    }
+    await this.applyRemoteV2Content(payload, true, serverSeq);
+  }
+
+  private async applyRemoteV2Content(payload: RemoteV2Payload & { path: string; fileId: string }, allowOverwrite: boolean, serverSeq: number): Promise<void> {
+    if ((payload.kind === "file-create" || payload.kind === "file-copy") && payload.fileKind === "markdown") {
+      const content = payload.content ?? "";
+      const result = await applyMarkdownUpsertWithCollision(this.host.app.vault, this.suppressedPaths, payload.path, content, payload.fileId, allowOverwrite);
+      this.recordRemoteFile(payload.fileId, result.path, "markdown", payload.contentHash, serverSeq);
+      return;
+    }
+    if (payload.kind === "file-update" && payload.fileKind === "markdown") {
+      if (payload.contentUpdate) {
+        applyMarkdownUpdate(this.ydoc, payload.contentUpdate);
+        const text = getMarkdownText(this.ytree, normalizeVaultPath(payload.path));
+        const content = text?.toString() ?? "";
+        const result = await applyMarkdownUpsertWithCollision(this.host.app.vault, this.suppressedPaths, payload.path, content, payload.fileId, allowOverwrite);
+        this.recordRemoteFile(payload.fileId, result.path, "markdown", payload.contentHash, serverSeq);
       }
+      return;
+    }
+    if ((payload.kind === "file-create" || payload.kind === "file-copy" || payload.kind === "file-update") && payload.fileKind === "binary") {
+      if (!payload.blobId) {
+        throw new Error("missing v2 binary blob id");
+      }
+      const keys = await this.host.loadVaultKeys();
+      const blobBytes = await this.host.createApiClient().getBlob(this.host.settings.vaultId, payload.blobId);
+      if (!blobBytes) {
+        throw new Error(`missing blob ${payload.blobId}`);
+      }
+      const plaintext = decryptBlobEnvelope(keys, this.host.settings.vaultId, payload.blobId, blobBytes);
+      const result = await applyBinaryUpsertWithCollision(this.host.app.vault, this.suppressedPaths, payload.path, plaintext, payload.fileId, allowOverwrite);
+      this.recordRemoteFile(payload.fileId, result.path, "binary", payload.contentHash, serverSeq);
     }
   }
 
-  private async applyBlobRef(payload: RemoteBlobRef): Promise<void> {
-    const keys = await this.host.loadVaultKeys();
-    const blobBytes = await this.host.createApiClient().getBlob(this.host.settings.vaultId, payload.blobId);
-    if (!blobBytes) {
-      throw new Error(`missing blob ${payload.blobId}`);
-    }
-    const plaintext = decryptBlobEnvelope(keys, this.host.settings.vaultId, payload.blobId, blobBytes);
-    await applyBinaryUpsert(this.host.app.vault, this.suppressedPaths, payload.path, plaintext);
+  private recordRemoteFile(fileId: string, path: string, kind: FileKind, contentHash: string, serverSeq: number): void {
+    const current = this.stateIndex.byFileId(fileId);
+    this.stateIndex.upsertFile({
+      fileId,
+      path,
+      kind,
+      contentHash,
+      tombstone: false,
+      lastLocalSeq: current?.lastLocalSeq ?? 0,
+      lastRemoteSeq: serverSeq,
+      updatedAtMs: Date.now(),
+    });
   }
 
   private async restoreSnapshot(snapshot: SnapshotRecord, deleteMissing: boolean): Promise<void> {
     const keys = await this.host.loadVaultKeys();
-    await restoreEncryptedSnapshot(
+    const payload = await restoreEncryptedSnapshot(
       this.host.app.vault,
       this.suppressedPaths,
       keys,
@@ -594,6 +824,11 @@ export class SyncEngine {
       (entry) => this.loadSnapshotBinary(entry),
       deleteMissing,
     );
+    if (payload.state) {
+      this.host.settings.durableSyncState.index = payload.state;
+      this.stateIndex = VaultStateIndex.fromSnapshot(payload.state);
+      this.classifier = new LocalEventClassifier(this.stateIndex);
+    }
   }
 
   private async restoreSnapshotForCatchUp(): Promise<boolean> {
@@ -639,45 +874,10 @@ export function validateRemotePayload(payload: unknown): asserts payload is Remo
   if (!isRecord(payload) || typeof payload.kind !== "string") {
     throw new Error("invalid remote payload");
   }
-  if (payload.kind === "markdown-upsert") {
-    normalizeVaultPath(payload.path);
-    if (typeof payload.content !== "string") {
-      throw new Error("invalid markdown payload content");
-    }
-    return;
+  if (payload.version !== 2) {
+    throw new Error("unsupported remote payload version");
   }
-  if (payload.kind === "yjs-update") {
-    if (typeof payload.updateHex !== "string" || payload.updateHex.length === 0 || payload.updateHex.length % 2 !== 0 || /[^0-9a-f]/.test(payload.updateHex)) {
-      throw new Error("invalid yjs update payload");
-    }
-    if (!Array.isArray(payload.changedPaths) || payload.changedPaths.length === 0 || payload.changedPaths.length > 1024) {
-      throw new Error("invalid yjs changed paths");
-    }
-    for (const path of payload.changedPaths) {
-      normalizeVaultPath(path);
-    }
-    return;
-  }
-  if (payload.kind === "blob-ref") {
-    normalizeVaultPath(payload.path);
-    if (typeof payload.blobId !== "string" || !/^[0-9a-f]{64}$/.test(payload.blobId)) {
-      throw new Error("invalid blob-ref payload blob id");
-    }
-    if (typeof payload.size !== "number" || !Number.isSafeInteger(payload.size) || payload.size < 0) {
-      throw new Error("invalid blob-ref payload size");
-    }
-    return;
-  }
-  if (payload.kind === "file-delete") {
-    normalizeVaultPath(payload.path);
-    return;
-  }
-  if (payload.kind === "file-rename") {
-    normalizeVaultPath(payload.oldPath);
-    normalizeVaultPath(payload.newPath);
-    return;
-  }
-  throw new Error("unsupported remote payload kind");
+  validateRemoteV2Payload(payload as unknown as RemoteV2Payload);
 }
 
 export function parseWebSocketChallenge(payload: Uint8Array): string {
@@ -697,7 +897,7 @@ export function validateRemoteOpRecord(op: unknown): asserts op is EncryptedOpRe
   validateDeviceId(op.device_id);
   validateSequence("op server seq", op.server_seq, 1);
   validateSequence("op lamport", op.lamport, 0);
-  if (typeof op.kind !== "number" || !Number.isSafeInteger(op.kind) || op.kind < 1 || op.kind > 7) {
+  if (typeof op.kind !== "number" || !Number.isSafeInteger(op.kind) || op.kind < OpKind.FileCreate || op.kind > OpKind.FileCopy) {
     throw new Error("invalid op kind");
   }
   if (op.key_version !== 1) {
@@ -731,10 +931,63 @@ function remotePayloadPaths(payload: RemotePayload): string[] {
   if (payload.kind === "file-rename") {
     return [payload.oldPath, payload.newPath];
   }
-  if (payload.kind === "yjs-update") {
-    return payload.changedPaths;
-  }
   return [payload.path];
+}
+
+function validateRemoteV2Payload(payload: RemoteV2Payload): void {
+  validateFileId(payload.fileId);
+  normalizeVaultPath(payload.path);
+  if (payload.kind === "file-create" || payload.kind === "file-update" || payload.kind === "file-copy") {
+    validateFileKind(payload.fileKind);
+    validateContentHash(payload.contentHash);
+    if (payload.fileKind === "markdown") {
+      if (payload.kind !== "file-update" && payload.content !== undefined && typeof payload.content !== "string") {
+        throw new Error("invalid v2 markdown content");
+      }
+      if (payload.kind === "file-update" && payload.contentUpdate !== undefined) {
+        validateHexPayload("v2 content update", payload.contentUpdate);
+      }
+    }
+    if (payload.fileKind === "binary") {
+      if (typeof payload.blobId !== "string" || !/^[0-9a-f]{64}$/.test(payload.blobId)) {
+        throw new Error("invalid v2 blob id");
+      }
+      if (typeof payload.size !== "number" || !Number.isSafeInteger(payload.size) || payload.size < 0) {
+        throw new Error("invalid v2 binary size");
+      }
+    }
+  }
+  if (payload.kind === "file-rename") {
+    normalizeVaultPath(payload.oldPath);
+    normalizeVaultPath(payload.newPath);
+  }
+  if (payload.kind === "file-delete") {
+    if (typeof payload.tombstoneId !== "string" || !/^t[0-9a-f]{32}$/.test(payload.tombstoneId)) {
+      throw new Error("invalid v2 tombstone id");
+    }
+  }
+  if (payload.kind === "file-copy") {
+    validateFileId(payload.sourceFileId);
+    validateFileId(payload.newFileId);
+  }
+}
+
+function validateFileKind(value: unknown): asserts value is FileKind {
+  if (value !== "markdown" && value !== "binary") {
+    throw new Error("invalid v2 file kind");
+  }
+}
+
+function validateFileId(value: unknown): asserts value is string {
+  if (typeof value !== "string" || !/^f[0-9a-f]{32}$/.test(value)) {
+    throw new Error("invalid v2 file id");
+  }
+}
+
+function validateContentHash(value: unknown): asserts value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 128 || /[^0-9a-f]/.test(value)) {
+    throw new Error("invalid v2 content hash");
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -30,6 +30,14 @@ export const ServerMsgKind = {
   Error: 255,
 } as const;
 
+export const OpKind = {
+  FileCreate: 1,
+  FileUpdate: 2,
+  FileRename: 3,
+  FileDelete: 4,
+  FileCopy: 5,
+} as const;
+
 export interface Frame {
   kind: number;
   flags: number;
