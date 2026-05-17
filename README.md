@@ -93,7 +93,7 @@ Enable Mylonite in Obsidian's community plugins list, then open its settings.
 
 ## Pairing
 
-There are two paths. Pair the first device with the pairing token; add every other device with the Request / Authorize flow. The pairing token sets up the vault encryption key locally, so reusing it on a second device would create a device that can't decrypt anything the first device wrote.
+The first device must be paired with the pairing token. Every other device can be paired with the Request / Authorize flow.
 
 ### First device
 
@@ -101,15 +101,11 @@ There are two paths. Pair the first device with the pairing token; add every oth
 2. Paste the pairing token printed by `mylonite init`.
 3. Click Pair.
 
-The server now has one paired device. Sync starts immediately.
-
 ### Additional devices
 
 1. On the new device, open Mylonite settings -> Join an existing vault -> click Request. Copy the request that appears.
 2. On an already paired device, open Mylonite settings -> Add another device, paste the request, and click Authorize. Copy the response that appears.
 3. Back on the new device, paste the response into Step 2 and click Complete.
-
-The new device receives the vault encryption key over an ephemeral X25519 channel, registers with the server, and starts replaying vault history.
 
 If you ever lose access to every paired device, the vault data is unrecoverable — the encryption key was generated on the first device and the server only holds ciphertext. Wipe the dead vault and start fresh:
 
