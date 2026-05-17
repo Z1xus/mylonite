@@ -1,20 +1,88 @@
 use axum::{
     Json,
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 
 use super::{ApiError, AppState, auth::verify_device_signature, validation};
-use crate::storage::{BlobRecord, DeviceRecord, EncryptedOpRecord, SnapshotRecord};
+use crate::storage::{
+    BlobRecord, CreatedVault, DeviceRecord, EncryptedOpRecord, SnapshotRecord, StorageStats,
+};
 
 pub(super) async fn health(State(app_state): State<AppState>) -> impl IntoResponse {
     match app_state.storage.stats() {
         Ok(storage_stats) => format!("ok vaults={}\n", storage_stats.vault_count),
         Err(error) => format!("degraded error={error}\n"),
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct AdminCreateVaultRequest {
+    name: String,
+}
+
+pub(super) async fn admin_create_vault(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(app_state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<CreatedVault>, ApiError> {
+    require_loopback_admin(peer)?;
+    validate_json_body_len(&app_state, &body)?;
+    let request: AdminCreateVaultRequest = serde_json::from_slice(&body)?;
+    Ok(Json(app_state.storage.create_vault(&request.name)?))
+}
+
+pub(super) async fn admin_list_vaults(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(app_state): State<AppState>,
+) -> Result<Json<Vec<CreatedVault>>, ApiError> {
+    require_loopback_admin(peer)?;
+    Ok(Json(app_state.storage.list_vaults()?))
+}
+
+pub(super) async fn admin_delete_vault(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(app_state): State<AppState>,
+    Path(vault_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_loopback_admin(peer)?;
+    validation::validate_vault_id(&vault_id)?;
+    app_state.storage.delete_vault(&vault_id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub(super) async fn admin_list_devices(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(app_state): State<AppState>,
+    Path(vault_id): Path<String>,
+) -> Result<Json<Vec<DeviceRecord>>, ApiError> {
+    require_loopback_admin(peer)?;
+    validation::validate_vault_id(&vault_id)?;
+    Ok(Json(app_state.storage.list_devices(&vault_id)?))
+}
+
+pub(super) async fn admin_revoke_device(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(app_state): State<AppState>,
+    Path((vault_id, device_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    require_loopback_admin(peer)?;
+    validation::validate_vault_id(&vault_id)?;
+    validation::validate_device_id(&device_id)?;
+    app_state.storage.revoke_device(&vault_id, &device_id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub(super) async fn admin_stats(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(app_state): State<AppState>,
+) -> Result<Json<StorageStats>, ApiError> {
+    require_loopback_admin(peer)?;
+    Ok(Json(app_state.storage.stats()?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -349,13 +417,37 @@ fn validate_body_device_matches_signer(
     Ok(())
 }
 
+fn require_loopback_admin(peer: SocketAddr) -> Result<(), ApiError> {
+    if peer.ip().is_loopback() {
+        return Ok(());
+    }
+    Err(ApiError(anyhow::anyhow!(
+        "admin API is only available from loopback"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::validate_body_device_matches_signer;
+    use super::{require_loopback_admin, validate_body_device_matches_signer};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]
     fn body_device_id_must_match_signing_device() {
         assert!(validate_body_device_matches_signer("d111", "d111").is_ok());
         assert!(validate_body_device_matches_signer("d111", "d222").is_err());
+    }
+
+    #[test]
+    fn admin_routes_require_loopback_peer() {
+        assert!(
+            require_loopback_admin(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12000)).is_ok()
+        );
+        assert!(
+            require_loopback_admin(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+                12000
+            ))
+            .is_err()
+        );
     }
 }

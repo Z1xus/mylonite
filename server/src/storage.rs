@@ -24,7 +24,7 @@ pub struct Storage {
     data_dir: Arc<PathBuf>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreatedVault {
     pub id: String,
     pub name: String,
@@ -74,7 +74,7 @@ pub struct EncryptedOpRecord {
     pub accepted_at_unix: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppendOpResult {
     pub server_seq: u64,
     pub inserted: bool,
@@ -100,7 +100,7 @@ pub struct SnapshotRecord {
     pub created_at_unix: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageStats {
     pub vault_count: u64,
 }

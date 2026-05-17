@@ -11,6 +11,7 @@ use std::{
 use anyhow::Context;
 use clap::Parser;
 use cli::{Cli, Command, DeviceCommand, VaultCommand};
+use config::Config;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -45,25 +46,29 @@ fn handle_vault(command: VaultCommand) -> anyhow::Result<()> {
     match command {
         VaultCommand::Create { name, config } => {
             let config = config::Config::load_or_default(config.as_deref())?;
-            let storage = storage::Storage::open(&config.server.data_dir)?;
             let name = match name {
                 Some(name) => name,
                 None => prompt_text("vault name", "My Vault")?,
             };
-            let vault = storage.create_vault(&name).context("create vault")?;
+            let vault = with_admin_or_storage(
+                &config,
+                |admin| admin.create_vault(&name),
+                |storage| storage.create_vault(&name),
+            )
+            .context("create vault")?;
             print_vault(&vault);
         }
         VaultCommand::List { config } => {
             let config = config::Config::load_or_default(config.as_deref())?;
-            let storage = storage::Storage::open(&config.server.data_dir)?;
-            for vault in storage.list_vaults()? {
+            for vault in with_admin_or_storage(&config, AdminClient::list_vaults, |storage| {
+                storage.list_vaults()
+            })? {
                 println!("{}\t{}\t{}", vault.id, vault.name, vault.created_at_unix);
             }
         }
         VaultCommand::Delete { vault, config, yes } => {
             let config = config::Config::load_or_default(config.as_deref())?;
-            let storage = storage::Storage::open(&config.server.data_dir)?;
-            let vault_id = resolve_vault_id(&storage, vault)?;
+            let vault_id = resolve_vault_id(&config, vault)?;
             if !yes
                 && !prompt_yes_no(
                     &format!(
@@ -75,7 +80,11 @@ fn handle_vault(command: VaultCommand) -> anyhow::Result<()> {
                 print_status("Cancelled", "vault was not deleted");
                 return Ok(());
             }
-            storage.delete_vault(&vault_id)?;
+            with_admin_or_storage(
+                &config,
+                |admin| admin.delete_vault(&vault_id),
+                |storage| storage.delete_vault(&vault_id),
+            )?;
             print_status("Vault", &format!("deleted {vault_id}"));
         }
     }
@@ -86,9 +95,12 @@ fn handle_device(command: DeviceCommand) -> anyhow::Result<()> {
     match command {
         DeviceCommand::List { vault, config } => {
             let config = config::Config::load_or_default(config.as_deref())?;
-            let storage = storage::Storage::open(&config.server.data_dir)?;
-            let vault = resolve_vault_id(&storage, vault)?;
-            for device in storage.list_devices(&vault)? {
+            let vault = resolve_vault_id(&config, vault)?;
+            for device in with_admin_or_storage(
+                &config,
+                |admin| admin.list_devices(&vault),
+                |storage| storage.list_devices(&vault),
+            )? {
                 println!(
                     "{}\t{}\t{}\t{:?}",
                     device.device_id, device.label, device.created_at_unix, device.revoked_at_unix
@@ -101,10 +113,13 @@ fn handle_device(command: DeviceCommand) -> anyhow::Result<()> {
             config,
         } => {
             let config = config::Config::load_or_default(config.as_deref())?;
-            let storage = storage::Storage::open(&config.server.data_dir)?;
-            let vault = resolve_vault_id(&storage, vault)?;
-            let device = resolve_device_id(&storage, &vault, device)?;
-            storage.revoke_device(&vault, &device)?;
+            let vault = resolve_vault_id(&config, vault)?;
+            let device = resolve_device_id(&config, &vault, device)?;
+            with_admin_or_storage(
+                &config,
+                |admin| admin.revoke_device(&vault, &device),
+                |storage| storage.revoke_device(&vault, &device),
+            )?;
             println!("revoked device {device} in vault {vault}");
         }
     }
@@ -113,8 +128,7 @@ fn handle_device(command: DeviceCommand) -> anyhow::Result<()> {
 
 fn handle_stats(config_path: Option<&std::path::Path>) -> anyhow::Result<()> {
     let config = config::Config::load_or_default(config_path)?;
-    let storage = storage::Storage::open(&config.server.data_dir)?;
-    let stats = storage.stats()?;
+    let stats = with_admin_or_storage(&config, AdminClient::stats, storage::Storage::stats)?;
     println!("vaults={}", stats.vault_count);
     Ok(())
 }
@@ -125,14 +139,13 @@ fn print_vault(vault: &storage::CreatedVault) {
     println!("pairing_token={}", vault.pairing_token);
 }
 
-fn resolve_vault_id(
-    storage: &storage::Storage,
-    supplied: Option<String>,
-) -> anyhow::Result<String> {
+fn resolve_vault_id(config: &Config, supplied: Option<String>) -> anyhow::Result<String> {
     if let Some(vault_id) = supplied {
         return Ok(vault_id);
     }
-    let vaults = storage.list_vaults()?;
+    let vaults = with_admin_or_storage(config, AdminClient::list_vaults, |storage| {
+        storage.list_vaults()
+    })?;
     match vaults.len() {
         0 => anyhow::bail!("no vaults configured; run mylonite vault create"),
         1 => Ok(vaults[0].id.clone()),
@@ -148,14 +161,18 @@ fn resolve_vault_id(
 }
 
 fn resolve_device_id(
-    storage: &storage::Storage,
+    config: &Config,
     vault_id: &str,
     supplied: Option<String>,
 ) -> anyhow::Result<String> {
     if let Some(device_id) = supplied {
         return Ok(device_id);
     }
-    let devices = storage.list_devices(vault_id)?;
+    let devices = with_admin_or_storage(
+        config,
+        |admin| admin.list_devices(vault_id),
+        |storage| storage.list_devices(vault_id),
+    )?;
     match devices.len() {
         0 => anyhow::bail!("no devices found in vault {vault_id}"),
         1 => Ok(devices[0].device_id.clone()),
@@ -292,5 +309,170 @@ fn color(code: &str, text: &str) -> String {
         text.to_string()
     } else {
         format!("\x1b[{code}m{text}\x1b[0m")
+    }
+}
+
+fn with_admin_or_storage<T>(
+    config: &Config,
+    admin_op: impl FnOnce(&AdminClient) -> anyhow::Result<T>,
+    storage_op: impl FnOnce(&storage::Storage) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let admin = AdminClient::new(config.server.listen);
+    match admin_op(&admin) {
+        Ok(value) => Ok(value),
+        Err(error) if is_admin_unavailable(&error) => {
+            let storage = storage::Storage::open(&config.server.data_dir)?;
+            storage_op(&storage)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_admin_unavailable(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<io::Error>())
+        .any(|error| {
+            matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::NotConnected
+                    | io::ErrorKind::TimedOut
+            )
+        })
+}
+
+struct AdminClient {
+    base_url: String,
+}
+
+impl AdminClient {
+    fn new(listen: SocketAddr) -> Self {
+        let host = if listen.ip().is_unspecified() {
+            "127.0.0.1".to_string()
+        } else if listen.ip().is_ipv6() {
+            format!("[{}]", listen.ip())
+        } else {
+            listen.ip().to_string()
+        };
+        Self {
+            base_url: format!("http://{host}:{}", listen.port()),
+        }
+    }
+
+    fn create_vault(&self, name: &str) -> anyhow::Result<storage::CreatedVault> {
+        self.json_request(
+            "POST",
+            "/api/v1/admin/vaults",
+            Some(&serde_json::json!({ "name": name })),
+        )
+    }
+
+    fn list_vaults(&self) -> anyhow::Result<Vec<storage::CreatedVault>> {
+        self.json_request("GET", "/api/v1/admin/vaults", None)
+    }
+
+    fn delete_vault(&self, vault_id: &str) -> anyhow::Result<()> {
+        self.empty_request("DELETE", &format!("/api/v1/admin/vaults/{vault_id}"))
+    }
+
+    fn list_devices(&self, vault_id: &str) -> anyhow::Result<Vec<storage::DeviceRecord>> {
+        self.json_request(
+            "GET",
+            &format!("/api/v1/admin/vaults/{vault_id}/devices"),
+            None,
+        )
+    }
+
+    fn revoke_device(&self, vault_id: &str, device_id: &str) -> anyhow::Result<()> {
+        self.empty_request(
+            "POST",
+            &format!("/api/v1/admin/vaults/{vault_id}/devices/{device_id}/revoke"),
+        )
+    }
+
+    fn stats(&self) -> anyhow::Result<storage::StorageStats> {
+        self.json_request("GET", "/api/v1/admin/stats", None)
+    }
+
+    fn json_request<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> anyhow::Result<T> {
+        let response = self.request(method, path, body)?;
+        serde_json::from_slice(&response).context("decode admin response")
+    }
+
+    fn empty_request(&self, method: &str, path: &str) -> anyhow::Result<()> {
+        self.request(method, path, None).map(|_| ())
+    }
+
+    fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> anyhow::Result<Vec<u8>> {
+        use std::{
+            io::{Read, Write},
+            net::TcpStream,
+            time::Duration,
+        };
+
+        let body = match body {
+            Some(value) => serde_json::to_vec(value).context("encode admin request")?,
+            None => Vec::new(),
+        };
+        let url = format!("{}{path}", self.base_url);
+        let without_scheme = url
+            .strip_prefix("http://")
+            .context("admin URL must use http")?;
+        let (authority, _) = without_scheme
+            .split_once('/')
+            .context("admin URL must include path")?;
+        let mut stream = TcpStream::connect(authority).with_context(|| format!("connect {url}"))?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .context("set admin read timeout")?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .context("set admin write timeout")?;
+        write!(
+            stream,
+            "{method} {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .context("write admin request headers")?;
+        stream
+            .write_all(&body)
+            .context("write admin request body")?;
+
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .context("read admin response")?;
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .context("admin response missing headers")?
+            + 4;
+        let headers = std::str::from_utf8(&response[..header_end])
+            .context("admin response headers are not UTF-8")?;
+        let status = headers
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .context("admin response missing status")?;
+        let body = response[header_end..].to_vec();
+        if !(200..300).contains(&status) {
+            let message = String::from_utf8_lossy(&body);
+            anyhow::bail!("admin request failed with HTTP {status}: {message}");
+        }
+        Ok(body)
     }
 }

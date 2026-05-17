@@ -11,7 +11,7 @@ use axum::{
     extract::DefaultBodyLimit,
     http::{HeaderName, Method, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
@@ -78,6 +78,25 @@ pub async fn serve(
     let app = Router::new()
         .route("/health", get(routes::health))
         .route(
+            "/api/v1/admin/vaults",
+            get(routes::admin_list_vaults)
+                .post(routes::admin_create_vault)
+                .layer(DefaultBodyLimit::max(max_json_body_bytes)),
+        )
+        .route(
+            "/api/v1/admin/vaults/{vault_id}",
+            delete(routes::admin_delete_vault),
+        )
+        .route(
+            "/api/v1/admin/vaults/{vault_id}/devices",
+            get(routes::admin_list_devices),
+        )
+        .route(
+            "/api/v1/admin/vaults/{vault_id}/devices/{device_id}/revoke",
+            post(routes::admin_revoke_device),
+        )
+        .route("/api/v1/admin/stats", get(routes::admin_stats))
+        .route(
             "/api/v1/pair/first-device",
             post(routes::pair_first_device).layer(DefaultBodyLimit::max(max_json_body_bytes)),
         )
@@ -117,9 +136,12 @@ pub async fn serve(
         tls::ServerTls::Off => {
             let listener = tokio::net::TcpListener::bind(listen).await?;
             info!(%listen, tls_mode = %tls.mode, "mylonite server listening");
-            axum::serve(listener, app)
-                .with_graceful_shutdown(tls::shutdown_signal())
-                .await?;
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(tls::shutdown_signal())
+            .await?;
         }
         tls::ServerTls::Enabled(config) => {
             info!(%listen, tls_mode = %tls.mode, "mylonite server listening");
@@ -127,7 +149,7 @@ pub async fn serve(
             tokio::spawn(tls::shutdown_server(handle.clone()));
             axum_server::bind_rustls(listen, config)
                 .handle(handle)
-                .serve(app.into_make_service())
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                 .await?;
         }
     }
