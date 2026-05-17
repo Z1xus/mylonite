@@ -75,7 +75,46 @@ pub async fn serve(
         snapshot_retain: usize::try_from(snapshots.retain).unwrap_or(usize::MAX),
         op_broadcast: broadcast::channel(1024).0,
     };
-    let app = Router::new()
+    let app = build_router(
+        state,
+        max_json_body_bytes,
+        max_op_json_body_bytes,
+        max_blob_size_bytes,
+        max_snapshot_json_body_bytes,
+    );
+
+    match tls::load_server_config(&tls, data_dir).await? {
+        tls::ServerTls::Off => {
+            let listener = tokio::net::TcpListener::bind(listen).await?;
+            info!(%listen, tls_mode = %tls.mode, "mylonite server listening");
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(tls::shutdown_signal())
+            .await?;
+        }
+        tls::ServerTls::Enabled(config) => {
+            info!(%listen, tls_mode = %tls.mode, "mylonite server listening");
+            let handle = axum_server::Handle::new();
+            tokio::spawn(tls::shutdown_server(handle.clone()));
+            axum_server::bind_rustls(listen, config)
+                .handle(handle)
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+fn build_router(
+    state: AppState,
+    max_json_body_bytes: usize,
+    max_op_json_body_bytes: usize,
+    max_blob_size_bytes: usize,
+    max_snapshot_json_body_bytes: usize,
+) -> Router {
+    Router::new()
         .route("/health", get(routes::health))
         .route(
             "/api/v1/admin/vaults",
@@ -130,30 +169,7 @@ pub async fn serve(
         )
         .route("/ws", get(ws::ws_handler))
         .layer(api_cors_layer())
-        .with_state(state);
-
-    match tls::load_server_config(&tls, data_dir).await? {
-        tls::ServerTls::Off => {
-            let listener = tokio::net::TcpListener::bind(listen).await?;
-            info!(%listen, tls_mode = %tls.mode, "mylonite server listening");
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .with_graceful_shutdown(tls::shutdown_signal())
-            .await?;
-        }
-        tls::ServerTls::Enabled(config) => {
-            info!(%listen, tls_mode = %tls.mode, "mylonite server listening");
-            let handle = axum_server::Handle::new();
-            tokio::spawn(tls::shutdown_server(handle.clone()));
-            axum_server::bind_rustls(listen, config)
-                .handle(handle)
-                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-                .await?;
-        }
-    }
-    Ok(())
+        .with_state(state)
 }
 
 fn encrypted_json_body_limit(max_ciphertext_bytes: usize) -> usize {
