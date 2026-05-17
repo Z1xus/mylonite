@@ -1,0 +1,17 @@
+/target/
+
+node_modules/
+plugin/node_modules/
+
+/dev/data/
+/dev/tls/
+*.redb
+*.log
+
+plugin/main.js
+plugin/main.js.map
+
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

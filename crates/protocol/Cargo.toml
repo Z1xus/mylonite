@@ -1,0 +1,13 @@
+[package]
+name = "mylonite-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT"
+description = "Wire protocol frame codec for Mylonite"
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = "2"

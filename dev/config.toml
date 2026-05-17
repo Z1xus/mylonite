@@ -1,0 +1,31 @@
+[server]
+listen = "127.0.0.1:9821"
+data_dir = "./dev/data"
+public_url = "http://127.0.0.1:9821"
+
+[tls]
+mode = "off"
+acme_email = "you@example.com"
+domains = ["localhost"]
+cert = "./dev/tls/cert.pem"
+key = "./dev/tls/key.pem"
+
+[limits]
+max_blob_size_mb = 256
+max_vault_size_gb = 50
+max_devices_per_vault = 16
+max_ops_per_push = 512
+max_json_body_kb = 1024
+max_op_ciphertext_kb = 1024
+max_snapshot_ciphertext_mb = 256
+
+[snapshots]
+ops_interval = 1000
+time_interval_hours = 24
+tail_size_mb = 16
+retain = 3
+safety_tail_ops = 100
+
+[log]
+level = "info"
+format = "compact"

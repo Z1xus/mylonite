@@ -1,0 +1,30 @@
+[package]
+name = "mylonite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT"
+description = "Self-hosted encrypted Obsidian sync server"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["ws"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+ed25519-dalek = "2"
+futures-util = "0.3"
+mylonite-protocol = { path = "../crates/protocol" }
+rand = "0.9"
+rcgen = "0.13"
+redb = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
