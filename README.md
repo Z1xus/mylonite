@@ -8,6 +8,12 @@
 
 Mylonite is a self-hosted sync server for Obsidian. Use it with the Mylonite plugin to pair devices and sync end-to-end encrypted vault data through your own storage.
 
+<p align="center">
+<img width="960" height="540" alt="Image" src="https://github.com/user-attachments/assets/83c73568-f482-4cb8-8103-48ea9a87cf7d" />
+<sub> Synchronization showcase using a remote server hundreds of kilometers away. Vault data remains end-to-end encrypted throughout the sync process.</sub>
+</p>
+<br>
+
 ## Server
 
 Install the latest binary.
@@ -41,7 +47,8 @@ The default config lives at:
 - macOS: `~/Library/Application Support/mylonite/config.toml`
 - Windows: `%APPDATA%\mylonite\config.toml`
 
-Keep `listen = "127.0.0.1:9821"` when a reverse proxy terminates TLS on the same host. Use `listen = "0.0.0.0:9821"` and set `public_url` to the reachable URL if the server should accept direct connections.
+Keep `listen = "127.0.0.1:9821"` when a reverse proxy terminates TLS on the same host.  
+Use `listen = "0.0.0.0:9821"` and set `public_url` to the reachable URL if the server should accept direct connections.
 
 ### Systemd
 
@@ -81,7 +88,7 @@ docker run -p 9821:9821 \
 
 ## Plugin
 
-Preferred: install [BRAT](https://tfthacker.com/brat-quick-guide), then add `z1xus/mylonite` as a beta plugin. This is the easiest path on mobile.
+Preferred: install [BRAT](https://tfthacker.com/brat-quick-guide), then add `https://github.com/Z1xus/mylonite` as a beta plugin. This is the easiest path on mobile.
 
 Manual install: download [mylonite-obsidian-plugin.zip](https://github.com/z1xus/mylonite/releases/latest/download/mylonite-obsidian-plugin.zip) from Releases and extract it into:
 
@@ -97,13 +104,13 @@ The first device must be paired with the pairing token. Every other device can b
 
 ### First device
 
-1. Enter your server URL.
+1. Enter your server URL (and optionally your device label).
 2. Paste the pairing token printed by `mylonite init`.
 3. Click Pair.
 
 ### Additional devices
 
-1. On the new device, open Mylonite settings -> Join an existing vault -> click Request. Copy the request that appears.
+1. On the new device, open Mylonite settings -> Enter your server URL -> click Request. Copy the request that appears.
 2. On an already paired device, open Mylonite settings -> Add another device, paste the request, and click Authorize. Copy the response that appears.
 3. Back on the new device, paste the response into Step 2 and click Complete.
 
