@@ -107,6 +107,7 @@ export default class MylonitePlugin extends Plugin {
       this.vaultKeys = null;
       await this.saveSettings();
       this.updateStatus("paired");
+      this.syncEngine.start();
       new Notice("Mylonite pairing completed.");
     } catch (error) {
       this.updateStatus("pairing failed");
@@ -130,69 +131,97 @@ export default class MylonitePlugin extends Plugin {
       x25519_public_key: exchangeKeypair.publicKeyHex,
     });
     await this.saveSettings();
-    new Notice("Mylonite device pairing request generated.");
+    new Notice("Pairing request generated.");
   }
 
   async authorizeDevicePairingRequest(): Promise<void> {
     if (!this.settings.vaultId) {
-      new Notice("This device must already be paired before authorizing another device.");
+      new Notice("This device is not paired.");
       return;
     }
-    const secretMaterial = await this.ensureVaultSecretMaterial();
-    const request = JSON.parse(this.settings.devicePairingRequest) as DevicePairingRequestPayload;
-    validateDevicePairingRequest(request);
-    const client = this.createApiClient();
-    const registered = await client.registerDevice(
-      this.settings.vaultId,
-      request.label || "Obsidian device",
-      request.verifying_key,
-    );
-    const exchangeKeypair = generateX25519Keypair();
-    const secret = new TextEncoder().encode(JSON.stringify({
-      version: 1,
-      vault_id: this.settings.vaultId,
-      vault_salt_hex: secretMaterial.saltHex,
-      passphrase: secretMaterial.passphrase,
-      device_id: registered.device_id,
-      last_server_seq: this.settings.lastServerSeq,
-    }));
-    const encrypted = encryptDevicePairingSecret(exchangeKeypair.privateKeyHex, request.x25519_public_key, secret);
-    this.settings.devicePairingResponse = JSON.stringify({
-      version: 1,
-      x25519_public_key: exchangeKeypair.publicKeyHex,
-      nonce_hex: encrypted.nonceHex,
-      ciphertext_hex: encrypted.ciphertextHex,
-    });
-    await this.saveSettings();
-    new Notice("Mylonite device pairing response generated.");
+    if (!this.settings.devicePairingRequest) {
+      new Notice("No pairing request to authorize.");
+      return;
+    }
+    let request: DevicePairingRequestPayload;
+    try {
+      request = JSON.parse(this.settings.devicePairingRequest) as DevicePairingRequestPayload;
+      validateDevicePairingRequest(request);
+    } catch (error) {
+      new Notice(`Invalid pairing request: ${String(error)}`);
+      return;
+    }
+    try {
+      const secretMaterial = await this.ensureVaultSecretMaterial();
+      const client = this.createApiClient();
+      const registered = await client.registerDevice(
+        this.settings.vaultId,
+        request.label || "Obsidian device",
+        request.verifying_key,
+      );
+      const exchangeKeypair = generateX25519Keypair();
+      const secret = new TextEncoder().encode(JSON.stringify({
+        version: 1,
+        vault_id: this.settings.vaultId,
+        vault_salt_hex: secretMaterial.saltHex,
+        passphrase: secretMaterial.passphrase,
+        device_id: registered.device_id,
+        last_server_seq: 0,
+      }));
+      const encrypted = encryptDevicePairingSecret(exchangeKeypair.privateKeyHex, request.x25519_public_key, secret);
+      this.settings.devicePairingResponse = JSON.stringify({
+        version: 1,
+        x25519_public_key: exchangeKeypair.publicKeyHex,
+        nonce_hex: encrypted.nonceHex,
+        ciphertext_hex: encrypted.ciphertextHex,
+      });
+      this.settings.devicePairingRequest = "";
+      await this.saveSettings();
+      new Notice("Pairing response generated.");
+    } catch (error) {
+      new Notice(`Authorization failed: ${String(error)}`);
+    }
   }
 
   async completeDevicePairing(): Promise<void> {
     const privateKeyHex = loadDevicePrivateKey(this.app, this.settings);
     const pairingPrivateKeyHex = loadDevicePairingPrivateKey(this.app, this.settings);
     if (!privateKeyHex || !this.settings.devicePublicKeyHex || !pairingPrivateKeyHex) {
-      new Notice("Generate a device pairing request on this device first.");
+      new Notice("Generate a pairing request on this device first.");
       return;
     }
-    const response = JSON.parse(this.settings.devicePairingResponse) as DevicePairingResponsePayload;
-    validateDevicePairingResponse(response);
-    const plaintext = decryptDevicePairingSecret(pairingPrivateKeyHex, response.x25519_public_key, {
-      nonceHex: response.nonce_hex,
-      ciphertextHex: response.ciphertext_hex,
-    });
-    const secret = JSON.parse(new TextDecoder().decode(plaintext)) as DevicePairingSecretPayload;
-    validateDevicePairingSecret(secret);
-    this.settings.vaultId = secret.vault_id;
-    this.settings.vaultSaltHex = secret.vault_salt_hex;
-    this.settings.deviceId = secret.device_id;
-    this.settings.lastServerSeq = secret.last_server_seq;
-    clearDevicePairingPrivateKey(this.app, this.settings);
-    this.settings.devicePairingResponse = "";
-    storeDevicePrivateKey(this.app, this.settings, privateKeyHex);
-    storePassphrase(this.app, this.settings, secret.passphrase);
-    this.vaultKeys = null;
-    await this.saveSettings();
-    new Notice("Mylonite device pairing completed.");
+    if (!this.settings.devicePairingResponse) {
+      new Notice("No pairing response to complete.");
+      return;
+    }
+    try {
+      const response = JSON.parse(this.settings.devicePairingResponse) as DevicePairingResponsePayload;
+      validateDevicePairingResponse(response);
+      const plaintext = decryptDevicePairingSecret(pairingPrivateKeyHex, response.x25519_public_key, {
+        nonceHex: response.nonce_hex,
+        ciphertextHex: response.ciphertext_hex,
+      });
+      const secret = JSON.parse(new TextDecoder().decode(plaintext)) as DevicePairingSecretPayload;
+      validateDevicePairingSecret(secret);
+      this.settings.vaultId = secret.vault_id;
+      this.settings.vaultSaltHex = secret.vault_salt_hex;
+      this.settings.deviceId = secret.device_id;
+      this.settings.lastServerSeq = secret.last_server_seq;
+      this.settings.lamport = 0;
+      this.settings.pendingOps = [];
+      clearDevicePairingPrivateKey(this.app, this.settings);
+      this.settings.devicePairingResponse = "";
+      this.settings.devicePairingRequest = "";
+      storeDevicePrivateKey(this.app, this.settings, privateKeyHex);
+      storePassphrase(this.app, this.settings, secret.passphrase);
+      this.vaultKeys = null;
+      await this.saveSettings();
+      this.updateStatus("paired");
+      this.syncEngine.start();
+      new Notice("Paired. Syncing.");
+    } catch (error) {
+      new Notice(`Pairing failed: ${String(error)}`);
+    }
   }
 
   createApiClient(): MyloniteApiClient {

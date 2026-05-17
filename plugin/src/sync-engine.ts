@@ -36,23 +36,27 @@ export class SyncEngine {
   private readonly ydoc = new Y.Doc();
   private readonly ytree = this.ydoc.getMap<Y.Map<unknown>>("tree");
   private socket: WebSocket | null = null;
+  private started = false;
 
   constructor(private readonly host: SyncEngineHost) {}
 
   start(): void {
-    this.registerVaultEvents();
+    if (!this.started) {
+      this.registerVaultEvents();
+      this.host.registerInterval(window.setInterval(() => {
+        void this.catchUp().catch((error) => {
+          this.host.updateStatus("catch-up error");
+          this.host.debug(`poll failed: ${String(error)}`);
+        });
+      }, 15_000));
+      this.host.debug(`initial visible files: ${this.host.app.vault.getFiles().length}`);
+      this.started = true;
+    }
     this.connectWebSocket();
-    this.host.debug(`initial visible files: ${this.host.app.vault.getFiles().length}`);
     void this.catchUp().catch((error) => {
       this.host.updateStatus("catch-up error");
       this.host.debug(`catch-up failed: ${String(error)}`);
     });
-    this.host.registerInterval(window.setInterval(() => {
-      void this.catchUp().catch((error) => {
-        this.host.updateStatus("catch-up error");
-        this.host.debug(`poll failed: ${String(error)}`);
-      });
-    }, 15_000));
   }
 
   close(): void {

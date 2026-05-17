@@ -4,104 +4,118 @@ mod config;
 mod storage;
 
 use std::{
-    collections::BTreeSet,
     io::{self, Write},
-    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
+    net::SocketAddr,
 };
 
 use anyhow::Context;
 use clap::Parser;
-use cli::{Cli, Command, DeviceCommand, PairCommand, VaultCommand};
+use cli::{Cli, Command, DeviceCommand, VaultCommand};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Init { config, no_vault } => {
-            handle_init(config, no_vault)?;
-        }
-        Command::Serve { config } => {
-            let config = config::Config::load_or_default(config.as_deref())?;
-            config::init_tracing(&config.log)?;
-            let storage = storage::Storage::open(&config.server.data_dir)?;
-            print_urls(config.server.listen, &config.server.public_url);
-            app::serve(
-                config.server.listen,
-                config.tls,
-                &config.server.data_dir,
-                config.limits,
-                config.snapshots,
-                storage,
-            )
-            .await?;
-        }
-        Command::Vault { command } => match command {
-            VaultCommand::Create { name, config } => {
-                let config = config::Config::load_or_default(config.as_deref())?;
-                let storage = storage::Storage::open(&config.server.data_dir)?;
-                let name = match name {
-                    Some(name) => name,
-                    None => prompt_text("vault name", "My Vault")?,
-                };
-                let vault = storage.create_vault(&name).context("create vault")?;
-                print_vault(&vault);
-            }
-            VaultCommand::List { config } => {
-                let config = config::Config::load_or_default(config.as_deref())?;
-                let storage = storage::Storage::open(&config.server.data_dir)?;
-                for vault in storage.list_vaults()? {
-                    println!("{}\t{}\t{}", vault.id, vault.name, vault.created_at_unix);
-                }
-            }
-        },
-        Command::Device { command } => match command {
-            DeviceCommand::List { vault, config } => {
-                let config = config::Config::load_or_default(config.as_deref())?;
-                let storage = storage::Storage::open(&config.server.data_dir)?;
-                let vault = resolve_vault_id(&storage, vault)?;
-                for device in storage.list_devices(&vault)? {
-                    println!(
-                        "{}\t{}\t{}\t{:?}",
-                        device.device_id,
-                        device.label,
-                        device.created_at_unix,
-                        device.revoked_at_unix
-                    );
-                }
-            }
-            DeviceCommand::Revoke {
-                vault,
-                device,
-                config,
-            } => {
-                let config = config::Config::load_or_default(config.as_deref())?;
-                let storage = storage::Storage::open(&config.server.data_dir)?;
-                let vault = resolve_vault_id(&storage, vault)?;
-                let device = resolve_device_id(&storage, &vault, device)?;
-                storage.revoke_device(&vault, &device)?;
-                println!("revoked device {device} in vault {vault}");
-            }
-        },
-        Command::Pair { command } => match command {
-            PairCommand::Issue { vault, config } => {
-                let config = config::Config::load_or_default(config.as_deref())?;
-                let storage = storage::Storage::open(&config.server.data_dir)?;
-                let vault = resolve_vault_id(&storage, vault)?;
-                let token = storage.issue_pairing_token(&vault)?;
-                println!("vault_id={}", token.vault_id);
-                println!("pairing_token={}", token.token);
-                println!("expires_at_unix={}", token.expires_at_unix);
-            }
-        },
-        Command::Stats { config } => {
+        Command::Init { config, no_vault } => handle_init(config, no_vault),
+        Command::Serve { config } => handle_serve(config.as_deref()).await,
+        Command::Vault { command } => handle_vault(command),
+        Command::Device { command } => handle_device(command),
+        Command::Stats { config } => handle_stats(config.as_deref()),
+    }
+}
+
+async fn handle_serve(config_path: Option<&std::path::Path>) -> anyhow::Result<()> {
+    let config = config::Config::load_or_default(config_path)?;
+    config::init_tracing(&config.log)?;
+    let storage = storage::Storage::open(&config.server.data_dir)?;
+    print_listening(config.server.listen, &config.server.public_url);
+    app::serve(
+        config.server.listen,
+        config.tls,
+        &config.server.data_dir,
+        config.limits,
+        config.snapshots,
+        storage,
+    )
+    .await
+}
+
+fn handle_vault(command: VaultCommand) -> anyhow::Result<()> {
+    match command {
+        VaultCommand::Create { name, config } => {
             let config = config::Config::load_or_default(config.as_deref())?;
             let storage = storage::Storage::open(&config.server.data_dir)?;
-            let stats = storage.stats()?;
-            println!("vaults={}", stats.vault_count);
+            let name = match name {
+                Some(name) => name,
+                None => prompt_text("vault name", "My Vault")?,
+            };
+            let vault = storage.create_vault(&name).context("create vault")?;
+            print_vault(&vault);
+        }
+        VaultCommand::List { config } => {
+            let config = config::Config::load_or_default(config.as_deref())?;
+            let storage = storage::Storage::open(&config.server.data_dir)?;
+            for vault in storage.list_vaults()? {
+                println!("{}\t{}\t{}", vault.id, vault.name, vault.created_at_unix);
+            }
+        }
+        VaultCommand::Delete { vault, config, yes } => {
+            let config = config::Config::load_or_default(config.as_deref())?;
+            let storage = storage::Storage::open(&config.server.data_dir)?;
+            let vault_id = resolve_vault_id(&storage, vault)?;
+            if !yes
+                && !prompt_yes_no(
+                    &format!(
+                        "Delete vault {vault_id} and all of its devices, ops, blobs, and snapshots?"
+                    ),
+                    false,
+                )?
+            {
+                print_status("Cancelled", "vault was not deleted");
+                return Ok(());
+            }
+            storage.delete_vault(&vault_id)?;
+            print_status("Vault", &format!("deleted {vault_id}"));
         }
     }
+    Ok(())
+}
 
+fn handle_device(command: DeviceCommand) -> anyhow::Result<()> {
+    match command {
+        DeviceCommand::List { vault, config } => {
+            let config = config::Config::load_or_default(config.as_deref())?;
+            let storage = storage::Storage::open(&config.server.data_dir)?;
+            let vault = resolve_vault_id(&storage, vault)?;
+            for device in storage.list_devices(&vault)? {
+                println!(
+                    "{}\t{}\t{}\t{:?}",
+                    device.device_id, device.label, device.created_at_unix, device.revoked_at_unix
+                );
+            }
+        }
+        DeviceCommand::Revoke {
+            vault,
+            device,
+            config,
+        } => {
+            let config = config::Config::load_or_default(config.as_deref())?;
+            let storage = storage::Storage::open(&config.server.data_dir)?;
+            let vault = resolve_vault_id(&storage, vault)?;
+            let device = resolve_device_id(&storage, &vault, device)?;
+            storage.revoke_device(&vault, &device)?;
+            println!("revoked device {device} in vault {vault}");
+        }
+    }
+    Ok(())
+}
+
+fn handle_stats(config_path: Option<&std::path::Path>) -> anyhow::Result<()> {
+    let config = config::Config::load_or_default(config_path)?;
+    let storage = storage::Storage::open(&config.server.data_dir)?;
+    let stats = storage.stats()?;
+    println!("vaults={}", stats.vault_count);
     Ok(())
 }
 
@@ -239,48 +253,14 @@ fn prompt_index(label: &str, len: usize) -> anyhow::Result<usize> {
     }
 }
 
-fn print_urls(listen: SocketAddr, public_url: &str) {
-    print_status("Server", &format!("listening on {listen}"));
-    print_kv("public url", public_url);
-    for url in candidate_urls(listen) {
-        print_kv("try", &url);
-    }
-}
-
-fn candidate_urls(listen: SocketAddr) -> BTreeSet<String> {
-    let mut urls = BTreeSet::new();
-    let scheme = "http";
-    let port = listen.port();
-    match listen.ip() {
-        IpAddr::V4(ip) if ip.is_unspecified() => {
-            urls.insert(format!("{scheme}://127.0.0.1:{port}"));
-            if let Some(lan_ip) = primary_lan_ipv4() {
-                urls.insert(format!("{scheme}://{lan_ip}:{port}"));
-            }
-        }
-        IpAddr::V4(ip) => {
-            urls.insert(format!("{scheme}://{ip}:{port}"));
-        }
-        IpAddr::V6(ip) if ip.is_unspecified() => {
-            urls.insert(format!("{scheme}://127.0.0.1:{port}"));
-            if let Some(lan_ip) = primary_lan_ipv4() {
-                urls.insert(format!("{scheme}://{lan_ip}:{port}"));
-            }
-        }
-        IpAddr::V6(ip) => {
-            urls.insert(format!("{scheme}://[{ip}]:{port}"));
-        }
-    }
-    urls
-}
-
-fn primary_lan_ipv4() -> Option<Ipv4Addr> {
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
-    socket.connect((Ipv4Addr::new(1, 1, 1, 1), 80)).ok()?;
-    match socket.local_addr().ok()?.ip() {
-        IpAddr::V4(ip) if !ip.is_loopback() => Some(ip),
-        _ => None,
-    }
+fn print_listening(listen: SocketAddr, public_url: &str) {
+    let trimmed = public_url.trim_end_matches('/');
+    let display = if trimmed.is_empty() {
+        format!("http://{listen}")
+    } else {
+        trimmed.to_string()
+    };
+    print_status("Server", &format!("listening on {display}"));
 }
 
 fn print_status(label: &str, value: &str) {

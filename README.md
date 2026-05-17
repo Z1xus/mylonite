@@ -6,11 +6,11 @@
 ![Obsidian](https://img.shields.io/badge/obsidian-desktop%20%2B%20mobile-7c3aed.svg)
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
 
-Mylonite is a self-hosted sync server for Obsidian. Use it with the Mylonite plugin to pair devices and sync encrypted vault data through your own storage.
+Mylonite is a self-hosted sync server for Obsidian. Use it with the Mylonite plugin to pair devices and sync end-to-end encrypted vault data through your own storage.
 
-## Deploy
+## Server
 
-Install the latest server binary.
+Install the latest binary.
 
 Debian/Ubuntu x86_64:
 
@@ -21,38 +21,31 @@ sudo install -m 0755 /tmp/mylonite /usr/local/bin/mylonite
 mylonite --version
 ```
 
-Other platforms: download the matching binary from Releases and place it somewhere on `PATH`.
+Other platforms: grab the matching binary from Releases and place it on your `PATH`.
 
-Bootstrap config and the first pairing token:
+Create the config and the first vault's pairing token:
 
 ```bash
 mylonite init
 ```
 
-Start the server:
+Run the server:
 
 ```bash
 mylonite serve
 ```
 
-Default config locations:
+The default config lives at:
 
 - Linux: `~/.config/mylonite/config.toml`
 - macOS: `~/Library/Application Support/mylonite/config.toml`
 - Windows: `%APPDATA%\mylonite\config.toml`
 
-Run `mylonite serve` under your service manager.
+Keep `listen = "127.0.0.1:9821"` when a reverse proxy terminates TLS on the same host. Use `listen = "0.0.0.0:9821"` and set `public_url` to the reachable URL if the server should accept direct connections.
 
-Systemd:
+### Systemd
 
-```bash
-sudo useradd --system --create-home --home-dir /var/lib/mylonite --shell /usr/sbin/nologin mylonite
-sudo -u mylonite -H /usr/local/bin/mylonite init
-sudo nano /var/lib/mylonite/.config/mylonite/config.toml
-sudo nano /etc/systemd/system/mylonite.service
-```
-
-When running as the `mylonite` user, the default config path is `/var/lib/mylonite/.config/mylonite/config.toml`. Keep `listen = "127.0.0.1:9821"` if a reverse proxy terminates TLS on the same host. Use `listen = "0.0.0.0:9821"` and set `public_url` to the reachable URL if the server should accept direct network connections.
+Drop this unit at `/etc/systemd/system/mylonite.service`, replacing `YOUR_USER` with the account that ran `mylonite init`:
 
 ```ini
 [Unit]
@@ -63,9 +56,7 @@ Wants=network-online.target
 [Service]
 ExecStart=/usr/local/bin/mylonite serve
 Restart=on-failure
-User=mylonite
-Group=mylonite
-WorkingDirectory=/var/lib/mylonite
+User=YOUR_USER
 
 [Install]
 WantedBy=multi-user.target
@@ -79,7 +70,7 @@ sudo systemctl status mylonite
 
 Windows: run `mylonite serve` with NSSM, WinSW, or your preferred service wrapper.
 
-## Docker
+### Docker
 
 ```bash
 docker run -p 9821:9821 \
@@ -88,7 +79,7 @@ docker run -p 9821:9821 \
   ghcr.io/z1xus/mylonite:latest
 ```
 
-## Install Plugin
+## Plugin
 
 Preferred: install [BRAT](https://tfthacker.com/brat-quick-guide), then add `z1xus/mylonite` as a beta plugin. This is the easiest path on mobile.
 
@@ -98,14 +89,35 @@ Manual install: download [mylonite-obsidian-plugin.zip](https://github.com/z1xus
 <vault>/.obsidian/plugins/mylonite/
 ```
 
-Enable Mylonite in Obsidian, enter the server URL and pairing token, then click Pair.
+Enable Mylonite in Obsidian's community plugins list, then open its settings.
 
-## Pair More Devices
+## Pairing
 
-1. On the new device, open Mylonite settings and click **Request**.
-2. Copy the request to an already paired device.
-3. Paste it into **Authorize another device** and click **Authorize**.
-4. Copy the response back to the new device and click **Complete**.
+There are two paths. Pair the first device with the pairing token; add every other device with the Request / Authorize flow. The pairing token sets up the vault encryption key locally, so reusing it on a second device would create a device that can't decrypt anything the first device wrote.
+
+### First device
+
+1. Enter your server URL.
+2. Paste the pairing token printed by `mylonite init`.
+3. Click Pair.
+
+The server now has one paired device. Sync starts immediately.
+
+### Additional devices
+
+1. On the new device, open Mylonite settings -> Join an existing vault -> click Request. Copy the request that appears.
+2. On an already paired device, open Mylonite settings -> Add another device, paste the request, and click Authorize. Copy the response that appears.
+3. Back on the new device, paste the response into Step 2 and click Complete.
+
+The new device receives the vault encryption key over an ephemeral X25519 channel, registers with the server, and starts replaying vault history.
+
+If you ever lose access to every paired device, the vault data is unrecoverable — the encryption key was generated on the first device and the server only holds ciphertext. Wipe the dead vault and start fresh:
+
+```bash
+mylonite vault delete <vault_id>
+mylonite vault create "My Vault"
+# pair the new device with the freshly printed token
+```
 
 ## Develop
 

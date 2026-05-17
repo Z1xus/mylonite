@@ -176,7 +176,75 @@ impl Storage {
         Ok(vaults)
     }
 
-    pub fn issue_pairing_token(&self, vault_id: &str) -> anyhow::Result<PairingTokenRecord> {
+    pub fn delete_vault(&self, vault_id: &str) -> anyhow::Result<()> {
+        let read = self.db.begin_read().context("begin read")?;
+        {
+            let vaults = read.open_table(VAULTS).context("open vault table")?;
+            if vaults.get(vault_id).context("read vault")?.is_none() {
+                bail!("vault not found");
+            }
+        }
+        drop(read);
+
+        let prefix = format!("{vault_id}:");
+        let write = self.db.begin_write().context("begin write")?;
+        {
+            let mut vaults = write.open_table(VAULTS).context("open vault table")?;
+            vaults.remove(vault_id).context("remove vault row")?;
+
+            remove_prefixed_keys(
+                &mut write.open_table(DEVICES).context("open device table")?,
+                &prefix,
+            )?;
+            remove_prefixed_keys(&mut write.open_table(OPLOG).context("open oplog")?, &prefix)?;
+            remove_prefixed_keys(
+                &mut write
+                    .open_table(CLIENT_OPS)
+                    .context("open client ops table")?,
+                &prefix,
+            )?;
+            remove_prefixed_keys(
+                &mut write.open_table(BLOB_INDEX).context("open blob index")?,
+                &prefix,
+            )?;
+            remove_prefixed_keys(
+                &mut write.open_table(SNAPSHOTS).context("open snapshots")?,
+                &prefix,
+            )?;
+
+            let mut tokens = write
+                .open_table(PAIRING_TOKENS)
+                .context("open pairing token table")?;
+            let stale_tokens = {
+                let mut out = Vec::new();
+                for item in tokens.iter().context("iterate pairing tokens")? {
+                    let (key, value) = item.context("read pairing token row")?;
+                    let record: PairingTokenRecord = serde_json::from_slice(value.value())
+                        .context("decode pairing token row")?;
+                    if record.vault_id == vault_id {
+                        out.push(key.value().to_string());
+                    }
+                }
+                out
+            };
+            for key in stale_tokens {
+                tokens
+                    .remove(key.as_str())
+                    .context("remove pairing token")?;
+            }
+        }
+        write.commit().context("commit vault delete")?;
+
+        let blob_root = self.data_dir.join("blobs").join(vault_id);
+        if blob_root.exists() {
+            fs::remove_dir_all(&blob_root)
+                .with_context(|| format!("remove {}", blob_root.display()))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn issue_pairing_token(&self, vault_id: &str) -> anyhow::Result<PairingTokenRecord> {
         let now = now_unix()?;
         let read = self.db.begin_read().context("begin read")?;
         {
@@ -229,6 +297,14 @@ impl Storage {
             if token_record.expires_at_unix < now {
                 bail!("pairing token expired");
             }
+            {
+                let devices = write.open_table(DEVICES).context("open device table")?;
+                if vault_has_any_device(&devices, &token_record.vault_id)? {
+                    bail!(
+                        "vault already has a paired device; use the Request / Authorize flow from an existing device instead of a pairing token"
+                    );
+                }
+            }
             token_record.consumed_at_unix = Some(now);
             write_json(&mut tokens, token, &token_record)?;
 
@@ -254,7 +330,7 @@ impl Storage {
         Ok(device)
     }
 
-    pub fn register_authorized_device_with_limit(
+    pub fn register_authorized_device(
         &self,
         vault_id: &str,
         label: &str,
@@ -679,6 +755,40 @@ fn active_device_count(
     Ok(count)
 }
 
+fn vault_has_any_device(
+    devices: &redb::Table<'_, &str, &[u8]>,
+    vault_id: &str,
+) -> anyhow::Result<bool> {
+    let prefix = format!("{vault_id}:");
+    for item in devices.iter().context("iterate devices")? {
+        let (key, _) = item.context("read device row")?;
+        if key.value().starts_with(&prefix) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn remove_prefixed_keys<V>(table: &mut redb::Table<'_, &str, V>, prefix: &str) -> anyhow::Result<()>
+where
+    V: redb::Value + 'static,
+{
+    let stale = {
+        let mut out = Vec::new();
+        for item in table.iter().context("iterate table")? {
+            let (key, _) = item.context("read table row")?;
+            if key.value().starts_with(prefix) {
+                out.push(key.value().to_string());
+            }
+        }
+        out
+    };
+    for key in stale {
+        table.remove(key.as_str()).context("remove table row")?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{EncryptedOpRecord, SnapshotRecord, Storage};
@@ -744,18 +854,36 @@ mod tests {
     }
 
     #[test]
+    fn register_first_device_rejects_pairing_token_when_vault_already_has_a_device() {
+        let storage = test_storage();
+        let vault = storage.create_vault("test vault").expect("create vault");
+        storage
+            .register_first_device(&vault.pairing_token, "laptop", &"c".repeat(64))
+            .expect("register first device");
+        let second_token = storage
+            .issue_pairing_token(&vault.id)
+            .expect("issue second pairing token");
+
+        let error = storage
+            .register_first_device(&second_token.token, "phone", &"d".repeat(64))
+            .expect_err("second pair-token registration must be rejected");
+
+        assert!(error.to_string().contains("Request"));
+    }
+
+    #[test]
     fn register_authorized_device_rejects_missing_vaults_and_adds_device() {
         let storage = test_storage();
 
         assert!(
             storage
-                .register_authorized_device_with_limit("missing", "phone", &"e".repeat(64), 16)
+                .register_authorized_device("missing", "phone", &"e".repeat(64), 16)
                 .is_err()
         );
 
         let vault = storage.create_vault("test vault").expect("create vault");
         let device = storage
-            .register_authorized_device_with_limit(&vault.id, "phone", &"f".repeat(64), 16)
+            .register_authorized_device(&vault.id, "phone", &"f".repeat(64), 16)
             .expect("register authorized device");
         let devices = storage.list_devices(&vault.id).expect("list devices");
 
@@ -765,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn register_authorized_device_with_limit_rejects_when_active_device_limit_is_reached() {
+    fn register_authorized_device_rejects_when_active_device_limit_is_reached() {
         let storage = test_storage();
         let vault = storage.create_vault("test vault").expect("create vault");
         let first = storage
@@ -774,7 +902,7 @@ mod tests {
 
         assert!(
             storage
-                .register_authorized_device_with_limit(&vault.id, "phone", &"2".repeat(64), 1)
+                .register_authorized_device(&vault.id, "phone", &"2".repeat(64), 1)
                 .is_err()
         );
 
@@ -782,7 +910,7 @@ mod tests {
             .revoke_device(&vault.id, &first.device_id)
             .expect("revoke first device");
         storage
-            .register_authorized_device_with_limit(&vault.id, "phone", &"3".repeat(64), 1)
+            .register_authorized_device(&vault.id, "phone", &"3".repeat(64), 1)
             .expect("register after revoke");
     }
 
@@ -885,6 +1013,59 @@ mod tests {
         storage
             .put_blob_with_vault_limit(&vault.id, "blob-b", b"12", 4)
             .expect("remaining quota is available after replacement");
+    }
+
+    #[test]
+    fn delete_vault_removes_all_per_vault_state_and_blob_files() {
+        let storage = test_storage();
+        let kept = storage.create_vault("kept").expect("create kept vault");
+        let doomed = storage.create_vault("doomed").expect("create doomed vault");
+        storage
+            .register_first_device(&doomed.pairing_token, "laptop", &"1".repeat(64))
+            .expect("register first device");
+        storage
+            .issue_pairing_token(&doomed.id)
+            .expect("issue extra token");
+        storage
+            .append_op(test_op(&doomed.id, "op-a"))
+            .expect("append op");
+        storage
+            .put_blob_with_vault_limit(&doomed.id, "blob-a", b"1234", 1024)
+            .expect("put blob");
+        storage
+            .put_snapshot(test_snapshot(&doomed.id, 1))
+            .expect("put snapshot");
+
+        storage.delete_vault(&doomed.id).expect("delete vault");
+
+        let vaults = storage.list_vaults().expect("list vaults");
+        assert_eq!(vaults.len(), 1);
+        assert_eq!(vaults[0].id, kept.id);
+        assert!(
+            storage
+                .list_devices(&doomed.id)
+                .expect("list devices")
+                .is_empty()
+        );
+        assert!(
+            storage
+                .list_ops_after(&doomed.id, 0, 100)
+                .expect("list ops")
+                .is_empty()
+        );
+        assert!(
+            storage
+                .list_snapshots(&doomed.id)
+                .expect("list snapshots")
+                .is_empty()
+        );
+        assert!(storage.delete_vault(&doomed.id).is_err());
+        assert!(
+            storage
+                .register_first_device(&doomed.pairing_token, "phone", &"2".repeat(64))
+                .is_err(),
+            "old pairing tokens for the deleted vault must no longer resolve"
+        );
     }
 
     fn test_storage() -> Storage {

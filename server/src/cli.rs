@@ -29,10 +29,6 @@ pub enum Command {
         #[command(subcommand)]
         command: DeviceCommand,
     },
-    Pair {
-        #[command(subcommand)]
-        command: PairCommand,
-    },
     Stats {
         #[arg(long)]
         config: Option<PathBuf>,
@@ -50,6 +46,13 @@ pub enum VaultCommand {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    Delete {
+        vault: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -62,15 +65,6 @@ pub enum DeviceCommand {
     Revoke {
         vault: Option<String>,
         device: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub enum PairCommand {
-    Issue {
-        vault: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
     },

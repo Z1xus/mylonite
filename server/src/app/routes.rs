@@ -94,7 +94,7 @@ pub(super) async fn register_device(
     )?;
     let request: RegisterDeviceRequest = serde_json::from_slice(&body)?;
     validation::validate_register_device_request(&request)?;
-    let device = app_state.storage.register_authorized_device_with_limit(
+    let device = app_state.storage.register_authorized_device(
         &vault_id,
         &request.label,
         &request.verifying_key,
