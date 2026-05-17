@@ -71,6 +71,7 @@ export default class MylonitePlugin extends Plugin {
 
   async loadSettings(): Promise<void> {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    this.syncEngine.reloadDurableState();
   }
 
   async saveSettings(): Promise<void> {
@@ -244,7 +245,7 @@ export default class MylonitePlugin extends Plugin {
     if (!confirmed) {
       return;
     }
-    this.syncEngine.close();
+    this.syncEngine.close({ flushScheduledUpdates: false });
     clearDevicePrivateKey(this.app, this.settings);
     clearDevicePairingPrivateKey(this.app, this.settings);
     clearPassphrase(this.app, this.settings);
@@ -258,7 +259,13 @@ export default class MylonitePlugin extends Plugin {
     this.settings.lamport = 0;
     this.settings.lastServerSeq = 0;
     this.settings.pendingOps = [];
+    this.settings.durableSyncState = {
+      version: 1,
+      index: { version: 1, files: [], tombstones: [] },
+      journal: [],
+    };
     this.vaultKeys = null;
+    this.syncEngine.reloadDurableState();
     await this.saveSettings();
     this.updateStatus("unpaired");
     new Notice("Device unpaired.");

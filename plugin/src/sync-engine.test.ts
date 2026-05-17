@@ -75,6 +75,20 @@ describe("markdown debounce", () => {
     expect(pushMarkdownUpdate).toHaveBeenCalledTimes(1);
     expect(pushMarkdownUpdate).toHaveBeenCalledWith(file);
   });
+
+  it("can close without flushing scheduled markdown updates", () => {
+    vi.useFakeTimers();
+    const engine = new SyncEngine(testHost());
+    const pushMarkdownUpdate = vi.fn().mockResolvedValue(undefined);
+    (engine as unknown as { pushMarkdownUpdate: typeof pushMarkdownUpdate }).pushMarkdownUpdate = pushMarkdownUpdate;
+    const file = testFile("Notes/a.md", "md");
+
+    callPrivate(engine, "scheduleMarkdownUpdate", file);
+    engine.close({ flushScheduledUpdates: false });
+    vi.runAllTimers();
+
+    expect(pushMarkdownUpdate).not.toHaveBeenCalled();
+  });
 });
 
 describe("websocket reconnect", () => {

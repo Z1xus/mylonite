@@ -96,13 +96,27 @@ export class SyncEngine {
     });
   }
 
-  close(): void {
+  close(options: { flushScheduledUpdates?: boolean } = {}): void {
     this.manuallyClosed = true;
-    this.flushScheduledMarkdownUpdates();
+    if (options.flushScheduledUpdates ?? true) {
+      this.flushScheduledMarkdownUpdates();
+    } else {
+      this.dropScheduledMarkdownUpdates();
+    }
     this.clearReconnectTimer();
     this.socketLive = false;
     this.socket?.close();
     this.socket = null;
+  }
+
+  reloadDurableState(): void {
+    this.stateIndex = VaultStateIndex.fromSnapshot(this.host.settings.durableSyncState?.index);
+    this.classifier = new LocalEventClassifier(this.stateIndex);
+    this.locallyDirtyPaths.clear();
+    this.locallyDirtyFileIds.clear();
+    this.pendingOpPaths.clear();
+    this.pendingOpFileIds.clear();
+    this.suppressedPaths.clear();
   }
 
   async catchUp(): Promise<void> {
@@ -591,6 +605,13 @@ export class SyncEngine {
         this.host.debug(`flush before close failed: ${String(error)}`);
       });
     }
+  }
+
+  private dropScheduledMarkdownUpdates(): void {
+    for (const { timer } of this.modifyTimers.values()) {
+      window.clearTimeout(timer);
+    }
+    this.modifyTimers.clear();
   }
 
   private shouldRunPeriodicCatchUp(now: number): boolean {
