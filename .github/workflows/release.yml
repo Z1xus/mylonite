@@ -18,6 +18,9 @@ env:
   CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_CACHE_SIZE: 2G
 
 jobs:
   plugin:
@@ -94,7 +97,8 @@ jobs:
         with:
           toolchain: 1.85.0
           targets: ${{ matrix.target }}
-          components: rustfmt, clippy
+
+      - uses: mozilla-actions/sccache-action@v0.0.10
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -104,6 +108,10 @@ jobs:
 
       - name: Build server
         run: cargo build --release -p mylonite --target ${{ matrix.target }}
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
 
       - name: Package server
         shell: bash

@@ -12,6 +12,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_CACHE_SIZE: 2G
 
 jobs:
   changes:
@@ -50,6 +53,8 @@ jobs:
           toolchain: 1.85.0
           components: rustfmt, clippy
 
+      - uses: mozilla-actions/sccache-action@v0.0.10
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
@@ -63,6 +68,10 @@ jobs:
 
       - name: Test
         run: cargo test -p mylonite
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
 
   plugin:
     name: Plugin
