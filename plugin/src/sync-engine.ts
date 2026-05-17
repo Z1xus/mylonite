@@ -256,8 +256,7 @@ export class SyncEngine {
       fileId: transition.fileId,
       path: normalizedPath,
       fileKind: "markdown",
-      contentUpdate: updateHex,
-      changedPaths: [normalizedPath],
+      updateHex,
       baseHash: transition.baseHash,
       contentHash: transition.contentHash,
     }, [transition.fileId], transition.transitionId);
@@ -314,9 +313,9 @@ export class SyncEngine {
         kind: "file-delete",
         fileId: transition.fileId,
         path: normalizedPath,
+        fileKind: "markdown",
         tombstoneId: transition.tombstoneId,
         updateHex,
-        changedPaths: [normalizedPath],
       }, [transition.fileId], transition.transitionId);
       this.host.updateStatus("synced local delete");
       return;
@@ -326,6 +325,7 @@ export class SyncEngine {
       kind: "file-delete",
       fileId: transition.fileId,
       path: normalizedPath,
+      fileKind: "binary",
       tombstoneId: transition.tombstoneId,
     }, [transition.fileId], transition.transitionId);
     this.host.updateStatus("synced local delete");
@@ -358,8 +358,9 @@ export class SyncEngine {
         oldPath: normalizedOldPath,
         newPath: normalizedNewPath,
         path: normalizedNewPath,
+        fileKind: "markdown",
+        contentHash: transition.contentHash,
         updateHex,
-        changedPaths: [normalizedOldPath, normalizedNewPath],
       }, [transition.fileId], transition.transitionId);
       this.host.updateStatus("synced local rename");
       return;
@@ -374,15 +375,17 @@ export class SyncEngine {
       oldPath: normalizedOldPath,
       newPath: normalizedNewPath,
       path: normalizedNewPath,
+      fileKind: "binary",
+      contentHash: transition.contentHash,
     }, [transition.fileId], transition.transitionId);
     this.host.updateStatus("synced local rename");
   }
 
-  private async pushEncryptedOp(kind: number, changedPaths: string[], payloadObject: object, changedFileIds: string[] = [], transitionId?: string): Promise<void> {
+  private async pushEncryptedOp(kind: number, affectedPaths: string[], payloadObject: object, changedFileIds: string[] = [], transitionId?: string): Promise<void> {
     const keys = await this.host.loadVaultKeys();
     const lamport = this.host.settings.lamport + 1;
     const op = encodeEncryptedOp(keys, this.host.settings.vaultId, this.host.settings.deviceId, lamport, kind, payloadObject);
-    const normalizedChangedPaths = changedPaths.map((path) => normalizeVaultPath(path));
+    const normalizedChangedPaths = affectedPaths.map((path) => normalizeVaultPath(path));
     this.pendingOpPaths.set(op.client_op_id, normalizedChangedPaths);
     this.pendingOpFileIds.set(op.client_op_id, changedFileIds);
     this.attachOpToTransition(transitionId, op.client_op_id);
@@ -427,7 +430,6 @@ export class SyncEngine {
         newFileId: transition.fileId,
         path: normalizedPath,
         fileKind: "markdown",
-        content,
         updateHex,
         contentHash: transition.contentHash,
       }, [transition.fileId], transition.transitionId);
@@ -758,6 +760,9 @@ export class SyncEngine {
       return;
     }
     if (payload.kind === "file-rename") {
+      if (payload.fileKind === "markdown") {
+        applyMarkdownUpdate(this.ydoc, requiredMarkdownUpdateHex(payload));
+      }
       const targetPath = decision.action === "conflict-path" ? decision.path : payload.newPath;
       const result = await applyFileRenameWithCollision(this.host.app.vault, this.suppressedPaths, payload.oldPath, targetPath, payload.fileId);
       const finalPath = result.status === "missing-local-file" ? targetPath : result.path;
@@ -765,8 +770,8 @@ export class SyncEngine {
       this.stateIndex.upsertFile({
         fileId: payload.fileId,
         path: finalPath,
-        kind: current?.kind ?? "markdown",
-        contentHash: current?.contentHash ?? "",
+        kind: payload.fileKind,
+        contentHash: payload.contentHash ?? current?.contentHash ?? "",
         tombstone: false,
         lastLocalSeq: current?.lastLocalSeq ?? 0,
         lastRemoteSeq: serverSeq,
@@ -775,6 +780,9 @@ export class SyncEngine {
       return;
     }
     if (payload.kind === "file-delete") {
+      if (payload.fileKind === "markdown") {
+        applyMarkdownUpdate(this.ydoc, requiredMarkdownUpdateHex(payload));
+      }
       await applyFileDelete(this.host.app.vault, this.suppressedPaths, payload.path);
       this.stateIndex.deleteFile(payload.fileId, payload.path, Date.now(), payload.tombstoneId);
       return;
@@ -785,24 +793,25 @@ export class SyncEngine {
       await this.applyRemoteV2Content({ ...payload, fileId, path }, false, serverSeq);
       return;
     }
-    await this.applyRemoteV2Content(payload, true, serverSeq);
+    if (payload.kind === "file-update") {
+      const path = decision.action === "conflict-path" ? decision.path : payload.path;
+      await this.applyRemoteV2Content({ ...payload, path }, decision.action !== "conflict-path", serverSeq);
+    }
   }
 
   private async applyRemoteV2Content(payload: RemoteV2Payload & { path: string; fileId: string }, allowOverwrite: boolean, serverSeq: number): Promise<void> {
     if ((payload.kind === "file-create" || payload.kind === "file-copy") && payload.fileKind === "markdown") {
-      const content = payload.content ?? "";
+      applyMarkdownUpdate(this.ydoc, requiredMarkdownUpdateHex(payload));
+      const content = getMarkdownText(this.ytree, normalizeVaultPath(payload.path))?.toString() ?? "";
       const result = await applyMarkdownUpsertWithCollision(this.host.app.vault, this.suppressedPaths, payload.path, content, payload.fileId, allowOverwrite);
       this.recordRemoteFile(payload.fileId, result.path, "markdown", payload.contentHash, serverSeq);
       return;
     }
     if (payload.kind === "file-update" && payload.fileKind === "markdown") {
-      if (payload.contentUpdate) {
-        applyMarkdownUpdate(this.ydoc, payload.contentUpdate);
-        const text = getMarkdownText(this.ytree, normalizeVaultPath(payload.path));
-        const content = text?.toString() ?? "";
-        const result = await applyMarkdownUpsertWithCollision(this.host.app.vault, this.suppressedPaths, payload.path, content, payload.fileId, allowOverwrite);
-        this.recordRemoteFile(payload.fileId, result.path, "markdown", payload.contentHash, serverSeq);
-      }
+      applyMarkdownUpdate(this.ydoc, requiredMarkdownUpdateHex(payload));
+      const content = getMarkdownText(this.ytree, normalizeVaultPath(payload.path))?.toString() ?? "";
+      const result = await applyMarkdownUpsertWithCollision(this.host.app.vault, this.suppressedPaths, payload.path, content, payload.fileId, allowOverwrite);
+      this.recordRemoteFile(payload.fileId, result.path, "markdown", payload.contentHash, serverSeq);
       return;
     }
     if ((payload.kind === "file-create" || payload.kind === "file-copy" || payload.kind === "file-update") && payload.fileKind === "binary") {
@@ -955,20 +964,28 @@ function remotePayloadPaths(payload: RemotePayload): string[] {
   return [payload.path];
 }
 
+function requiredMarkdownUpdateHex(payload: RemoteV2Payload): string {
+  if (payload.fileKind !== "markdown" || typeof payload.updateHex !== "string") {
+    throw new Error("missing v2 markdown update");
+  }
+  return payload.updateHex;
+}
+
 function validateRemoteV2Payload(payload: RemoteV2Payload): void {
   validateFileId(payload.fileId);
   normalizeVaultPath(payload.path);
-  if (payload.kind === "file-create" || payload.kind === "file-update" || payload.kind === "file-copy") {
-    validateFileKind(payload.fileKind);
-    validateContentHash(payload.contentHash);
-    if (payload.fileKind === "markdown") {
-      if (payload.kind !== "file-update" && payload.content !== undefined && typeof payload.content !== "string") {
-        throw new Error("invalid v2 markdown content");
-      }
-      if (payload.kind === "file-update" && payload.contentUpdate !== undefined) {
-        validateHexPayload("v2 content update", payload.contentUpdate);
-      }
+  validateFileKind(payload.fileKind);
+  if (!["file-create", "file-update", "file-rename", "file-delete", "file-copy"].includes(payload.kind)) {
+    throw new Error("unsupported v2 payload kind");
+  }
+  if (payload.fileKind === "markdown") {
+    if (typeof payload.updateHex !== "string") {
+      throw new Error("missing v2 markdown update");
     }
+    validateHexPayload("v2 update", payload.updateHex);
+  }
+  if (payload.kind === "file-create" || payload.kind === "file-update" || payload.kind === "file-copy") {
+    validateContentHash(payload.contentHash);
     if (payload.fileKind === "binary") {
       if (typeof payload.blobId !== "string" || !/^[0-9a-f]{64}$/.test(payload.blobId)) {
         throw new Error("invalid v2 blob id");
@@ -981,6 +998,9 @@ function validateRemoteV2Payload(payload: RemoteV2Payload): void {
   if (payload.kind === "file-rename") {
     normalizeVaultPath(payload.oldPath);
     normalizeVaultPath(payload.newPath);
+    if (payload.contentHash !== undefined) {
+      validateContentHash(payload.contentHash);
+    }
   }
   if (payload.kind === "file-delete") {
     if (typeof payload.tombstoneId !== "string" || !/^t[0-9a-f]{32}$/.test(payload.tombstoneId)) {

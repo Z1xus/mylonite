@@ -22,10 +22,9 @@ export function decideRemoteV2Apply(index: VaultStateIndex, payload: RemoteV2Pay
     }
     return { action: "apply" };
   }
-  const path = payload.kind === "file-copy" ? payload.path : payload.path;
-  const occupant = index.byPath(path);
-  if (occupant && occupant.fileId !== payload.fileId && payload.kind !== "file-update") {
-    return { action: "conflict-path", path: conflictPath(path, payload.fileId), reason: "remote create target is occupied" };
+  const occupant = index.byPath(payload.path);
+  if (occupant && occupant.fileId !== payload.fileId) {
+    return { action: "conflict-path", path: conflictPath(payload.path, payload.fileId), reason: "remote path is occupied by another file" };
   }
   if (payload.kind === "file-update" && localDirtyFileIds.has(payload.fileId) && payload.fileKind === "binary") {
     return { action: "prompt", reason: "remote binary update overlaps local edits" };

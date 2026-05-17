@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TFile } from "obsidian";
+import * as Y from "yjs";
 import {
   MARKDOWN_DEBOUNCE_MS,
   SyncEngine,
@@ -13,6 +14,7 @@ import {
 } from "./sync-engine";
 import { PendingEncryptedOp } from "./sync-types";
 import { ServerMsgKind, encodeFrame } from "./protocol";
+import { encodeMarkdownUpsertUpdate, hexToBytes } from "./yjs-markdown";
 
 describe("pending op queue", () => {
   it("keeps the failed op and later queued ops after a flush failure", () => {
@@ -190,24 +192,73 @@ describe("websocket gap repair", () => {
 
 describe("remote payload validation", () => {
   it("accepts well-formed v2 remote payloads", () => {
-    expect(() => validateRemotePayload(v2Payload({ kind: "file-create", fileKind: "markdown", content: "hello" }))).not.toThrow();
-    expect(() => validateRemotePayload(v2Payload({ kind: "file-update", fileKind: "markdown", contentUpdate: "00ff" }))).not.toThrow();
+    expect(() => validateRemotePayload(v2Payload({ kind: "file-create", fileKind: "markdown", updateHex: "00ff" }))).not.toThrow();
+    expect(() => validateRemotePayload(v2Payload({ kind: "file-update", fileKind: "markdown", updateHex: "00ff" }))).not.toThrow();
     expect(() => validateRemotePayload(v2Payload({ kind: "file-update", fileKind: "binary", blobId: "a".repeat(64), size: 12 }))).not.toThrow();
-    expect(() => validateRemotePayload(v2Payload({ kind: "file-delete", tombstoneId: "t" + "b".repeat(32) }))).not.toThrow();
-    expect(() => validateRemotePayload(v2Payload({ kind: "file-rename", oldPath: "Notes/a.md", newPath: "Notes/b.md" }))).not.toThrow();
+    expect(() => validateRemotePayload(v2Payload({ kind: "file-delete", fileKind: "markdown", updateHex: "00ff", tombstoneId: "t" + "b".repeat(32) }))).not.toThrow();
+    expect(() => validateRemotePayload(v2Payload({ kind: "file-rename", fileKind: "markdown", updateHex: "00ff", oldPath: "Notes/a.md", newPath: "Notes/b.md" }))).not.toThrow();
   });
 
   it("rejects unsafe vault paths before applying remote writes", () => {
     expect(() => validateRemotePayload(v2Payload({ path: "../outside.md", kind: "file-delete", tombstoneId: "t" + "b".repeat(32) }))).toThrow("invalid vault path");
-    expect(() => validateRemotePayload(v2Payload({ path: "/absolute.md", kind: "file-create", fileKind: "markdown", content: "hello" }))).toThrow("invalid vault path");
+    expect(() => validateRemotePayload(v2Payload({ path: "/absolute.md", kind: "file-create", fileKind: "markdown", updateHex: "00ff" }))).toThrow("invalid vault path");
     expect(() => validateRemotePayload(v2Payload({ kind: "file-rename", oldPath: "Notes/a.md", newPath: "Notes/../b.md" }))).toThrow("invalid vault path");
   });
 
   it("rejects legacy and malformed v2 payloads", () => {
     expect(() => validateRemotePayload({ kind: "file-update", path: "Notes/a.md" })).toThrow("unsupported remote payload version");
-    expect(() => validateRemotePayload(v2Payload({ kind: "file-update", fileKind: "markdown", contentUpdate: "abc" }))).toThrow("invalid v2 content update");
+    expect(() => validateRemotePayload(v2Payload({ kind: "file-update", fileKind: "markdown", updateHex: "abc" }))).toThrow("invalid v2 update");
     expect(() => validateRemotePayload(v2Payload({ kind: "file-update", fileKind: "binary", blobId: "blob-a", size: 1 }))).toThrow("invalid v2 blob id");
     expect(() => validateRemotePayload(v2Payload({ kind: "file-update", fileKind: "binary", blobId: "a".repeat(64), size: -1 }))).toThrow("invalid v2 binary size");
+  });
+});
+
+describe("v2 markdown application", () => {
+  it("applies text updates after an empty create on a receiver", async () => {
+    const path = "Notes/a.md";
+    const fileId = "f" + "a".repeat(32);
+    const localDoc = new Y.Doc();
+    const localTree = localDoc.getMap<Y.Map<unknown>>("tree");
+    const createUpdate = encodeMarkdownUpsertUpdate(localDoc, localTree, path, "");
+    const editUpdate = encodeMarkdownUpsertUpdate(localDoc, localTree, path, "hello");
+    const vault = new MemoryVault();
+    const engine = new SyncEngine(testHost(vault));
+
+    await callPrivate(engine, "applyRemoteV2Payload", v2Payload({
+      kind: "file-create",
+      fileId,
+      path,
+      fileKind: "markdown",
+      updateHex: createUpdate,
+      contentHash: "00",
+    }), 1);
+    await callPrivate(engine, "applyRemoteV2Payload", v2Payload({
+      kind: "file-update",
+      fileId,
+      path,
+      fileKind: "markdown",
+      updateHex: editUpdate,
+      contentHash: "01",
+    }), 2);
+
+    expect(vault.readText(path)).toBe("hello");
+  });
+});
+
+describe("markdown state updates", () => {
+  it("can bootstrap a receiver even if earlier updates were not applied", () => {
+    const path = "Notes/a.md";
+    const localDoc = new Y.Doc();
+    const localTree = localDoc.getMap<Y.Map<unknown>>("tree");
+    encodeMarkdownUpsertUpdate(localDoc, localTree, path, "");
+    const editUpdate = encodeMarkdownUpsertUpdate(localDoc, localTree, path, "hello");
+    const remoteDoc = new Y.Doc();
+    const remoteTree = remoteDoc.getMap<Y.Map<unknown>>("tree");
+
+    Y.applyUpdate(remoteDoc, hexToBytes(editUpdate));
+
+    const text = remoteTree.get(path)?.get("content");
+    expect(text instanceof Y.Text ? text.toString() : "").toBe("hello");
   });
 });
 
@@ -294,15 +345,16 @@ function v2Payload(overrides: Record<string, unknown>) {
     fileId: "f" + "a".repeat(32),
     path: "Notes/a.md",
     fileKind: "markdown",
+    updateHex: "00ff",
     contentHash: "abcd",
     ...overrides,
   };
 }
 
-function testHost() {
+function testHost(vault: MemoryVault | null = null) {
   return {
     app: {
-      vault: {
+      vault: vault ?? {
         getFiles: () => [],
         on: vi.fn(),
       },
@@ -332,6 +384,48 @@ function testHost() {
     saveSettings: vi.fn().mockResolvedValue(undefined),
     updateStatus: vi.fn(),
   } as unknown as ConstructorParameters<typeof SyncEngine>[0];
+}
+
+class MemoryVault {
+  readonly files = new Map<string, string>();
+
+  getFiles(): TFile[] {
+    return Array.from(this.files.keys()).map((path) => testFile(path, path.split(".").pop() ?? ""));
+  }
+
+  on(): void {}
+
+  getFileByPath(path: string): TFile | null {
+    return this.files.has(path) ? testFile(path, path.split(".").pop() ?? "") : null;
+  }
+
+  getFolderByPath(): object | null {
+    return {};
+  }
+
+  async create(path: string, content: string): Promise<void> {
+    this.files.set(path, content);
+  }
+
+  async modify(file: TFile, content: string): Promise<void> {
+    this.files.set(file.path, content);
+  }
+
+  async delete(file: TFile): Promise<void> {
+    this.files.delete(file.path);
+  }
+
+  async rename(file: TFile, newPath: string): Promise<void> {
+    const content = this.files.get(file.path) ?? "";
+    this.files.delete(file.path);
+    this.files.set(newPath, content);
+  }
+
+  async createFolder(): Promise<void> {}
+
+  readText(path: string): string | undefined {
+    return this.files.get(path);
+  }
 }
 
 function testFile(path: string, extension: string): TFile {

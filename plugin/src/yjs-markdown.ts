@@ -16,7 +16,6 @@ export function getMarkdownText(tree: MarkdownTree, path: string): Y.Text | null
 }
 
 export function encodeMarkdownUpsertUpdate(doc: Y.Doc, tree: MarkdownTree, path: string, content: string): string {
-  const beforeState = Y.encodeStateVector(doc);
   doc.transact(() => {
     const entry = ensureMarkdownEntry(tree, path);
     const text = ensureMarkdownContent(entry);
@@ -24,19 +23,17 @@ export function encodeMarkdownUpsertUpdate(doc: Y.Doc, tree: MarkdownTree, path:
     text.delete(0, text.length);
     text.insert(0, content);
   }, "local-vault");
-  return bytesToHex(Y.encodeStateAsUpdate(doc, beforeState));
+  return bytesToHex(Y.encodeStateAsUpdate(doc));
 }
 
 export function encodeMarkdownDeleteUpdate(doc: Y.Doc, tree: MarkdownTree, path: string): string {
-  const beforeState = Y.encodeStateVector(doc);
   doc.transact(() => {
     tree.delete(path);
   }, "local-vault");
-  return bytesToHex(Y.encodeStateAsUpdate(doc, beforeState));
+  return bytesToHex(Y.encodeStateAsUpdate(doc));
 }
 
 export function encodeMarkdownRenameUpdate(doc: Y.Doc, tree: MarkdownTree, oldPath: string, newPath: string, content: string): string {
-  const beforeState = Y.encodeStateVector(doc);
   doc.transact(() => {
     tree.delete(oldPath);
     const entry = ensureMarkdownEntry(tree, newPath);
@@ -46,7 +43,7 @@ export function encodeMarkdownRenameUpdate(doc: Y.Doc, tree: MarkdownTree, oldPa
     text.delete(0, text.length);
     text.insert(0, content);
   }, "local-vault");
-  return bytesToHex(Y.encodeStateAsUpdate(doc, beforeState));
+  return bytesToHex(Y.encodeStateAsUpdate(doc));
 }
 
 function ensureMarkdownEntry(tree: MarkdownTree, path: string): MarkdownEntry {
