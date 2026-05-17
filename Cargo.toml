@@ -16,7 +16,7 @@ pedantic = "warn"
 
 [profile.release]
 opt-level = "z"
-lto = "thin"
-codegen-units = 16
+lto = "fat"
+codegen-units = 1
 panic = "abort"
 strip = "symbols"
