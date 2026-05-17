@@ -104,7 +104,8 @@ jobs:
         with:
           workspaces: |
             . -> target
-          key: ${{ matrix.target }}
+          shared-key: release-${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build server
         run: cargo build --release -p mylonite --target ${{ matrix.target }}

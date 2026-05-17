@@ -59,6 +59,8 @@ jobs:
         with:
           workspaces: |
             . -> target
+          shared-key: ci-lalalalalala
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Format
         run: cargo fmt --check
