@@ -88,7 +88,9 @@ docker run -p 9821:9821 \
 
 ## Plugin
 
-Preferred: install [BRAT](https://tfthacker.com/brat-quick-guide), then add `https://github.com/Z1xus/mylonite` as a beta plugin. This is the easiest path on mobile.
+[Install Mylonite](obsidian://show-plugin?id=mylonite) from the [Obsidian community plugin directory](https://community.obsidian.md/plugins/mylonite).
+
+Beta install: install [BRAT](https://tfthacker.com/brat-quick-guide), then add `https://github.com/Z1xus/mylonite` as a beta plugin.
 
 Manual install: download [mylonite-obsidian-plugin.zip](https://github.com/z1xus/mylonite/releases/latest/download/mylonite-obsidian-plugin.zip) from Releases and extract it into:
 
