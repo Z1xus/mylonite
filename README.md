@@ -35,9 +35,24 @@ Start the server:
 mylonite serve
 ```
 
+Default config locations:
+
+- Linux: `~/.config/mylonite/config.toml`
+- macOS: `~/Library/Application Support/mylonite/config.toml`
+- Windows: `%APPDATA%\mylonite\config.toml`
+
 Run `mylonite serve` under your service manager.
 
 Systemd:
+
+```bash
+sudo useradd --system --create-home --home-dir /var/lib/mylonite --shell /usr/sbin/nologin mylonite
+sudo -u mylonite -H /usr/local/bin/mylonite init
+sudo nano /var/lib/mylonite/.config/mylonite/config.toml
+sudo nano /etc/systemd/system/mylonite.service
+```
+
+When running as the `mylonite` user, the default config path is `/var/lib/mylonite/.config/mylonite/config.toml`. Keep `listen = "127.0.0.1:9821"` if a reverse proxy terminates TLS on the same host. Use `listen = "0.0.0.0:9821"` and set `public_url` to the reachable URL if the server should accept direct network connections.
 
 ```ini
 [Unit]
@@ -50,9 +65,16 @@ ExecStart=/usr/local/bin/mylonite serve
 Restart=on-failure
 User=mylonite
 Group=mylonite
+WorkingDirectory=/var/lib/mylonite
 
 [Install]
 WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now mylonite
+sudo systemctl status mylonite
 ```
 
 Windows: run `mylonite serve` with NSSM, WinSW, or your preferred service wrapper.
