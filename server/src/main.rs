@@ -207,14 +207,20 @@ fn handle_init(config_path: Option<std::path::PathBuf>, no_vault: bool) -> anyho
         print_status("Config", &format!("created {}", path.display()));
     }
     let config = config::Config::load_or_default(Some(&path))?;
-    let storage = storage::Storage::open(&config.server.data_dir)?;
-    let existing_vaults = storage.list_vaults()?;
+    let existing_vaults = with_admin_or_storage(&config, AdminClient::list_vaults, |storage| {
+        storage.list_vaults()
+    })?;
     if existing_vaults.is_empty()
         && !no_vault
         && prompt_yes_no("create the first vault now?", true)?
     {
         let name = prompt_text("vault name", "My Vault")?;
-        let vault = storage.create_vault(&name).context("create vault")?;
+        let vault = with_admin_or_storage(
+            &config,
+            |admin| admin.create_vault(&name),
+            |storage| storage.create_vault(&name),
+        )
+        .context("create vault")?;
         print_status("Vault", &format!("created {}", vault.name));
         print_kv("vault id", &vault.id);
         print_kv("pairing token", &vault.pairing_token);
