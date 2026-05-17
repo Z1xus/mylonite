@@ -35,23 +35,23 @@ export default class MylonitePlugin extends Plugin {
 
     this.addCommand({
       id: "show-sync-status",
-      name: "Show sync status",
+      name: "show sync status",
       callback: () => new Notice(this.statusText()),
     });
     this.addCommand({
       id: "sync-now",
-      name: "Sync now",
-      callback: () => void this.syncEngine.catchUp().catch((error) => new Notice(`Mylonite sync failed: ${String(error)}`)),
+      name: "sync now",
+      callback: () => void this.syncEngine.catchUp().catch((error) => new Notice(`Sync failed. Check the server URL and try again. ${String(error)}`)),
     });
     this.addCommand({
       id: "create-snapshot",
-      name: "Create encrypted snapshot",
-      callback: () => void this.syncEngine.createSnapshot().catch((error) => new Notice(`Mylonite snapshot failed: ${String(error)}`)),
+      name: "create snapshot",
+      callback: () => void this.syncEngine.createSnapshot().catch((error) => new Notice(`Snapshot failed. Check the server connection and try again. ${String(error)}`)),
     });
     this.addCommand({
       id: "restore-latest-snapshot",
-      name: "Restore latest encrypted snapshot",
-      callback: () => void this.syncEngine.restoreLatestSnapshot().catch((error) => new Notice(`Mylonite restore failed: ${String(error)}`)),
+      name: "restore snapshot",
+      callback: () => void this.syncEngine.restoreLatestSnapshot().catch((error) => new Notice(`Restore failed. Check the server connection and try again. ${String(error)}`)),
     });
 
     this.addSettingTab(new MyloniteSettingTab(this.app, this));
@@ -79,7 +79,7 @@ export default class MylonitePlugin extends Plugin {
 
   async pairFirstDevice(): Promise<void> {
     if (!this.settings.serverUrl || !this.settings.pairingToken) {
-      new Notice("Enter a server URL and pairing token first.");
+      new Notice("Missing server URL or token. Enter both to continue.");
       return;
     }
 
@@ -108,10 +108,10 @@ export default class MylonitePlugin extends Plugin {
       await this.saveSettings();
       this.updateStatus("paired");
       this.syncEngine.start();
-      new Notice("Mylonite pairing completed.");
+      new Notice("Device paired.");
     } catch (error) {
       this.updateStatus("pairing failed");
-      new Notice(`Mylonite pairing failed: ${String(error)}`);
+      new Notice(`Pairing failed. Check the token and try again. ${String(error)}`);
     }
   }
 
@@ -131,16 +131,16 @@ export default class MylonitePlugin extends Plugin {
       x25519_public_key: exchangeKeypair.publicKeyHex,
     });
     await this.saveSettings();
-    new Notice("Pairing request generated.");
+    new Notice("Pairing request ready.");
   }
 
   async authorizeDevicePairingRequest(): Promise<void> {
     if (!this.settings.vaultId) {
-      new Notice("This device is not paired.");
+      new Notice("This device is not paired. Pair it before authorizing another device.");
       return;
     }
     if (!this.settings.devicePairingRequest) {
-      new Notice("No pairing request to authorize.");
+      new Notice("Missing pairing request. Paste one to continue.");
       return;
     }
     let request: DevicePairingRequestPayload;
@@ -148,7 +148,7 @@ export default class MylonitePlugin extends Plugin {
       request = JSON.parse(this.settings.devicePairingRequest) as DevicePairingRequestPayload;
       validateDevicePairingRequest(request);
     } catch (error) {
-      new Notice(`Invalid pairing request: ${String(error)}`);
+      new Notice(`Invalid pairing request. Ask the new device to create another one. ${String(error)}`);
       return;
     }
     try {
@@ -177,9 +177,9 @@ export default class MylonitePlugin extends Plugin {
       });
       this.settings.devicePairingRequest = "";
       await this.saveSettings();
-      new Notice("Pairing response generated.");
+      new Notice("Pairing response ready.");
     } catch (error) {
-      new Notice(`Authorization failed: ${String(error)}`);
+      new Notice(`Authorization failed. Check the request and try again. ${String(error)}`);
     }
   }
 
@@ -187,11 +187,11 @@ export default class MylonitePlugin extends Plugin {
     const privateKeyHex = loadDevicePrivateKey(this.app, this.settings);
     const pairingPrivateKeyHex = loadDevicePairingPrivateKey(this.app, this.settings);
     if (!privateKeyHex || !this.settings.devicePublicKeyHex || !pairingPrivateKeyHex) {
-      new Notice("Generate a pairing request on this device first.");
+      new Notice("Missing pairing request. Create one on this device first.");
       return;
     }
     if (!this.settings.devicePairingResponse) {
-      new Notice("No pairing response to complete.");
+      new Notice("Missing pairing response. Paste one to continue.");
       return;
     }
     try {
@@ -218,9 +218,9 @@ export default class MylonitePlugin extends Plugin {
       await this.saveSettings();
       this.updateStatus("paired");
       this.syncEngine.start();
-      new Notice("Paired. Syncing.");
+      new Notice("Device paired.");
     } catch (error) {
-      new Notice(`Pairing failed: ${String(error)}`);
+      new Notice(`Pairing failed. Check the response and try again. ${String(error)}`);
     }
   }
 
@@ -240,7 +240,7 @@ export default class MylonitePlugin extends Plugin {
   }
 
   async unpairDevice(): Promise<void> {
-    const confirmed = window.confirm("Unpair this device from Mylonite? Local sync credentials will be removed from this Obsidian vault.");
+    const confirmed = window.confirm("Unpair this device? It will stop syncing immediately.");
     if (!confirmed) {
       return;
     }
@@ -261,7 +261,7 @@ export default class MylonitePlugin extends Plugin {
     this.vaultKeys = null;
     await this.saveSettings();
     this.updateStatus("unpaired");
-    new Notice("Mylonite unpaired on this device.");
+    new Notice("Device unpaired.");
   }
 
   updateStatus(state: string): void {
@@ -272,9 +272,9 @@ export default class MylonitePlugin extends Plugin {
 
   private statusText(): string {
     if (!this.settings.serverUrl || !this.settings.vaultId) {
-      return "Mylonite is not paired yet.";
+      return "Not paired. Pair this device to start syncing.";
     }
-    return `Mylonite configured for vault ${this.settings.vaultId} on device ${this.settings.deviceId}.`;
+    return `Paired with vault ${this.settings.vaultId}.`;
   }
 
   debug(message: string): void {

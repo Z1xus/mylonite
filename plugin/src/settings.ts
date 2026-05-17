@@ -69,7 +69,7 @@ export class MyloniteSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Server URL")
-      .setDesc("The URL of your self-hosted Mylonite server.")
+      .setDesc("Used to reach your Mylonite server.")
       .addText((text) => text
         .setPlaceholder("http://127.0.0.1:9821")
         .setValue(this.plugin.settings.serverUrl)
@@ -80,7 +80,7 @@ export class MyloniteSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Device label")
-      .setDesc("Shown in the server's device list.")
+      .setDesc("Shown in the device list.")
       .addText((text) => text
         .setPlaceholder("Obsidian device")
         .setValue(this.plugin.settings.deviceLabel)
@@ -97,7 +97,7 @@ export class MyloniteSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Debug logging")
-      .setDesc("Write sync details to the developer console.")
+      .setDesc("Writes sync details to the developer console.")
       .addToggle((toggle) => toggle
         .setValue(this.plugin.settings.debugLogging)
         .onChange(async (value) => {
@@ -111,11 +111,11 @@ export class MyloniteSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Paired")
-      .setDesc(`Vault ${this.plugin.settings.vaultId} · device ${this.plugin.settings.deviceId}.`);
+      .setDesc(`Vault ${this.plugin.settings.vaultId}, device ${this.plugin.settings.deviceId}.`);
 
     new Setting(containerEl)
       .setName("Encrypted snapshot")
-      .setDesc("Upload a full encrypted snapshot of this vault so new devices can bootstrap faster.")
+      .setDesc("Uploads this vault so new devices can start faster.")
       .addButton((button) => button
         .setButtonText("Create")
         .onClick(async () => {
@@ -123,8 +123,8 @@ export class MyloniteSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName("Restore latest snapshot")
-      .setDesc("Decrypt and apply the newest snapshot from the server.")
+      .setName("Latest snapshot")
+      .setDesc("Restores the newest snapshot from the server.")
       .addButton((button) => button
         .setButtonText("Restore")
         .onClick(async () => {
@@ -132,8 +132,8 @@ export class MyloniteSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName("Unpair this device")
-      .setDesc("Remove local Mylonite credentials and stop syncing this Obsidian vault.")
+      .setName("Unpair device")
+      .setDesc("Removes local credentials and stops syncing this vault.")
       .addButton((button) => button
         .setButtonText("Unpair")
         .setWarning()
@@ -144,37 +144,32 @@ export class MyloniteSettingTab extends PluginSettingTab {
 
     containerEl.createEl("h3", { text: "Add another device" });
     containerEl.createEl("p", {
-      text: "On the new device, click Request, then paste the request here and click Authorize. Copy the response back to the new device.",
+      text: "Paste the new device's request, then copy the response back to it.",
       cls: "setting-item-description",
     });
 
-    new Setting(containerEl)
-      .setName("Pairing request from the new device")
-      .addTextArea((text) => text
-        .setPlaceholder("Paste the pairing request here")
-        .setValue(this.plugin.settings.devicePairingRequest)
-        .onChange(async (value) => {
-          this.plugin.settings.devicePairingRequest = value.trim();
-          await this.plugin.saveSettings();
-        }))
-      .addButton((button) => button
-        .setButtonText("Authorize")
-        .setCta()
-        .onClick(async () => {
-          await this.plugin.authorizeDevicePairingRequest();
-          this.display();
-        }));
+    this.addCodeInput(containerEl, {
+      name: "Pairing request",
+      placeholder: "Paste pairing request",
+      value: this.plugin.settings.devicePairingRequest,
+      buttonText: "Authorize",
+      cta: true,
+      onChange: async (value) => {
+        this.plugin.settings.devicePairingRequest = value.trim();
+        await this.plugin.saveSettings();
+      },
+      onButtonClick: async () => {
+        await this.plugin.authorizeDevicePairingRequest();
+        this.display();
+      },
+    });
 
     if (this.plugin.settings.devicePairingResponse) {
-      new Setting(containerEl)
-        .setName("Pairing response")
-        .setDesc("Copy this back to the new device and click Complete there.")
-        .addTextArea((text) => text
-          .setValue(this.plugin.settings.devicePairingResponse)
-          .onChange(async (value) => {
-            this.plugin.settings.devicePairingResponse = value.trim();
-            await this.plugin.saveSettings();
-          }));
+      this.addCodeOutput(containerEl, {
+        name: "Pairing response",
+        desc: "Copy this back to the new device.",
+        value: this.plugin.settings.devicePairingResponse,
+      });
     }
   }
 
@@ -184,21 +179,21 @@ export class MyloniteSettingTab extends PluginSettingTab {
     containerEl.createEl("h3", { text: "Pair this device" });
     containerEl.createEl("p", {
       text: hasRequest
-        ? "Waiting for a pairing response. Paste it below and click Complete."
+        ? "Waiting for a pairing response. Paste it below to continue."
         : "Pick the option that matches your situation.",
       cls: "setting-item-description",
     });
 
     containerEl.createEl("h4", { text: "First device for a new vault" });
     containerEl.createEl("p", {
-      text: "Paste the pairing token printed by `mylonite init` on the server.",
+      text: "Paste the pairing token from `mylonite init`.",
       cls: "setting-item-description",
     });
 
     new Setting(containerEl)
       .setName("Pairing token")
       .addText((text) => text
-        .setPlaceholder("p…")
+        .setPlaceholder("p...")
         .setValue(this.plugin.settings.pairingToken)
         .onChange(async (value) => {
           this.plugin.settings.pairingToken = value.trim();
@@ -214,15 +209,15 @@ export class MyloniteSettingTab extends PluginSettingTab {
 
     containerEl.createEl("h4", { text: "Join an existing vault" });
     containerEl.createEl("p", {
-      text: "Generate a pairing request on this device, hand it to an already-paired device, then paste the response it gives you back.",
+      text: "Create a request, authorize it on a paired device, then paste the response here.",
       cls: "setting-item-description",
     });
 
     new Setting(containerEl)
-      .setName("Step 1 — generate a pairing request")
+      .setName("Pairing request")
       .setDesc(hasRequest
-        ? "Request generated. Copy it from the box below and authorize it on an already-paired device."
-        : "Creates the request shown below.")
+        ? "Copy this to an already-paired device."
+        : "Creates a request for this device.")
       .addButton((button) => button
         .setButtonText(hasRequest ? "Regenerate" : "Request")
         .onClick(async () => {
@@ -231,33 +226,96 @@ export class MyloniteSettingTab extends PluginSettingTab {
         }));
 
     if (hasRequest) {
-      new Setting(containerEl)
-        .setName("Pairing request")
-        .setDesc("Copy this into the already-paired device.")
-        .addTextArea((text) => text
-          .setValue(this.plugin.settings.devicePairingRequest)
-          .onChange(async (value) => {
-            this.plugin.settings.devicePairingRequest = value.trim();
-            await this.plugin.saveSettings();
-          }));
+      this.addCodeOutput(containerEl, {
+        name: "Pairing request",
+        desc: "Copy this into the already-paired device.",
+        value: this.plugin.settings.devicePairingRequest,
+      });
     }
 
-    new Setting(containerEl)
-      .setName("Step 2 — paste the pairing response")
-      .setDesc("The already-paired device produces this. It carries the vault encryption key, so handle it like a password.")
-      .addTextArea((text) => text
-        .setPlaceholder("Paste the pairing response here")
-        .setValue(this.plugin.settings.devicePairingResponse)
-        .onChange(async (value) => {
-          this.plugin.settings.devicePairingResponse = value.trim();
-          await this.plugin.saveSettings();
-        }))
+    this.addCodeInput(containerEl, {
+      name: "Pairing response",
+      desc: "Paste the response from the paired device.",
+      placeholder: "Paste pairing response",
+      value: this.plugin.settings.devicePairingResponse,
+      buttonText: "Complete",
+      cta: true,
+      onChange: async (value) => {
+        this.plugin.settings.devicePairingResponse = value.trim();
+        await this.plugin.saveSettings();
+      },
+      onButtonClick: async () => {
+        await this.plugin.completeDevicePairing();
+        this.display();
+      },
+    });
+  }
+
+  private addCodeInput(
+    containerEl: HTMLElement,
+    options: {
+      name: string;
+      desc?: string;
+      placeholder: string;
+      value: string;
+      buttonText: string;
+      cta?: boolean;
+      onChange(value: string): Promise<void>;
+      onButtonClick(): Promise<void>;
+    },
+  ): void {
+    const setting = new Setting(containerEl)
+      .setName(options.name)
+      .addTextArea((text) => {
+        text
+          .setPlaceholder(options.placeholder)
+          .setValue(options.value)
+          .onChange(options.onChange);
+        text.inputEl.rows = 6;
+        text.inputEl.spellcheck = false;
+        text.inputEl.addClass("mylonite-code-field");
+        return text;
+      })
+      .addButton((button) => {
+        button
+          .setButtonText(options.buttonText)
+          .onClick(options.onButtonClick);
+        if (options.cta) {
+          button.setCta();
+        }
+        return button;
+      });
+    if (options.desc) {
+      setting.setDesc(options.desc);
+    }
+    setting.settingEl.addClass("mylonite-code-setting");
+  }
+
+  private addCodeOutput(
+    containerEl: HTMLElement,
+    options: {
+      name: string;
+      desc: string;
+      value: string;
+    },
+  ): void {
+    const setting = new Setting(containerEl)
+      .setName(options.name)
+      .setDesc(options.desc)
+      .addTextArea((text) => {
+        text
+          .setValue(options.value)
+          .setDisabled(true);
+        text.inputEl.rows = 6;
+        text.inputEl.spellcheck = false;
+        text.inputEl.addClass("mylonite-code-field");
+        return text;
+      })
       .addButton((button) => button
-        .setButtonText("Complete")
-        .setCta()
+        .setButtonText("Copy")
         .onClick(async () => {
-          await this.plugin.completeDevicePairing();
-          this.display();
+          await navigator.clipboard.writeText(options.value);
         }));
+    setting.settingEl.addClass("mylonite-code-setting");
   }
 }

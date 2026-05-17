@@ -104,13 +104,13 @@ export class SyncEngine {
     }
     if (appliedCount > 0) {
       await this.host.saveSettings();
-      this.host.updateStatus(`caught up ${appliedCount} ops`);
+      this.host.updateStatus(`synced ${appliedCount} changes`);
     }
   }
 
   async createSnapshot(): Promise<void> {
     if (!this.host.settings.vaultId || !this.host.settings.deviceId) {
-      new Notice("Pair Mylonite before creating a snapshot.");
+      new Notice("Device is not paired. Pair it before creating a snapshot.");
       return;
     }
     const keys = await this.host.loadVaultKeys();
@@ -130,29 +130,29 @@ export class SyncEngine {
       ciphertext_hex: encrypted.ciphertextHex,
     });
     this.host.updateStatus("snapshot uploaded");
-    new Notice("Mylonite snapshot uploaded.");
+    new Notice("Snapshot uploaded.");
   }
 
   async restoreLatestSnapshot(): Promise<void> {
     if (!this.host.settings.vaultId || !this.host.settings.deviceId) {
-      new Notice("Pair Mylonite before restoring a snapshot.");
+      new Notice("Device is not paired. Pair it before restoring a snapshot.");
       return;
     }
     const snapshots = await this.host.createApiClient().listSnapshots(this.host.settings.vaultId);
     const latest = snapshots.at(-1);
     if (!latest) {
-      new Notice("No Mylonite snapshots are available.");
+      new Notice("No snapshots found. Create a snapshot on another device first.");
       return;
     }
     validateSnapshotRecord(latest, this.host.settings.vaultId);
     const deleteMissing = window.confirm(
-      "Delete local files that are absent from the latest Mylonite snapshot? Choose Cancel to only overwrite/create files from the snapshot.",
+      "Delete files missing from the snapshot? This removes local files that are not in the latest snapshot.",
     );
     await this.restoreSnapshot(latest, deleteMissing);
     this.host.settings.lastServerSeq = Math.max(this.host.settings.lastServerSeq, latest.covers_through_seq);
     await this.host.saveSettings();
     this.host.updateStatus("snapshot restored");
-    new Notice("Mylonite snapshot restored.");
+    new Notice("Snapshot restored.");
   }
 
   private registerVaultEvents(): void {
@@ -308,7 +308,7 @@ export class SyncEngine {
     } catch (error) {
       this.host.settings.pendingOps.push(op);
       this.host.debug(`queued op ${op.client_op_id}: ${String(error)}`);
-      this.host.updateStatus("queued offline change");
+      this.host.updateStatus("queued offline");
     }
     this.host.settings.lamport = lamport;
     await this.host.saveSettings();
@@ -344,7 +344,7 @@ export class SyncEngine {
     try {
       const socket = new WebSocket(this.host.createApiClient().websocketUrl(this.host.settings.vaultId));
       socket.binaryType = "arraybuffer";
-      socket.onopen = () => this.host.updateStatus("authenticating live sync");
+      socket.onopen = () => this.host.updateStatus("authenticating");
       socket.onmessage = (event: MessageEvent<ArrayBuffer>) => {
         void this.handleSocketMessage(event.data).catch((error) => {
           this.host.updateStatus("live sync error");
@@ -354,7 +354,7 @@ export class SyncEngine {
       socket.onclose = () => {
         this.socketLive = false;
         this.socket = null;
-        this.host.updateStatus("offline polling");
+        this.host.updateStatus("offline");
         this.scheduleWebSocketReconnect();
       };
       socket.onerror = () => {
@@ -524,9 +524,9 @@ export class SyncEngine {
       return;
     }
     const summary = races.slice(0, 3).join(", ");
-    this.host.updateStatus(`remote change raced local edit: ${summary}`);
+    this.host.updateStatus(`edit conflict: ${summary}`);
     this.host.debug(`remote op raced local dirty paths: ${races.join(", ")}`);
-    new Notice(`Mylonite applied a remote change that raced a local edit: ${summary}`);
+    new Notice(`Remote edit overlapped a local edit. Check ${summary}.`);
   }
 
   private clearDirtyPathsForOp(clientOpId: string): void {
@@ -609,7 +609,7 @@ export class SyncEngine {
     await this.restoreSnapshot(latest, false);
     this.host.settings.lastServerSeq = latest.covers_through_seq;
     await this.host.saveSettings();
-    this.host.updateStatus(`restored snapshot through seq ${latest.covers_through_seq}`);
+    this.host.updateStatus("snapshot restored");
     return true;
   }
 

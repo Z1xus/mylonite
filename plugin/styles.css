@@ -1,1 +1,42 @@
 
+.mylonite-code-setting {
+  align-items: stretch;
+  flex-direction: column;
+}
+
+.mylonite-code-setting .setting-item-info {
+  margin-bottom: 8px;
+  margin-right: 0;
+}
+
+.mylonite-code-setting .setting-item-control {
+  align-items: stretch;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+}
+
+.mylonite-code-setting textarea.mylonite-code-field {
+  box-sizing: border-box;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-small);
+  line-height: 1.35;
+  max-width: none;
+  min-height: 140px;
+  resize: vertical;
+  width: 100%;
+  word-break: break-all;
+}
+
+.mylonite-code-setting button {
+  align-self: flex-end;
+  min-width: 120px;
+}
+
+@media (max-width: 600px) {
+  .mylonite-code-setting button {
+    align-self: stretch;
+    width: 100%;
+  }
+}
