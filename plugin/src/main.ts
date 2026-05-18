@@ -189,7 +189,7 @@ export default class MylonitePlugin extends Plugin {
         };
         validateDevicePairingInvite(invite);
       } catch {
-        new Notice(`Invalid invite. Paste invite text, scan the QR code, or enter a code with the server URL. ${String(error)}`);
+        new Notice(`Invalid invite. Scan the QR code, paste the invite link, or enter the invite code with the server URL. ${String(error)}`);
         return;
       }
     }

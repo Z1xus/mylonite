@@ -3,7 +3,6 @@ import { App, Plugin, PluginSettingTab, Setting } from "obsidian";
 import {
   DevicePairingInvitePayload,
   DevicePairingRequestPayload,
-  devicePairingInviteText,
   devicePairingInviteUrl,
   pairingSafetyCode,
   parseDevicePairingInviteInput,
@@ -236,8 +235,8 @@ export class MyloniteSettingTab extends PluginSettingTab {
     });
 
     this.addCodeInput(containerEl, {
-      name: "Invite",
-      desc: "Paste invite text, or enter the grouped invite code shown on the paired device.",
+      name: "Invite code",
+      desc: "Enter the grouped invite code shown on the paired device.",
       placeholder: "ABCD-2345-WXYZ",
       value: this.plugin.settings.devicePairingInvite,
       buttonText: request ? "Retry" : "Join",
@@ -283,7 +282,6 @@ export class MyloniteSettingTab extends PluginSettingTab {
   }
 
   private addInviteDisplay(containerEl: HTMLElement, invite: DevicePairingInvitePayload): void {
-    const inviteText = devicePairingInviteText(invite);
     const inviteUrl = devicePairingInviteUrl(invite);
     const wrap = containerEl.createDiv({ cls: "mylonite-invite-panel" });
     wrap.createEl("img", {
@@ -305,12 +303,12 @@ export class MyloniteSettingTab extends PluginSettingTab {
           await navigator.clipboard.writeText(inviteUrl);
         }));
     new Setting(details)
-      .setName("Invite text")
-      .setDesc("Fallback for devices that cannot open the link.")
+      .setName("Invite code")
+      .setDesc("Use this with the server URL if the link does not open.")
       .addButton((button) => button
         .setButtonText("Copy")
         .onClick(async () => {
-          await navigator.clipboard.writeText(inviteText);
+          await navigator.clipboard.writeText(invite.invite_code);
         }));
   }
 

@@ -33,6 +33,7 @@ pub(super) async fn health(State(app_state): State<AppState>) -> impl IntoRespon
 #[derive(Debug, Deserialize)]
 pub(super) struct PairInvitePageQuery {
     invite: Option<String>,
+    c: Option<String>,
     code: Option<String>,
 }
 
@@ -43,11 +44,11 @@ pub(super) async fn pair_invite_page(
     if !invite.is_empty() {
         validate_pairing_invite_text(&invite)?;
     }
-    let code = query.code.unwrap_or_default();
+    let code = query.c.or(query.code).unwrap_or_default();
+    let code = normalize_invite_code(&code);
     if !code.is_empty() {
         validation::validate_invite_code(&code)?;
     }
-    let escaped_invite = html_escape(&invite);
     let encoded_invite = percent_encode(&invite);
     let escaped_code = html_escape(&code);
     Ok(Html(format!(
@@ -66,24 +67,29 @@ textarea {{ box-sizing: border-box; font-family: ui-monospace, SFMono-Regular, M
 .actions {{ display: flex; flex-wrap: wrap; gap: 10px; margin: 20px 0; }}
 a, button {{ background: #1f2328; border: 0; border-radius: 6px; color: #fff; cursor: pointer; font: inherit; padding: 10px 14px; text-decoration: none; }}
 button.secondary {{ background: #e7e9ed; color: #1f2328; }}
+:root {{ color-scheme: light dark; }}
+@media (prefers-color-scheme: dark) {{
+  body {{ background: #0f1115; color: #e6e8ec; }}
+  p {{ color: #a9b0bd; }}
+  textarea {{ background: #171a21; border: 1px solid #343946; color: #e6e8ec; }}
+  a, button {{ background: #e6e8ec; color: #0f1115; }}
+  button.secondary {{ background: #2a2f3a; color: #e6e8ec; }}
+}}
 </style>
 </head>
 <body>
 <main>
 <h1>Mylonite device invite</h1>
-<p>Open this invite in Obsidian on the device you want to add. If that handoff is unavailable, copy the invite text or code and paste it in Mylonite settings.</p>
+<p>Open this invite in Obsidian on the device you want to add. If Obsidian does not open, copy the invite code and paste it in Mylonite settings.</p>
 <div class="actions">
 <a id="open" href="obsidian://mylonite-pair?invite={encoded_invite}">Open in Obsidian</a>
-<button class="secondary" type="button" onclick="navigator.clipboard.writeText(document.querySelector('textarea').value)">Copy invite</button>
+<button class="secondary" type="button" onclick="navigator.clipboard.writeText(document.getElementById('code').value)">Copy invite code</button>
 </div>
-<textarea readonly>{escaped_invite}</textarea>
-<p><strong>Invite code:</strong> <code id="code">{escaped_code}</code></p>
+<textarea id="code" readonly>{escaped_code}</textarea>
 <script>
-const code = document.getElementById("code").textContent;
-const textarea = document.querySelector("textarea");
-if (!textarea.value && code) {{
+const code = document.getElementById("code").value;
+if (code) {{
   const invite = "MYLONITE:" + btoa(JSON.stringify({{ version: 1, server_url: location.origin, invite_code: code }})).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  textarea.value = invite;
   document.getElementById("open").href = "obsidian://mylonite-pair?invite=" + encodeURIComponent(invite);
 }}
 </script>
@@ -856,6 +862,21 @@ fn validate_pairing_invite_text(invite: &str) -> Result<(), ApiError> {
         return Err(ApiError(anyhow::anyhow!("invalid pairing invite")));
     }
     Ok(())
+}
+
+fn normalize_invite_code(code: &str) -> String {
+    let compact: String = code
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|char| char.to_ascii_uppercase())
+        .collect();
+    compact
+        .as_bytes()
+        .chunks(4)
+        .take(3)
+        .map(|chunk| std::str::from_utf8(chunk).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 fn html_escape(value: &str) -> String {

@@ -32,7 +32,7 @@ describe("device pairing join payloads", () => {
       invite_code: "ABCD-2345-WXYZ",
     };
 
-    expect(devicePairingInviteUrl(invite)).toBe("https://sync.example.com/pair?code=ABCD-2345-WXYZ");
+    expect(devicePairingInviteUrl(invite)).toBe("https://sync.example.com/p?c=ABCD2345WXYZ");
     expect(parseDevicePairingInviteInput(devicePairingInviteUrl(invite))).toEqual(invite);
   });
 

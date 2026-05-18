@@ -1,9 +1,9 @@
-const VERSION = 8;
-const SIZE = 17 + 4 * VERSION;
-const DATA_CODEWORDS = 194;
-const BLOCK_COUNT = 2;
-const DATA_CODEWORDS_PER_BLOCK = DATA_CODEWORDS / BLOCK_COUNT;
-const EC_CODEWORDS_PER_BLOCK = 24;
+const QR_CONFIGS = [
+  { version: 4, dataCodewords: 64, blockCount: 2, ecCodewordsPerBlock: 18, alignment: [6, 26], errorCorrectionLevel: 0b00 },
+  { version: 8, dataCodewords: 194, blockCount: 2, ecCodewordsPerBlock: 24, alignment: [6, 24, 42], errorCorrectionLevel: 0b01 },
+];
+
+type QrConfig = typeof QR_CONFIGS[number];
 
 type Module = 0 | 1 | -1;
 
@@ -24,15 +24,16 @@ export function qrSvgDataUrl(text: string, scale = 5): string {
 }
 
 function encodeQr(text: string): boolean[][] {
+  const config = selectConfig(text);
   const data = makeDataCodewords(text);
-  const codewords = addErrorCorrection(data);
+  const codewords = addErrorCorrection(data, config);
   let bestModules: boolean[][] | null = null;
   let bestPenalty = Number.POSITIVE_INFINITY;
   for (let mask = 0; mask < 8; mask += 1) {
-    const { modules, functionModules } = makeBaseMatrix();
+    const { modules, functionModules } = makeBaseMatrix(config);
     drawCodewords(modules, functionModules, codewords, mask);
-    drawFormatBits(modules, mask);
-    drawVersionBits(modules);
+    drawFormatBits(modules, config, mask);
+    drawVersionBits(modules, config);
     const boolModules = modules.map((row) => row.map((value) => value === 1));
     const penalty = penaltyScore(boolModules);
     if (penalty < bestPenalty) {
@@ -48,16 +49,27 @@ function encodeQr(text: string): boolean[][] {
 
 function makeDataCodewords(text: string): number[] {
   const bytes = new TextEncoder().encode(text);
-  if (bytes.length > DATA_CODEWORDS - 3) {
+  const config = selectConfig(text);
+  return makeDataCodewordsForBytes(bytes, config);
+}
+
+function selectConfig(text: string): QrConfig {
+  const bytes = new TextEncoder().encode(text);
+  const config = QR_CONFIGS.find((candidate) => bytes.length <= candidate.dataCodewords - 3);
+  if (!config) {
     throw new Error("invite is too long for QR code");
   }
+  return config;
+}
+
+function makeDataCodewordsForBytes(bytes: Uint8Array, config: QrConfig): number[] {
   const bits: number[] = [];
   appendBits(bits, 0b0100, 4);
   appendBits(bits, bytes.length, 8);
   for (const byte of bytes) {
     appendBits(bits, byte, 8);
   }
-  appendBits(bits, 0, Math.min(4, DATA_CODEWORDS * 8 - bits.length));
+  appendBits(bits, 0, Math.min(4, config.dataCodewords * 8 - bits.length));
   while (bits.length % 8 !== 0) {
     bits.push(0);
   }
@@ -69,29 +81,30 @@ function makeDataCodewords(text: string): number[] {
     }
     data.push(value);
   }
-  for (let pad = 0xec; data.length < DATA_CODEWORDS; pad = pad === 0xec ? 0x11 : 0xec) {
+  for (let pad = 0xec; data.length < config.dataCodewords; pad = pad === 0xec ? 0x11 : 0xec) {
     data.push(pad);
   }
   return data;
 }
 
-function addErrorCorrection(data: number[]): number[] {
-  const generator = reedSolomonGenerator(EC_CODEWORDS_PER_BLOCK);
+function addErrorCorrection(data: number[], config: QrConfig): number[] {
+  const generator = reedSolomonGenerator(config.ecCodewordsPerBlock);
   const blocks: number[][] = [];
   const ecc: number[][] = [];
-  for (let block = 0; block < BLOCK_COUNT; block += 1) {
-    const start = block * DATA_CODEWORDS_PER_BLOCK;
-    const chunk = data.slice(start, start + DATA_CODEWORDS_PER_BLOCK);
+  const dataCodewordsPerBlock = config.dataCodewords / config.blockCount;
+  for (let block = 0; block < config.blockCount; block += 1) {
+    const start = block * dataCodewordsPerBlock;
+    const chunk = data.slice(start, start + dataCodewordsPerBlock);
     blocks.push(chunk);
     ecc.push(reedSolomonRemainder(chunk, generator));
   }
   const out: number[] = [];
-  for (let index = 0; index < DATA_CODEWORDS_PER_BLOCK; index += 1) {
+  for (let index = 0; index < dataCodewordsPerBlock; index += 1) {
     for (const block of blocks) {
       out.push(block[index]);
     }
   }
-  for (let index = 0; index < EC_CODEWORDS_PER_BLOCK; index += 1) {
+  for (let index = 0; index < config.ecCodewordsPerBlock; index += 1) {
     for (const block of ecc) {
       out.push(block[index]);
     }
@@ -99,33 +112,35 @@ function addErrorCorrection(data: number[]): number[] {
   return out;
 }
 
-function makeBaseMatrix(): { modules: Module[][]; functionModules: boolean[][] } {
-  const modules: Module[][] = Array.from({ length: SIZE }, () => Array<Module>(SIZE).fill(-1));
-  const functionModules: boolean[][] = Array.from({ length: SIZE }, () => Array<boolean>(SIZE).fill(false));
+function makeBaseMatrix(config: QrConfig): { modules: Module[][]; functionModules: boolean[][] } {
+  const size = sizeForVersion(config.version);
+  const modules: Module[][] = Array.from({ length: size }, () => Array<Module>(size).fill(-1));
+  const functionModules: boolean[][] = Array.from({ length: size }, () => Array<boolean>(size).fill(false));
   drawFinder(modules, functionModules, 3, 3);
-  drawFinder(modules, functionModules, SIZE - 4, 3);
-  drawFinder(modules, functionModules, 3, SIZE - 4);
+  drawFinder(modules, functionModules, size - 4, 3);
+  drawFinder(modules, functionModules, 3, size - 4);
   drawTiming(modules, functionModules);
-  for (const y of [6, 24, 42]) {
-    for (const x of [6, 24, 42]) {
-      if ((x === 6 && y === 6) || (x === 42 && y === 6) || (x === 6 && y === 42)) {
+  for (const y of config.alignment) {
+    for (const x of config.alignment) {
+      if ((x === 6 && y === 6) || (x === config.alignment.at(-1) && y === 6) || (x === 6 && y === config.alignment.at(-1))) {
         continue;
       }
       drawAlignment(modules, functionModules, x, y);
     }
   }
-  setFunctionModule(modules, functionModules, 8, 4 * VERSION + 9, 1);
+  setFunctionModule(modules, functionModules, 8, 4 * config.version + 9, 1);
   reserveFormatAreas(functionModules);
-  reserveVersionAreas(functionModules);
+  reserveVersionAreas(functionModules, config);
   return { modules, functionModules };
 }
 
 function drawFinder(modules: Module[][], functionModules: boolean[][], cx: number, cy: number): void {
+  const size = modules.length;
   for (let dy = -4; dy <= 4; dy += 1) {
     for (let dx = -4; dx <= 4; dx += 1) {
       const x = cx + dx;
       const y = cy + dy;
-      if (x < 0 || y < 0 || x >= SIZE || y >= SIZE) {
+      if (x < 0 || y < 0 || x >= size || y >= size) {
         continue;
       }
       const dist = Math.max(Math.abs(dx), Math.abs(dy));
@@ -144,7 +159,8 @@ function drawAlignment(modules: Module[][], functionModules: boolean[][], cx: nu
 }
 
 function drawTiming(modules: Module[][], functionModules: boolean[][]): void {
-  for (let i = 8; i < SIZE - 8; i += 1) {
+  const size = modules.length;
+  for (let i = 8; i < size - 8; i += 1) {
     const value: Module = i % 2 === 0 ? 1 : 0;
     setFunctionModule(modules, functionModules, 6, i, value);
     setFunctionModule(modules, functionModules, i, 6, value);
@@ -152,19 +168,24 @@ function drawTiming(modules: Module[][], functionModules: boolean[][]): void {
 }
 
 function reserveFormatAreas(functionModules: boolean[][]): void {
+  const size = functionModules.length;
   for (let i = 0; i < 9; i += 1) {
     functionModules[8][i] = true;
     functionModules[i][8] = true;
-    functionModules[8][SIZE - 1 - i] = true;
-    functionModules[SIZE - 1 - i][8] = true;
+    functionModules[8][size - 1 - i] = true;
+    functionModules[size - 1 - i][8] = true;
   }
 }
 
-function reserveVersionAreas(functionModules: boolean[][]): void {
+function reserveVersionAreas(functionModules: boolean[][], config: QrConfig): void {
+  if (config.version < 7) {
+    return;
+  }
+  const size = functionModules.length;
   for (let i = 0; i < 6; i += 1) {
     for (let j = 0; j < 3; j += 1) {
-      functionModules[i][SIZE - 11 + j] = true;
-      functionModules[SIZE - 11 + j][i] = true;
+      functionModules[i][size - 11 + j] = true;
+      functionModules[size - 11 + j][i] = true;
     }
   }
 }
@@ -175,14 +196,15 @@ function setFunctionModule(modules: Module[][], functionModules: boolean[][], x:
 }
 
 function drawCodewords(modules: Module[][], functionModules: boolean[][], codewords: number[], mask: number): void {
+  const size = modules.length;
   let bitIndex = 0;
   let upward = true;
-  for (let right = SIZE - 1; right >= 1; right -= 2) {
+  for (let right = size - 1; right >= 1; right -= 2) {
     if (right === 6) {
       right -= 1;
     }
-    for (let vert = 0; vert < SIZE; vert += 1) {
-      const y = upward ? SIZE - 1 - vert : vert;
+    for (let vert = 0; vert < size; vert += 1) {
+      const y = upward ? size - 1 - vert : vert;
       for (let col = 0; col < 2; col += 1) {
         const x = right - col;
         if (functionModules[y][x]) {
@@ -203,8 +225,9 @@ function drawCodewords(modules: Module[][], functionModules: boolean[][], codewo
   }
 }
 
-function drawFormatBits(modules: Module[][], mask: number): void {
-  const bits = formatBits(mask);
+function drawFormatBits(modules: Module[][], config: QrConfig, mask: number): void {
+  const size = modules.length;
+  const bits = formatBits(config, mask);
   for (let i = 0; i <= 5; i += 1) {
     modules[8][i] = ((bits >>> i) & 1) as Module;
   }
@@ -215,23 +238,27 @@ function drawFormatBits(modules: Module[][], mask: number): void {
     modules[14 - i][8] = ((bits >>> i) & 1) as Module;
   }
   for (let i = 0; i < 8; i += 1) {
-    modules[SIZE - 1 - i][8] = ((bits >>> i) & 1) as Module;
+    modules[size - 1 - i][8] = ((bits >>> i) & 1) as Module;
   }
   for (let i = 8; i < 15; i += 1) {
-    modules[8][SIZE - 15 + i] = ((bits >>> i) & 1) as Module;
+    modules[8][size - 15 + i] = ((bits >>> i) & 1) as Module;
   }
-  modules[SIZE - 8][8] = 1;
+  modules[size - 8][8] = 1;
 }
 
-function drawVersionBits(modules: Module[][]): void {
-  let bits = VERSION;
+function drawVersionBits(modules: Module[][], config: QrConfig): void {
+  if (config.version < 7) {
+    return;
+  }
+  const size = modules.length;
+  let bits = config.version;
   for (let i = 0; i < 12; i += 1) {
     bits = (bits << 1) ^ (((bits >>> 11) & 1) * 0x1f25);
   }
-  bits = (VERSION << 12) | bits;
+  bits = (config.version << 12) | bits;
   for (let i = 0; i < 18; i += 1) {
     const bit = ((bits >>> i) & 1) as Module;
-    const a = SIZE - 11 + (i % 3);
+    const a = size - 11 + (i % 3);
     const b = Math.floor(i / 3);
     modules[b][a] = bit;
     modules[a][b] = bit;
@@ -252,8 +279,8 @@ function maskBit(mask: number, x: number, y: number): boolean {
   }
 }
 
-function formatBits(mask: number): number {
-  let data = (0b01 << 3) | mask;
+function formatBits(config: QrConfig, mask: number): number {
+  let data = (config.errorCorrectionLevel << 3) | mask;
   let bits = data << 10;
   for (let i = 14; i >= 10; i -= 1) {
     if (((bits >>> i) & 1) !== 0) {
@@ -264,15 +291,16 @@ function formatBits(mask: number): number {
 }
 
 function penaltyScore(modules: boolean[][]): number {
+  const size = modules.length;
   let penalty = 0;
-  for (let y = 0; y < SIZE; y += 1) {
+  for (let y = 0; y < size; y += 1) {
     penalty += linePenalty(modules[y]);
   }
-  for (let x = 0; x < SIZE; x += 1) {
+  for (let x = 0; x < size; x += 1) {
     penalty += linePenalty(modules.map((row) => row[x]));
   }
-  for (let y = 0; y < SIZE - 1; y += 1) {
-    for (let x = 0; x < SIZE - 1; x += 1) {
+  for (let y = 0; y < size - 1; y += 1) {
+    for (let x = 0; x < size - 1; x += 1) {
       const color = modules[y][x];
       if (modules[y][x + 1] === color && modules[y + 1][x] === color && modules[y + 1][x + 1] === color) {
         penalty += 3;
@@ -280,7 +308,7 @@ function penaltyScore(modules: boolean[][]): number {
     }
   }
   const dark = modules.flat().filter(Boolean).length;
-  const percent = (dark * 100) / (SIZE * SIZE);
+  const percent = (dark * 100) / (size * size);
   penalty += Math.floor(Math.abs(percent - 50) / 5) * 10;
   return penalty;
 }
@@ -309,6 +337,10 @@ function appendBits(bits: number[], value: number, count: number): void {
   for (let i = count - 1; i >= 0; i -= 1) {
     bits.push((value >>> i) & 1);
   }
+}
+
+function sizeForVersion(version: number): number {
+  return 17 + 4 * version;
 }
 
 function reedSolomonGenerator(degree: number): number[] {
