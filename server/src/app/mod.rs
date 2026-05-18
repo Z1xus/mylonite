@@ -4,7 +4,12 @@ mod tls;
 mod validation;
 mod ws;
 
-use std::{net::SocketAddr, path::Path};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use axum::{
     Router,
@@ -36,6 +41,31 @@ struct AppState {
     max_snapshot_ciphertext_bytes: usize,
     snapshot_retain: usize,
     op_broadcast: broadcast::Sender<EncryptedOpRecord>,
+    pairing_sessions: Arc<Mutex<HashMap<String, PairingSession>>>,
+}
+
+#[derive(Debug, Clone)]
+struct PairingSession {
+    vault_id: String,
+    invite_code_hash: String,
+    expires_at_unix: u64,
+    request: Option<PairingSessionRequest>,
+    grant: Option<PairingSessionGrant>,
+}
+
+#[derive(Debug, Clone)]
+struct PairingSessionRequest {
+    request_hash: String,
+    label: String,
+    verifying_key: String,
+    x25519_public_key: String,
+}
+
+#[derive(Debug, Clone)]
+struct PairingSessionGrant {
+    x25519_public_key: String,
+    nonce_hex: String,
+    ciphertext_hex: String,
 }
 
 pub async fn serve(
@@ -74,6 +104,7 @@ pub async fn serve(
         max_snapshot_ciphertext_bytes,
         snapshot_retain: usize::try_from(snapshots.retain).unwrap_or(usize::MAX),
         op_broadcast: broadcast::channel(1024).0,
+        pairing_sessions: Arc::new(Mutex::new(HashMap::new())),
     };
     let app = build_router(
         state,
@@ -140,10 +171,32 @@ fn build_router(
             post(routes::pair_first_device).layer(DefaultBodyLimit::max(max_json_body_bytes)),
         )
         .route(
+            "/api/v1/pair/invites/request",
+            post(routes::submit_pairing_session_request)
+                .layer(DefaultBodyLimit::max(max_json_body_bytes)),
+        )
+        .route(
+            "/api/v1/pair/sessions/{session_id}/grant",
+            get(routes::get_pairing_session_grant),
+        )
+        .route(
             "/api/v1/vaults/{vault_id}/devices",
             get(routes::list_devices)
                 .post(routes::register_device)
                 .layer(DefaultBodyLimit::max(max_json_body_bytes)),
+        )
+        .route(
+            "/api/v1/vaults/{vault_id}/pairing-sessions/{session_id}/grant",
+            post(routes::put_pairing_session_grant)
+                .layer(DefaultBodyLimit::max(max_json_body_bytes)),
+        )
+        .route(
+            "/api/v1/vaults/{vault_id}/pairing-sessions",
+            post(routes::open_pairing_session).layer(DefaultBodyLimit::max(max_json_body_bytes)),
+        )
+        .route(
+            "/api/v1/vaults/{vault_id}/pairing-sessions/{session_id}",
+            get(routes::get_pairing_session),
         )
         .route(
             "/api/v1/vaults/{vault_id}/devices/{device_id}",

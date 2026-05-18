@@ -96,6 +96,51 @@ pub(super) fn validate_blob_id(blob_id: &str) -> Result<(), ApiError> {
     validate_hex_field("blob id", blob_id, 64)
 }
 
+pub(super) fn validate_pairing_session_id(session_id: &str) -> Result<(), ApiError> {
+    if !session_id.starts_with("ps") || session_id.len() != 34 || !is_lower_hex(&session_id[2..]) {
+        return Err(ApiError(anyhow::anyhow!("invalid pairing session id")));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_request_hash(request_hash: &str) -> Result<(), ApiError> {
+    validate_hex_field("request hash", request_hash, 64)
+}
+
+pub(super) fn validate_invite_code_hash(invite_code_hash: &str) -> Result<(), ApiError> {
+    validate_hex_field("invite code hash", invite_code_hash, 64)
+}
+
+pub(super) fn validate_invite_code(invite_code: &str) -> Result<(), ApiError> {
+    let valid = invite_code.len() == 14
+        && invite_code
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| match index {
+                4 | 9 => byte == b'-',
+                _ => matches!(byte, b'A'..=b'Z' | b'2'..=b'9'),
+            });
+    if !valid {
+        return Err(ApiError(anyhow::anyhow!("invalid invite code")));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_x25519_public_key(public_key: &str) -> Result<(), ApiError> {
+    validate_hex_field("X25519 public key", public_key, 64)
+}
+
+pub(super) fn validate_nonce_hex(nonce_hex: &str) -> Result<(), ApiError> {
+    validate_hex_field("nonce", nonce_hex, 48)
+}
+
+pub(super) fn validate_ciphertext_hex(ciphertext_hex: &str) -> Result<(), ApiError> {
+    if ciphertext_hex.is_empty() || ciphertext_hex.len() % 2 != 0 || !is_lower_hex(ciphertext_hex) {
+        return Err(ApiError(anyhow::anyhow!("invalid ciphertext hex")));
+    }
+    Ok(())
+}
+
 pub(super) fn validate_op_list_limit(limit: u64) -> Result<(), ApiError> {
     if limit == 0 {
         return Err(ApiError(anyhow::anyhow!(
@@ -152,7 +197,9 @@ pub(super) fn is_lower_hex(value: &str) -> bool {
 mod tests {
     use super::super::routes::{AppendOpRequest, PutSnapshotRequest};
     use super::{
-        validate_blob_id, validate_op_list_limit, validate_op_request, validate_snapshot_request,
+        validate_blob_id, validate_invite_code, validate_invite_code_hash, validate_op_list_limit,
+        validate_op_request, validate_pairing_session_id, validate_request_hash,
+        validate_snapshot_request,
     };
     use mylonite_protocol::OpKind;
 
@@ -202,6 +249,25 @@ mod tests {
         assert!(validate_blob_id("blob-a").is_err());
         assert!(validate_blob_id(&"A".repeat(64)).is_err());
         assert!(validate_blob_id(&"a".repeat(63)).is_err());
+    }
+
+    #[test]
+    fn validate_pairing_session_ids_and_request_hashes() {
+        assert!(validate_pairing_session_id(&format!("ps{}", "a".repeat(32))).is_ok());
+        assert!(validate_pairing_session_id(&format!("p{}", "a".repeat(33))).is_err());
+        assert!(validate_pairing_session_id(&format!("ps{}", "A".repeat(32))).is_err());
+
+        assert!(validate_request_hash(&"b".repeat(64)).is_ok());
+        assert!(validate_request_hash(&"b".repeat(63)).is_err());
+        assert!(validate_invite_code_hash(&"c".repeat(64)).is_ok());
+    }
+
+    #[test]
+    fn validate_invite_codes_use_grouped_base32() {
+        assert!(validate_invite_code("ABCD-2345-WXYZ").is_ok());
+        assert!(validate_invite_code("abcd-2345-wxyz").is_err());
+        assert!(validate_invite_code("ABCD2345WXYZ").is_err());
+        assert!(validate_invite_code("ABCD-2345-WXY").is_err());
     }
 
     #[test]

@@ -34,9 +34,70 @@
   min-width: 120px;
 }
 
+.mylonite-invite-panel {
+  align-items: center;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  display: flex;
+  gap: 16px;
+  margin: 12px 0;
+  padding: 14px;
+}
+
+.mylonite-invite-qr {
+  background: #fff;
+  border-radius: 6px;
+  height: 180px;
+  width: 180px;
+}
+
+.mylonite-invite-details {
+  flex: 1;
+  min-width: 0;
+}
+
+.mylonite-invite-code {
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-large);
+  font-weight: 700;
+  letter-spacing: 0;
+  margin-bottom: 6px;
+}
+
+.mylonite-invite-server {
+  overflow-wrap: anywhere;
+}
+
+.mylonite-qr-video {
+  background: #000;
+  border-radius: 8px;
+  display: block;
+  margin: 12px 0;
+  max-height: 70vh;
+  width: 100%;
+}
+
+input.mylonite-safety-code {
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-large);
+  font-weight: 700;
+  letter-spacing: 0;
+  text-align: center;
+  width: 9ch;
+}
+
 @media (max-width: 600px) {
   .mylonite-code-setting button {
     align-self: stretch;
     width: 100%;
+  }
+
+  .mylonite-invite-panel {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .mylonite-invite-qr {
+    align-self: center;
   }
 }

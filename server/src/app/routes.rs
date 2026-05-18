@@ -6,12 +6,22 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use sha2::{Digest, Sha256};
+use std::{
+    net::SocketAddr,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-use super::{ApiError, AppState, auth::verify_device_signature, validation};
+use super::{
+    ApiError, AppState, PairingSession, PairingSessionGrant, PairingSessionRequest,
+    auth::verify_device_signature, validation,
+};
 use crate::storage::{
     BlobRecord, CreatedVault, DeviceRecord, EncryptedOpRecord, SnapshotRecord, StorageStats,
 };
+
+const PAIRING_SESSION_TTL_SECS: u64 = 10 * 60;
+const MAX_PAIRING_SESSIONS: usize = 1024;
 
 pub(super) async fn health(State(app_state): State<AppState>) -> impl IntoResponse {
     match app_state.storage.stats() {
@@ -109,6 +119,81 @@ pub(super) struct RegisterDeviceResponse {
     device_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub(super) struct OpenPairingSessionRequest {
+    session_id: String,
+    invite_code_hash: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct OpenPairingSessionResponse {
+    session_id: String,
+    expires_at_unix: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub(super) struct PairingSessionRequestPayload {
+    request_hash: String,
+    label: String,
+    verifying_key: String,
+    x25519_public_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct SubmitPairingSessionRequest {
+    invite_code: String,
+    request: PairingSessionRequestPayload,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct SubmitPairingSessionResponse {
+    session_id: String,
+    expires_at_unix: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub(super) struct PairingSessionGrantPayload {
+    x25519_public_key: String,
+    nonce_hex: String,
+    ciphertext_hex: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct PutPairingSessionGrantRequest {
+    request_hash: String,
+    grant: PairingSessionGrantPayload,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(super) enum PairingSessionResponse {
+    Waiting {
+        expires_at_unix: u64,
+    },
+    Requested {
+        expires_at_unix: u64,
+        request: PairingSessionRequestPayload,
+    },
+    Granted {
+        expires_at_unix: u64,
+        grant: PairingSessionGrantPayload,
+    },
+    Expired,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(super) enum PairingSessionGrantResponse {
+    Pending {
+        expires_at_unix: u64,
+    },
+    Granted {
+        expires_at_unix: u64,
+        grant: PairingSessionGrantPayload,
+    },
+    Expired,
+}
+
 pub(super) async fn pair_first_device(
     State(app_state): State<AppState>,
     body: Bytes,
@@ -125,6 +210,226 @@ pub(super) async fn pair_first_device(
         vault_id: device.vault_id,
         device_id: device.device_id,
     }))
+}
+
+pub(super) async fn open_pairing_session(
+    State(app_state): State<AppState>,
+    Path(vault_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<OpenPairingSessionResponse>, ApiError> {
+    validation::validate_vault_id(&vault_id)?;
+    validate_json_body_len(&app_state, &body)?;
+    verify_device_signature(
+        &app_state,
+        &vault_id,
+        "POST",
+        &format!("/api/v1/vaults/{vault_id}/pairing-sessions"),
+        &body,
+        &headers,
+    )?;
+    let request: OpenPairingSessionRequest = serde_json::from_slice(&body)?;
+    validation::validate_pairing_session_id(&request.session_id)?;
+    validation::validate_invite_code_hash(&request.invite_code_hash)?;
+
+    let now = now_unix()?;
+    let expires_at_unix = now.saturating_add(PAIRING_SESSION_TTL_SECS);
+    let mut sessions = app_state
+        .pairing_sessions
+        .lock()
+        .map_err(|_| ApiError(anyhow::anyhow!("pairing session state unavailable")))?;
+    prune_pairing_sessions(&mut sessions, now);
+    if sessions.len() >= MAX_PAIRING_SESSIONS {
+        return Err(ApiError(anyhow::anyhow!(
+            "too many active pairing sessions"
+        )));
+    }
+    if sessions.contains_key(&request.session_id) {
+        return Err(ApiError(anyhow::anyhow!("pairing session already exists")));
+    }
+
+    sessions.insert(
+        request.session_id.clone(),
+        PairingSession {
+            vault_id,
+            invite_code_hash: request.invite_code_hash,
+            expires_at_unix,
+            request: None,
+            grant: None,
+        },
+    );
+    Ok(Json(OpenPairingSessionResponse {
+        session_id: request.session_id,
+        expires_at_unix,
+    }))
+}
+
+pub(super) async fn get_pairing_session(
+    State(app_state): State<AppState>,
+    Path((vault_id, session_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<PairingSessionResponse>, ApiError> {
+    validation::validate_vault_id(&vault_id)?;
+    validation::validate_pairing_session_id(&session_id)?;
+    verify_device_signature(
+        &app_state,
+        &vault_id,
+        "GET",
+        &format!("/api/v1/vaults/{vault_id}/pairing-sessions/{session_id}"),
+        &[],
+        &headers,
+    )?;
+
+    let now = now_unix()?;
+    let mut sessions = app_state
+        .pairing_sessions
+        .lock()
+        .map_err(|_| ApiError(anyhow::anyhow!("pairing session state unavailable")))?;
+    prune_pairing_sessions(&mut sessions, now);
+    let Some(session) = sessions.get(&session_id) else {
+        return Ok(Json(PairingSessionResponse::Expired));
+    };
+    if session.vault_id != vault_id {
+        return Err(ApiError(anyhow::anyhow!("pairing session vault mismatch")));
+    }
+    if let Some(grant) = &session.grant {
+        return Ok(Json(PairingSessionResponse::Granted {
+            expires_at_unix: session.expires_at_unix,
+            grant: PairingSessionGrantPayload {
+                x25519_public_key: grant.x25519_public_key.clone(),
+                nonce_hex: grant.nonce_hex.clone(),
+                ciphertext_hex: grant.ciphertext_hex.clone(),
+            },
+        }));
+    }
+    if let Some(request) = &session.request {
+        return Ok(Json(PairingSessionResponse::Requested {
+            expires_at_unix: session.expires_at_unix,
+            request: PairingSessionRequestPayload {
+                request_hash: request.request_hash.clone(),
+                label: request.label.clone(),
+                verifying_key: request.verifying_key.clone(),
+                x25519_public_key: request.x25519_public_key.clone(),
+            },
+        }));
+    }
+    Ok(Json(PairingSessionResponse::Waiting {
+        expires_at_unix: session.expires_at_unix,
+    }))
+}
+
+pub(super) async fn submit_pairing_session_request(
+    State(app_state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<SubmitPairingSessionResponse>, ApiError> {
+    validate_json_body_len(&app_state, &body)?;
+    let request: SubmitPairingSessionRequest = serde_json::from_slice(&body)?;
+    validation::validate_invite_code(&request.invite_code)?;
+    validate_pairing_session_request(&request.request)?;
+
+    let now = now_unix()?;
+    let mut sessions = app_state
+        .pairing_sessions
+        .lock()
+        .map_err(|_| ApiError(anyhow::anyhow!("pairing session state unavailable")))?;
+    prune_pairing_sessions(&mut sessions, now);
+    let Some((session_id, session)) = sessions.iter_mut().find(|(session_id, session)| {
+        session.invite_code_hash == invite_code_hash(session_id, &request.invite_code)
+    }) else {
+        return Err(ApiError(anyhow::anyhow!("invite code not found")));
+    };
+    if session.request.is_some() || session.grant.is_some() {
+        return Err(ApiError(anyhow::anyhow!("pairing session already claimed")));
+    }
+    session.request = Some(PairingSessionRequest {
+        request_hash: request.request.request_hash,
+        label: request.request.label,
+        verifying_key: request.request.verifying_key,
+        x25519_public_key: request.request.x25519_public_key,
+    });
+    Ok(Json(SubmitPairingSessionResponse {
+        session_id: session_id.clone(),
+        expires_at_unix: session.expires_at_unix,
+    }))
+}
+
+pub(super) async fn get_pairing_session_grant(
+    State(app_state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Result<Json<PairingSessionGrantResponse>, ApiError> {
+    validation::validate_pairing_session_id(&session_id)?;
+    let now = now_unix()?;
+    let mut sessions = app_state
+        .pairing_sessions
+        .lock()
+        .map_err(|_| ApiError(anyhow::anyhow!("pairing session state unavailable")))?;
+    prune_pairing_sessions(&mut sessions, now);
+    let Some(session) = sessions.get(&session_id) else {
+        return Ok(Json(PairingSessionGrantResponse::Expired));
+    };
+    if let Some(grant) = &session.grant {
+        return Ok(Json(PairingSessionGrantResponse::Granted {
+            expires_at_unix: session.expires_at_unix,
+            grant: PairingSessionGrantPayload {
+                x25519_public_key: grant.x25519_public_key.clone(),
+                nonce_hex: grant.nonce_hex.clone(),
+                ciphertext_hex: grant.ciphertext_hex.clone(),
+            },
+        }));
+    }
+    Ok(Json(PairingSessionGrantResponse::Pending {
+        expires_at_unix: session.expires_at_unix,
+    }))
+}
+
+pub(super) async fn put_pairing_session_grant(
+    State(app_state): State<AppState>,
+    Path((vault_id, session_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    validation::validate_vault_id(&vault_id)?;
+    validation::validate_pairing_session_id(&session_id)?;
+    validate_json_body_len(&app_state, &body)?;
+    verify_device_signature(
+        &app_state,
+        &vault_id,
+        "POST",
+        &format!("/api/v1/vaults/{vault_id}/pairing-sessions/{session_id}/grant"),
+        &body,
+        &headers,
+    )?;
+    let request: PutPairingSessionGrantRequest = serde_json::from_slice(&body)?;
+    validation::validate_request_hash(&request.request_hash)?;
+    validate_pairing_session_grant(&request.grant)?;
+
+    let now = now_unix()?;
+    let mut sessions = app_state
+        .pairing_sessions
+        .lock()
+        .map_err(|_| ApiError(anyhow::anyhow!("pairing session state unavailable")))?;
+    prune_pairing_sessions(&mut sessions, now);
+    let Some(session) = sessions.get_mut(&session_id) else {
+        return Err(ApiError(anyhow::anyhow!("pairing session expired")));
+    };
+    if session.vault_id != vault_id {
+        return Err(ApiError(anyhow::anyhow!("pairing session vault mismatch")));
+    }
+    let Some(pending_request) = &session.request else {
+        return Err(ApiError(anyhow::anyhow!("pairing session has no request")));
+    };
+    if pending_request.request_hash != request.request_hash {
+        return Err(ApiError(anyhow::anyhow!("pairing request hash mismatch")));
+    }
+    if session.grant.is_some() {
+        return Err(ApiError(anyhow::anyhow!("pairing session already granted")));
+    }
+    session.grant = Some(PairingSessionGrant {
+        x25519_public_key: request.grant.x25519_public_key,
+        nonce_hex: request.grant.nonce_hex,
+        ciphertext_hex: request.grant.ciphertext_hex,
+    });
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub(super) async fn list_devices(
@@ -426,9 +731,70 @@ fn require_loopback_admin(peer: SocketAddr) -> Result<(), ApiError> {
     )))
 }
 
+fn validate_pairing_session_grant(grant: &PairingSessionGrantPayload) -> Result<(), ApiError> {
+    validation::validate_x25519_public_key(&grant.x25519_public_key)?;
+    validation::validate_nonce_hex(&grant.nonce_hex)?;
+    validation::validate_ciphertext_hex(&grant.ciphertext_hex)
+}
+
+fn validate_pairing_session_request(
+    request: &PairingSessionRequestPayload,
+) -> Result<(), ApiError> {
+    validation::validate_request_hash(&request.request_hash)?;
+    validate_device_label(&request.label)?;
+    validation::validate_x25519_public_key(&request.x25519_public_key)?;
+    validate_verifying_key(&request.verifying_key)
+}
+
+fn validate_device_label(label: &str) -> Result<(), ApiError> {
+    if label.trim().is_empty() || label.len() > 128 {
+        return Err(ApiError(anyhow::anyhow!(
+            "device label must be 1..128 bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_verifying_key(verifying_key: &str) -> Result<(), ApiError> {
+    if verifying_key.len() != 64 || !validation::is_lower_hex(verifying_key) {
+        return Err(ApiError(anyhow::anyhow!("invalid Ed25519 verifying key")));
+    }
+    Ok(())
+}
+
+fn invite_code_hash(session_id: &str, invite_code: &str) -> String {
+    let material = format!("mylonite/pairing-invite-code/v1|{session_id}|{invite_code}");
+    hex_encode(&Sha256::digest(material.as_bytes()))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
+fn prune_pairing_sessions(
+    sessions: &mut std::collections::HashMap<String, PairingSession>,
+    now: u64,
+) {
+    sessions.retain(|_, session| session.expires_at_unix >= now);
+}
+
+fn now_unix() -> anyhow::Result<u64> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{require_loopback_admin, validate_body_device_matches_signer};
+    use super::{
+        PairingSessionGrantPayload, PairingSessionRequestPayload, invite_code_hash,
+        require_loopback_admin, validate_body_device_matches_signer,
+        validate_pairing_session_grant, validate_pairing_session_request,
+    };
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]
@@ -448,6 +814,68 @@ mod tests {
                 12000
             ))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn pairing_session_grant_requires_public_key_nonce_and_ciphertext_hex() {
+        let valid = PairingSessionGrantPayload {
+            x25519_public_key: "a".repeat(64),
+            nonce_hex: "b".repeat(48),
+            ciphertext_hex: "cc".to_string(),
+        };
+        assert!(validate_pairing_session_grant(&valid).is_ok());
+
+        assert!(
+            validate_pairing_session_grant(&PairingSessionGrantPayload {
+                x25519_public_key: "A".repeat(64),
+                ..valid.clone()
+            })
+            .is_err()
+        );
+        assert!(
+            validate_pairing_session_grant(&PairingSessionGrantPayload {
+                ciphertext_hex: "abc".to_string(),
+                ..valid
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pairing_session_request_requires_device_keys_and_hash() {
+        let valid = PairingSessionRequestPayload {
+            request_hash: "a".repeat(64),
+            label: "Phone".to_string(),
+            verifying_key: "b".repeat(64),
+            x25519_public_key: "c".repeat(64),
+        };
+        assert!(validate_pairing_session_request(&valid).is_ok());
+        assert!(
+            validate_pairing_session_request(&PairingSessionRequestPayload {
+                label: " ".to_string(),
+                ..valid.clone()
+            })
+            .is_err()
+        );
+        assert!(
+            validate_pairing_session_request(&PairingSessionRequestPayload {
+                x25519_public_key: "C".repeat(64),
+                ..valid
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn invite_code_hash_is_stable() {
+        assert_eq!(
+            invite_code_hash("psaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ABCD-2345-WXYZ"),
+            invite_code_hash("psaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ABCD-2345-WXYZ")
+        );
+        assert_ne!(
+            invite_code_hash("psaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ABCD-2345-WXYZ"),
+            invite_code_hash("psaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ABCD-2345-WXY2")
         );
     }
 }

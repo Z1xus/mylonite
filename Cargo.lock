@@ -786,7 +786,7 @@ dependencies = [
 
 [[package]]
 name = "mylonite"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "anyhow",
  "axum",
@@ -801,6 +801,7 @@ dependencies = [
  "redb",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "toml",
  "tower-http",
@@ -810,7 +811,7 @@ dependencies = [
 
 [[package]]
 name = "mylonite-protocol"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "thiserror",
 ]

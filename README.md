@@ -14,6 +14,9 @@ Mylonite is a self-hosted sync server for Obsidian. Use it with the Mylonite plu
 </p>
 <br>
 
+> [!NOTE]  
+> Mylonite is still in early development, expect bugs and breaking changes.
+
 ## Server
 
 Install the latest binary.
@@ -102,7 +105,7 @@ Enable Mylonite in Obsidian's community plugins list, then open its settings.
 
 ## Pairing
 
-The first device must be paired with the pairing token. Every other device can be paired with the Request / Authorize flow.
+The first device must be paired with the pairing token. Every other device joins through a short-lived invite approved by an already-paired device.
 
 ### First device
 
@@ -112,9 +115,9 @@ The first device must be paired with the pairing token. Every other device can b
 
 ### Additional devices
 
-1. On the new device, open Mylonite settings -> Enter your server URL -> click Request. Copy the request that appears.
-2. On an already paired device, open Mylonite settings -> Add another device, paste the request, and click Authorize. Copy the response that appears.
-3. Back on the new device, paste the response into Step 2 and click Complete.
+1. On an already-paired device, open Mylonite settings -> Add another device -> Create. Mylonite shows a QR code, an invite code, and the server URL.
+2. On the new device, open Mylonite settings -> Join an existing vault. Scan the QR code or paste the invite text to fill the server URL automatically. If QR scanning is unavailable, enter the invite code and server URL manually.
+3. Compare the six-digit safety code on both devices, then click Approve on the already-paired device.
 
 If you ever lose access to every paired device, the vault data is unrecoverable — the encryption key was generated on the first device and the server only holds ciphertext. Wipe the dead vault and start fresh:
 

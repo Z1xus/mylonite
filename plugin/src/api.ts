@@ -6,6 +6,40 @@ export interface PairFirstDeviceResponse {
   device_id: string;
 }
 
+export interface OpenPairingSessionResponse {
+  session_id: string;
+  expires_at_unix: number;
+}
+
+export interface SubmitPairingSessionResponse {
+  session_id: string;
+  expires_at_unix: number;
+}
+
+export interface PairingGrantPayload {
+  x25519_public_key: string;
+  nonce_hex: string;
+  ciphertext_hex: string;
+}
+
+export interface PairingRequestPayload {
+  request_hash: string;
+  label: string;
+  verifying_key: string;
+  x25519_public_key: string;
+}
+
+export type PairingSessionResponse =
+  | { status: "waiting"; expires_at_unix: number }
+  | { status: "requested"; expires_at_unix: number; request: PairingRequestPayload }
+  | { status: "granted"; expires_at_unix: number; grant: PairingGrantPayload }
+  | { status: "expired" };
+
+export type PairingSessionGrantResponse =
+  | { status: "pending"; expires_at_unix: number }
+  | { status: "granted"; expires_at_unix: number; grant: PairingGrantPayload }
+  | { status: "expired" };
+
 export interface EncryptedOpRecord {
   vault_id: string;
   server_seq: number;
@@ -113,6 +147,51 @@ export class MyloniteApiClient {
     });
   }
 
+  async openPairingSession(vaultId: string, sessionId: string, inviteCodeHash: string): Promise<OpenPairingSessionResponse> {
+    validateOpaqueId("vault id", vaultId);
+    validatePairingSessionId(sessionId);
+    validateInviteCodeHash(inviteCodeHash);
+    const path = `/api/v1/vaults/${encodeURIComponent(vaultId)}/pairing-sessions`;
+    const body = new TextEncoder().encode(JSON.stringify({ session_id: sessionId, invite_code_hash: inviteCodeHash }));
+    return this.requestJson(path, {
+      method: "POST",
+      headers: this.signedHeaders("POST", path, body, { "content-type": "application/json" }),
+      body,
+    });
+  }
+
+  async getPairingSession(vaultId: string, sessionId: string): Promise<PairingSessionResponse> {
+    validateOpaqueId("vault id", vaultId);
+    validatePairingSessionId(sessionId);
+    const path = `/api/v1/vaults/${encodeURIComponent(vaultId)}/pairing-sessions/${encodeURIComponent(sessionId)}`;
+    const response = await this.requestJson<PairingSessionResponse>(path, {
+      headers: this.signedHeaders("GET", path, new Uint8Array()),
+    });
+    validatePairingSessionResponse(response);
+    return response;
+  }
+
+  async submitPairingSessionRequest(inviteCode: string, request: PairingRequestPayload): Promise<SubmitPairingSessionResponse> {
+    validateInviteCode(inviteCode);
+    validatePairingRequestPayload(request);
+    const path = "/api/v1/pair/invites/request";
+    const response = await this.requestJson<SubmitPairingSessionResponse>(path, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ invite_code: inviteCode, request }),
+    });
+    validatePairingSessionId(response.session_id);
+    validateSequence("expires at", response.expires_at_unix, 0);
+    return response;
+  }
+
+  async getPairingSessionGrant(sessionId: string): Promise<PairingSessionGrantResponse> {
+    validatePairingSessionId(sessionId);
+    const response = await this.requestJson<PairingSessionGrantResponse>(`/api/v1/pair/sessions/${encodeURIComponent(sessionId)}/grant`);
+    validatePairingSessionGrantResponse(response);
+    return response;
+  }
+
   async listOps(vaultId: string, after: number, limit?: number): Promise<EncryptedOpRecord[]> {
     validateOpaqueId("vault id", vaultId);
     validateSequence("after", after);
@@ -206,6 +285,20 @@ export class MyloniteApiClient {
     });
   }
 
+  async putPairingSessionGrant(vaultId: string, sessionId: string, requestHash: string, grant: PairingGrantPayload): Promise<void> {
+    validateOpaqueId("vault id", vaultId);
+    validatePairingSessionId(sessionId);
+    validateRequestHash(requestHash);
+    validatePairingGrantPayload(grant);
+    const path = `/api/v1/vaults/${encodeURIComponent(vaultId)}/pairing-sessions/${encodeURIComponent(sessionId)}/grant`;
+    const body = new TextEncoder().encode(JSON.stringify({ request_hash: requestHash, grant }));
+    await this.request(path, {
+      method: "POST",
+      headers: this.signedHeaders("POST", path, body, { "content-type": "application/json" }),
+      body,
+    });
+  }
+
   async revokeDevice(vaultId: string, deviceId: string): Promise<void> {
     validateOpaqueId("vault id", vaultId);
     validateDeviceId(deviceId);
@@ -283,8 +376,32 @@ function validatePairingToken(value: string): void {
   }
 }
 
+function validatePairingSessionId(value: string): void {
+  if (!/^ps[0-9a-f]{32}$/.test(value)) {
+    throw new Error("invalid pairing session id");
+  }
+}
+
+function validateRequestHash(value: string): void {
+  validateHexField("request hash", value, 64);
+}
+
+function validateInviteCodeHash(value: string): void {
+  validateHexField("invite code hash", value, 64);
+}
+
+function validateInviteCode(value: string): void {
+  if (!/^[A-Z2-9]{4}-[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(value)) {
+    throw new Error("invalid invite code");
+  }
+}
+
 function validateVerifyingKey(value: string): void {
   validateHexField("Ed25519 verifying key", value, 64);
+}
+
+function validateX25519PublicKey(value: string): void {
+  validateHexField("X25519 public key", value, 64);
 }
 
 function validateBlobId(value: string): void {
@@ -318,6 +435,56 @@ function validatePutSnapshotRequest(snapshot: PutSnapshotRequest): void {
   validateKeyVersion(snapshot.key_version);
   validateHexField("nonce", snapshot.nonce_hex, 48);
   validateHexPayload("ciphertext", snapshot.ciphertext_hex);
+}
+
+function validatePairingSessionGrantResponse(response: PairingSessionGrantResponse): void {
+  if (response.status === "expired") {
+    return;
+  }
+  if (response.status === "pending") {
+    validateSequence("expires at", response.expires_at_unix, 0);
+    return;
+  }
+  if (response.status === "granted") {
+    validateSequence("expires at", response.expires_at_unix, 0);
+    validatePairingGrantPayload(response.grant);
+    return;
+  }
+  throw new Error("invalid pairing session grant response");
+}
+
+function validatePairingSessionResponse(response: PairingSessionResponse): void {
+  if (response.status === "expired") {
+    return;
+  }
+  if (response.status === "waiting") {
+    validateSequence("expires at", response.expires_at_unix, 0);
+    return;
+  }
+  if (response.status === "requested") {
+    validateSequence("expires at", response.expires_at_unix, 0);
+    validatePairingRequestPayload(response.request);
+    return;
+  }
+  if (response.status === "granted") {
+    validateSequence("expires at", response.expires_at_unix, 0);
+    validatePairingGrantPayload(response.grant);
+    return;
+  }
+  throw new Error("invalid pairing session response");
+}
+
+function validatePairingRequestPayload(request: PairingRequestPayload): void {
+  validateRequestHash(request.request_hash);
+  validateDeviceLabel(request.label);
+  validateVerifyingKey(request.verifying_key);
+  validateX25519PublicKey(request.x25519_public_key);
+}
+
+function validatePairingGrantPayload(grant: PairingGrantPayload): void {
+  validateX25519PublicKey(grant.x25519_public_key);
+  validateHexField("nonce", grant.nonce_hex, 48);
+  validateHexPayload("ciphertext", grant.ciphertext_hex);
 }
 
 function validateKeyVersion(value: number): void {

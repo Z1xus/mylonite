@@ -104,7 +104,13 @@ mod tests {
     };
     use axum::http::HeaderMap;
     use ed25519_dalek::{Signer, SigningKey};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
+    };
     use tokio::sync::broadcast;
 
     static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -217,6 +223,7 @@ mod tests {
             max_snapshot_ciphertext_bytes: 1024,
             snapshot_retain: 2,
             op_broadcast: broadcast::channel::<EncryptedOpRecord>(16).0,
+            pairing_sessions: Arc::new(Mutex::new(HashMap::new())),
         };
 
         (state, vault.id, device.device_id, signing_key)

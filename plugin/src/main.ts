@@ -1,6 +1,6 @@
 import { Notice, Plugin } from "obsidian";
 
-import { MyloniteApiClient } from "./api";
+import { MyloniteApiClient, PairingGrantPayload } from "./api";
 import {
   VaultKeys,
   decryptDevicePairingSecret,
@@ -22,6 +22,24 @@ import {
   storePassphrase,
 } from "./secrets";
 import { DEFAULT_SETTINGS, MyloniteSettings, MyloniteSettingTab } from "./settings";
+import {
+  DevicePairingInvitePayload,
+  DevicePairingRequestPayload,
+  DevicePairingResponsePayload,
+  DevicePairingSecretPayload,
+  createDevicePairingInvitePayload,
+  createDevicePairingRequestPayload,
+  inviteCodeHash,
+  normalizeServerUrl,
+  normalizeInviteCode,
+  pairingSafetyCode,
+  parseDevicePairingInviteInput,
+  validateDevicePairingInvite,
+  validateDevicePairingRequest,
+  validateDevicePairingResponse,
+  validateDevicePairingSecret,
+  validatePairingRequestShape,
+} from "./pairing";
 import { SyncEngine } from "./sync-engine";
 
 export default class MylonitePlugin extends Plugin {
@@ -29,6 +47,7 @@ export default class MylonitePlugin extends Plugin {
   private status: HTMLElement | null = null;
   private vaultKeys: Promise<VaultKeys> | null = null;
   private syncEngine = new SyncEngine(this);
+  private pairingPollTimer: number | null = null;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -57,6 +76,7 @@ export default class MylonitePlugin extends Plugin {
     this.addSettingTab(new MyloniteSettingTab(this.app, this));
     this.status = this.addStatusBarItem();
     this.updateStatus("idle");
+    this.startPairingPolling();
 
     this.app.workspace.onLayoutReady(() => {
       this.syncEngine.start();
@@ -64,6 +84,7 @@ export default class MylonitePlugin extends Plugin {
   }
 
   onunload(): void {
+    this.stopPairingPolling();
     this.syncEngine.close();
     this.status?.remove();
     this.status = null;
@@ -118,23 +139,78 @@ export default class MylonitePlugin extends Plugin {
     }
   }
 
-  async createDevicePairingRequest(): Promise<void> {
-    const existingPrivateKey = loadDevicePrivateKey(this.app, this.settings);
-    const deviceKeypair = existingPrivateKey && this.settings.devicePublicKeyHex
-      ? { privateKeyHex: existingPrivateKey, publicKeyHex: this.settings.devicePublicKeyHex }
-      : generateDeviceKeypair();
-    const exchangeKeypair = generateX25519Keypair();
-    storeDevicePrivateKey(this.app, this.settings, deviceKeypair.privateKeyHex);
-    this.settings.devicePublicKeyHex = deviceKeypair.publicKeyHex;
-    storeDevicePairingPrivateKey(this.app, this.settings, exchangeKeypair.privateKeyHex);
-    this.settings.devicePairingRequest = JSON.stringify({
-      version: 1,
-      label: this.settings.deviceLabel || "Obsidian device",
-      verifying_key: deviceKeypair.publicKeyHex,
-      x25519_public_key: exchangeKeypair.publicKeyHex,
-    });
-    await this.saveSettings();
-    new Notice("Pairing request ready.");
+  async createDevicePairingInvite(): Promise<void> {
+    if (!this.settings.vaultId || !this.settings.serverUrl) {
+      new Notice("This device is not ready to create an invite.");
+      return;
+    }
+    try {
+      const sessionId = `ps${randomHex(16)}`;
+      const invite = createDevicePairingInvitePayload(this.settings.serverUrl);
+      const client = this.createApiClient();
+      await client.openPairingSession(this.settings.vaultId, sessionId, inviteCodeHash(sessionId, invite.invite_code));
+      this.settings.devicePairingInvite = JSON.stringify(invite);
+      this.settings.devicePairingSessionId = sessionId;
+      this.settings.devicePairingRequest = "";
+      this.settings.devicePairingResponse = "";
+      await this.saveSettings();
+      this.startPairingPolling();
+      new Notice(`Device invite ready. Code ${invite.invite_code}.`);
+    } catch (error) {
+      new Notice(`Could not create invite. Check the server connection and try again. ${String(error)}`);
+    }
+  }
+
+  async submitDevicePairingInvite(inviteInput: string): Promise<void> {
+    let invite: DevicePairingInvitePayload;
+    try {
+      invite = parseDevicePairingInviteInput(inviteInput);
+    } catch (error) {
+      try {
+        invite = {
+          version: 1,
+          server_url: normalizeServerUrl(this.settings.serverUrl),
+          invite_code: normalizeInviteCode(inviteInput),
+        };
+        validateDevicePairingInvite(invite);
+      } catch {
+        new Notice(`Invalid invite. Paste invite text, scan the QR code, or enter a code with the server URL. ${String(error)}`);
+        return;
+      }
+    }
+    try {
+      const existingPrivateKey = loadDevicePrivateKey(this.app, this.settings);
+      const deviceKeypair = existingPrivateKey && this.settings.devicePublicKeyHex
+        ? { privateKeyHex: existingPrivateKey, publicKeyHex: this.settings.devicePublicKeyHex }
+        : generateDeviceKeypair();
+      const exchangeKeypair = generateX25519Keypair();
+      const request = createDevicePairingRequestPayload(
+        invite.invite_code,
+        this.settings.deviceLabel || "Obsidian device",
+        deviceKeypair.publicKeyHex,
+        exchangeKeypair.publicKeyHex,
+      );
+      const client = new MyloniteApiClient(invite.server_url);
+      const submitted = await client.submitPairingSessionRequest(invite.invite_code, {
+        request_hash: request.request_hash,
+        label: request.label,
+        verifying_key: request.verifying_key,
+        x25519_public_key: request.x25519_public_key,
+      });
+      this.settings.serverUrl = normalizeServerUrl(invite.server_url);
+      this.settings.devicePairingInvite = JSON.stringify(invite);
+      this.settings.devicePairingSessionId = submitted.session_id;
+      this.settings.devicePairingRequest = JSON.stringify(request);
+      this.settings.devicePairingResponse = "";
+      this.settings.devicePublicKeyHex = deviceKeypair.publicKeyHex;
+      storeDevicePrivateKey(this.app, this.settings, deviceKeypair.privateKeyHex);
+      storeDevicePairingPrivateKey(this.app, this.settings, exchangeKeypair.privateKeyHex);
+      await this.saveSettings();
+      this.startPairingPolling();
+      new Notice(`Join request sent. Safety code ${pairingSafetyCode(request.request_hash)}.`);
+    } catch (error) {
+      new Notice(`Could not join invite. Check the invite code and server URL. ${String(error)}`);
+    }
   }
 
   async authorizeDevicePairingRequest(): Promise<void> {
@@ -142,21 +218,39 @@ export default class MylonitePlugin extends Plugin {
       new Notice("This device is not paired. Pair it before authorizing another device.");
       return;
     }
-    if (!this.settings.devicePairingRequest) {
-      new Notice("Missing pairing request. Paste one to continue.");
+    const invite = this.currentPairingInvite();
+    const request = this.currentPairingRequest();
+    if (!invite || !request || !this.settings.devicePairingSessionId) {
+      new Notice("No pending device request to approve.");
       return;
     }
-    let request: DevicePairingRequestPayload;
     try {
-      request = JSON.parse(this.settings.devicePairingRequest) as DevicePairingRequestPayload;
-      validateDevicePairingRequest(request);
+      validateDevicePairingRequest(request, invite.invite_code);
     } catch (error) {
-      new Notice(`Invalid pairing request. Ask the new device to create another one. ${String(error)}`);
+      new Notice(`Invalid device request. Ask the new device to try again. ${String(error)}`);
+      return;
+    }
+    const approved = window.confirm(`Approve "${request.label}"?\n\nSafety code: ${pairingSafetyCode(request.request_hash)}`);
+    if (!approved) {
       return;
     }
     try {
       const secretMaterial = await this.ensureVaultSecretMaterial();
       const client = this.createApiClient();
+      const session = await client.getPairingSession(this.settings.vaultId, this.settings.devicePairingSessionId);
+      if (session.status === "expired") {
+        new Notice("Invite expired. Create a new invite.");
+        return;
+      }
+      if (session.status === "granted") {
+        new Notice("Invite was already approved. Ask the new device to check approval.");
+        return;
+      }
+      if (session.status !== "requested" || session.request.request_hash !== request.request_hash) {
+        new Notice("The pending request changed. Review the safety code again.");
+        await this.pollPairingState(true);
+        return;
+      }
       const registered = await client.registerDevice(
         this.settings.vaultId,
         request.label || "Obsidian device",
@@ -169,32 +263,38 @@ export default class MylonitePlugin extends Plugin {
         vault_salt_hex: secretMaterial.saltHex,
         passphrase: secretMaterial.passphrase,
         device_id: registered.device_id,
+        request_hash: request.request_hash,
         last_server_seq: 0,
       }));
       const encrypted = encryptDevicePairingSecret(exchangeKeypair.privateKeyHex, request.x25519_public_key, secret);
-      this.settings.devicePairingResponse = JSON.stringify({
-        version: 1,
+      const grant: PairingGrantPayload = {
         x25519_public_key: exchangeKeypair.publicKeyHex,
         nonce_hex: encrypted.nonceHex,
         ciphertext_hex: encrypted.ciphertextHex,
-      });
+      };
+      await client.putPairingSessionGrant(this.settings.vaultId, this.settings.devicePairingSessionId, request.request_hash, grant);
+      this.settings.devicePairingInvite = "";
+      this.settings.devicePairingSessionId = "";
       this.settings.devicePairingRequest = "";
+      this.settings.devicePairingResponse = "";
       await this.saveSettings();
-      new Notice("Pairing response ready.");
+      this.stopPairingPolling();
+      new Notice("Device approved. The new device will finish automatically.");
     } catch (error) {
       new Notice(`Authorization failed. Check the request and try again. ${String(error)}`);
     }
   }
 
   async completeDevicePairing(): Promise<void> {
+    const request = this.currentPairingRequest();
     const privateKeyHex = loadDevicePrivateKey(this.app, this.settings);
     const pairingPrivateKeyHex = loadDevicePairingPrivateKey(this.app, this.settings);
-    if (!privateKeyHex || !this.settings.devicePublicKeyHex || !pairingPrivateKeyHex) {
-      new Notice("Missing pairing request. Create one on this device first.");
+    if (!request || !privateKeyHex || !this.settings.devicePublicKeyHex || !pairingPrivateKeyHex) {
+      new Notice("Missing join request. Enter the invite again.");
       return;
     }
     if (!this.settings.devicePairingResponse) {
-      new Notice("Missing pairing response. Paste one to continue.");
+      new Notice("Still waiting for approval from a paired device.");
       return;
     }
     try {
@@ -205,7 +305,7 @@ export default class MylonitePlugin extends Plugin {
         ciphertextHex: response.ciphertext_hex,
       });
       const secret = JSON.parse(new TextDecoder().decode(plaintext)) as DevicePairingSecretPayload;
-      validateDevicePairingSecret(secret);
+      validateDevicePairingSecret(secret, request.request_hash);
       this.settings.vaultId = secret.vault_id;
       this.settings.vaultSaltHex = secret.vault_salt_hex;
       this.settings.deviceId = secret.device_id;
@@ -214,17 +314,188 @@ export default class MylonitePlugin extends Plugin {
       this.settings.pendingBlobs = [];
       this.settings.pendingOps = [];
       clearDevicePairingPrivateKey(this.app, this.settings);
+      this.settings.devicePairingInvite = "";
+      this.settings.devicePairingSessionId = "";
       this.settings.devicePairingResponse = "";
       this.settings.devicePairingRequest = "";
       storeDevicePrivateKey(this.app, this.settings, privateKeyHex);
       storePassphrase(this.app, this.settings, secret.passphrase);
       this.vaultKeys = null;
       await this.saveSettings();
+      this.stopPairingPolling();
       this.updateStatus("paired");
       this.syncEngine.start();
       new Notice("Device paired.");
     } catch (error) {
-      new Notice(`Pairing failed. Check the response and try again. ${String(error)}`);
+      new Notice(`Pairing failed. Check the approval and try again. ${String(error)}`);
+    }
+  }
+
+  async checkDevicePairingStatus(): Promise<void> {
+    await this.pollPairingState(true);
+  }
+
+  private startPairingPolling(): void {
+    if (this.pairingPollTimer !== null || !this.hasPairingStateToPoll()) {
+      return;
+    }
+    this.pairingPollTimer = window.setInterval(() => {
+      void this.pollPairingState(false);
+    }, 3000);
+    void this.pollPairingState(false);
+  }
+
+  private stopPairingPolling(): void {
+    if (this.pairingPollTimer === null) {
+      return;
+    }
+    window.clearInterval(this.pairingPollTimer);
+    this.pairingPollTimer = null;
+  }
+
+  private hasPairingStateToPoll(): boolean {
+    if (this.settings.vaultId) {
+      return Boolean(this.settings.devicePairingInvite && this.settings.devicePairingSessionId);
+    }
+    return Boolean(this.settings.devicePairingRequest && this.settings.devicePairingSessionId);
+  }
+
+  private async pollPairingState(showNotice: boolean): Promise<void> {
+    if (this.settings.vaultId) {
+      await this.pollPendingPairingRequest(showNotice);
+      return;
+    }
+    await this.pollDevicePairingGrant(showNotice);
+  }
+
+  private async pollPendingPairingRequest(showNotice: boolean): Promise<void> {
+    if (!this.settings.vaultId || !this.settings.devicePairingInvite || !this.settings.devicePairingSessionId) {
+      this.stopPairingPolling();
+      return;
+    }
+    try {
+      const session = await this.createApiClient().getPairingSession(this.settings.vaultId, this.settings.devicePairingSessionId);
+      if (session.status === "expired") {
+        this.settings.devicePairingInvite = "";
+        this.settings.devicePairingSessionId = "";
+        this.settings.devicePairingRequest = "";
+        await this.saveSettings();
+        this.stopPairingPolling();
+        if (showNotice) {
+          new Notice("Invite expired. Create a new one.");
+        }
+        return;
+      }
+      if (session.status === "waiting") {
+        if (showNotice) {
+          new Notice("Still waiting for the new device.");
+        }
+        return;
+      }
+      if (session.status === "granted") {
+        this.settings.devicePairingInvite = "";
+        this.settings.devicePairingSessionId = "";
+        this.settings.devicePairingRequest = "";
+        await this.saveSettings();
+        this.stopPairingPolling();
+        return;
+      }
+      const invite = this.currentPairingInvite();
+      if (!invite) {
+        this.settings.devicePairingInvite = "";
+        this.settings.devicePairingSessionId = "";
+        this.settings.devicePairingRequest = "";
+        await this.saveSettings();
+        this.stopPairingPolling();
+        if (showNotice) {
+          new Notice("Invite state is invalid. Create a new invite.");
+        }
+        return;
+      }
+      const request: DevicePairingRequestPayload = { version: 1, ...session.request };
+      validateDevicePairingRequest(request, invite.invite_code);
+      if (this.settings.devicePairingRequest !== JSON.stringify(request)) {
+        this.settings.devicePairingRequest = JSON.stringify(request);
+        await this.saveSettings();
+        new Notice(`New device request received. Safety code ${pairingSafetyCode(request.request_hash)}.`);
+      }
+    } catch (error) {
+      if (showNotice) {
+        new Notice(`Could not check invite. ${String(error)}`);
+      } else {
+        this.debug(`pairing invite poll failed: ${String(error)}`);
+      }
+    }
+  }
+
+  private async pollDevicePairingGrant(showNotice: boolean): Promise<void> {
+    if (this.settings.vaultId || !this.settings.devicePairingRequest || !this.settings.devicePairingSessionId) {
+      this.stopPairingPolling();
+      return;
+    }
+    const request = this.currentPairingRequest();
+    if (!request) {
+      if (showNotice) {
+        new Notice("Invalid join request. Enter the invite again.");
+      }
+      this.stopPairingPolling();
+      return;
+    }
+    try {
+      const client = new MyloniteApiClient(this.settings.serverUrl);
+      const response = await client.getPairingSessionGrant(this.settings.devicePairingSessionId);
+      if (response.status === "expired") {
+        this.stopPairingPolling();
+        if (showNotice) {
+          new Notice("Invite expired. Enter a new one.");
+        }
+        return;
+      }
+      if (response.status === "pending") {
+        if (showNotice) {
+          new Notice(`Still waiting for approval. Safety code ${pairingSafetyCode(request.request_hash)}.`);
+        }
+        return;
+      }
+      const grant: DevicePairingResponsePayload = {
+        version: 1,
+        x25519_public_key: response.grant.x25519_public_key,
+        nonce_hex: response.grant.nonce_hex,
+        ciphertext_hex: response.grant.ciphertext_hex,
+      };
+      this.settings.devicePairingResponse = JSON.stringify(grant);
+      await this.saveSettings();
+      await this.completeDevicePairing();
+    } catch (error) {
+      if (showNotice) {
+        new Notice(`Could not check for approval. ${String(error)}`);
+      } else {
+        this.debug(`pairing grant poll failed: ${String(error)}`);
+      }
+    }
+  }
+
+  private currentPairingInvite(): DevicePairingInvitePayload | null {
+    if (!this.settings.devicePairingInvite) {
+      return null;
+    }
+    try {
+      return parseDevicePairingInviteInput(this.settings.devicePairingInvite);
+    } catch {
+      return null;
+    }
+  }
+
+  private currentPairingRequest(): DevicePairingRequestPayload | null {
+    if (!this.settings.devicePairingRequest) {
+      return null;
+    }
+    try {
+      const request = JSON.parse(this.settings.devicePairingRequest) as DevicePairingRequestPayload;
+      validatePairingRequestShape(request);
+      return request;
+    } catch {
+      return null;
     }
   }
 
@@ -248,6 +519,7 @@ export default class MylonitePlugin extends Plugin {
     if (!confirmed) {
       return;
     }
+    this.stopPairingPolling();
     this.syncEngine.close({ flushScheduledUpdates: false });
     clearDevicePrivateKey(this.app, this.settings);
     clearDevicePairingPrivateKey(this.app, this.settings);
@@ -257,6 +529,8 @@ export default class MylonitePlugin extends Plugin {
     this.settings.deviceId = "";
     this.settings.devicePublicKeyHex = "";
     this.settings.pairingToken = "";
+    this.settings.devicePairingInvite = "";
+    this.settings.devicePairingSessionId = "";
     this.settings.devicePairingRequest = "";
     this.settings.devicePairingResponse = "";
     this.settings.lamport = 0;
@@ -320,70 +594,4 @@ export default class MylonitePlugin extends Plugin {
     }
     return { passphrase, saltHex: this.settings.vaultSaltHex };
   }
-}
-
-interface DevicePairingRequestPayload {
-  version: number;
-  label: string;
-  verifying_key: string;
-  x25519_public_key: string;
-}
-
-interface DevicePairingResponsePayload {
-  version: number;
-  x25519_public_key: string;
-  nonce_hex: string;
-  ciphertext_hex: string;
-}
-
-interface DevicePairingSecretPayload {
-  version: number;
-  vault_id: string;
-  vault_salt_hex: string;
-  passphrase: string;
-  device_id: string;
-  last_server_seq: number;
-}
-
-function validateDevicePairingRequest(payload: DevicePairingRequestPayload): void {
-  if (payload.version !== 1 || !validDeviceLabel(payload.label) || !isHex(payload.verifying_key, 64) || !isHex(payload.x25519_public_key, 64)) {
-    throw new Error("invalid device pairing request");
-  }
-}
-
-function validateDevicePairingResponse(payload: DevicePairingResponsePayload): void {
-  if (payload.version !== 1 || !isHex(payload.x25519_public_key, 64) || !isHex(payload.nonce_hex, 48) || !isHex(payload.ciphertext_hex)) {
-    throw new Error("invalid device pairing response");
-  }
-}
-
-function validateDevicePairingSecret(payload: DevicePairingSecretPayload): void {
-  if (
-    payload.version !== 1
-    || !validOpaqueId(payload.vault_id)
-    || !isHex(payload.vault_salt_hex, 32)
-    || typeof payload.passphrase !== "string"
-    || payload.passphrase.length === 0
-    || !validDeviceId(payload.device_id)
-    || !Number.isSafeInteger(payload.last_server_seq)
-    || payload.last_server_seq < 0
-  ) {
-    throw new Error("invalid device pairing secret");
-  }
-}
-
-function validOpaqueId(value: string): boolean {
-  return typeof value === "string" && value.length > 0 && value.length <= 128 && /^[A-Za-z0-9_-]+$/.test(value);
-}
-
-function validDeviceId(value: string): boolean {
-  return typeof value === "string" && /^d[0-9a-f]{32}$/.test(value);
-}
-
-function validDeviceLabel(value: string): boolean {
-  return typeof value === "string" && value.trim().length > 0 && new TextEncoder().encode(value).length <= 128;
-}
-
-function isHex(value: string, len?: number): boolean {
-  return (len === undefined || value.length === len) && /^[0-9a-f]+$/.test(value);
 }

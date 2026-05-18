@@ -53,12 +53,50 @@ describe("MyloniteApiClient id validation", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("validates pairing relay requests before network requests", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}", { status: 200 }));
+    const client = new MyloniteApiClient("http://localhost");
+
+    await expect(client.openPairingSession("vault-a", "bad-session", "a".repeat(64))).rejects.toThrow("invalid pairing session id");
+    await expect(client.openPairingSession("vault-a", `ps${"a".repeat(32)}`, "b".repeat(63))).rejects.toThrow("invalid invite code hash");
+    await expect(client.submitPairingSessionRequest("bad-code", {
+      request_hash: "a".repeat(64),
+      label: "Phone",
+      verifying_key: "b".repeat(64),
+      x25519_public_key: "c".repeat(64),
+    })).rejects.toThrow("invalid invite code");
+    await expect(client.submitPairingSessionRequest("ABCD-2345-WXYZ", {
+      request_hash: "a".repeat(64),
+      label: "",
+      verifying_key: "b".repeat(64),
+      x25519_public_key: "c".repeat(64),
+    })).rejects.toThrow("invalid device label");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("rejects malformed device registration requests before signing", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}", { status: 200 }));
     const client = new MyloniteApiClient("http://localhost", { deviceId: "d" + "1".repeat(32), privateKeyHex: "00".repeat(32) });
 
     await expect(client.registerDevice("vault-a", "", "a".repeat(64))).rejects.toThrow("invalid device label");
     await expect(client.registerDevice("vault-a", "device", "a".repeat(63))).rejects.toThrow("invalid Ed25519 verifying key");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("validates pairing relay grants before signing", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
+    const client = new MyloniteApiClient("http://localhost", { deviceId: "d" + "1".repeat(32), privateKeyHex: "00".repeat(32) });
+
+    await expect(client.putPairingSessionGrant("vault-a", "bad-session", "a".repeat(64), {
+      x25519_public_key: "b".repeat(64),
+      nonce_hex: "c".repeat(48),
+      ciphertext_hex: "dd",
+    })).rejects.toThrow("invalid pairing session id");
+    await expect(client.putPairingSessionGrant("vault-a", `ps${"a".repeat(32)}`, "b".repeat(64), {
+      x25519_public_key: "c".repeat(64),
+      nonce_hex: "d".repeat(48),
+      ciphertext_hex: "abc",
+    })).rejects.toThrow("invalid ciphertext");
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -118,6 +156,41 @@ describe("MyloniteApiClient id validation", () => {
     await client.listOps("vault-a", 12, 512);
 
     expect(fetchMock).toHaveBeenCalledWith("http://localhost/api/v1/vaults/vault-a/ops?after=12&limit=512", expect.objectContaining({
+      headers: expect.objectContaining({
+        "x-mylonite-device-id": "d" + "1".repeat(32),
+      }),
+    }));
+  });
+
+  it("signs pairing relay grants against the vault-scoped path", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
+    const client = new MyloniteApiClient("http://localhost", { deviceId: "d" + "1".repeat(32), privateKeyHex: "00".repeat(32) });
+
+    await client.putPairingSessionGrant("vault-a", `ps${"a".repeat(32)}`, "b".repeat(64), {
+      x25519_public_key: "c".repeat(64),
+      nonce_hex: "d".repeat(48),
+      ciphertext_hex: "ee",
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith("http://localhost/api/v1/vaults/vault-a/pairing-sessions/psaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/grant", expect.objectContaining({
+      method: "POST",
+      headers: expect.objectContaining({
+        "x-mylonite-device-id": "d" + "1".repeat(32),
+      }),
+    }));
+  });
+
+  it("opens pairing sessions against the vault-scoped signed path", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      session_id: `ps${"a".repeat(32)}`,
+      expires_at_unix: 123,
+    }), { status: 200 }));
+    const client = new MyloniteApiClient("http://localhost", { deviceId: "d" + "1".repeat(32), privateKeyHex: "00".repeat(32) });
+
+    await client.openPairingSession("vault-a", `ps${"a".repeat(32)}`, "b".repeat(64));
+
+    expect(fetchMock).toHaveBeenCalledWith("http://localhost/api/v1/vaults/vault-a/pairing-sessions", expect.objectContaining({
+      method: "POST",
       headers: expect.objectContaining({
         "x-mylonite-device-id": "d" + "1".repeat(32),
       }),
