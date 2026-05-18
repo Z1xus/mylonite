@@ -1,7 +1,10 @@
 const QR_CONFIGS = [
+  { version: 2, dataCodewords: 28, blockCount: 1, ecCodewordsPerBlock: 16, alignment: [6, 18], errorCorrectionLevel: 0b00 },
+  { version: 3, dataCodewords: 44, blockCount: 1, ecCodewordsPerBlock: 26, alignment: [6, 22], errorCorrectionLevel: 0b00 },
   { version: 4, dataCodewords: 64, blockCount: 2, ecCodewordsPerBlock: 18, alignment: [6, 26], errorCorrectionLevel: 0b00 },
   { version: 8, dataCodewords: 194, blockCount: 2, ecCodewordsPerBlock: 24, alignment: [6, 24, 42], errorCorrectionLevel: 0b01 },
 ];
+const ALPHANUMERIC_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
 
 type QrConfig = typeof QR_CONFIGS[number];
 
@@ -48,6 +51,10 @@ function encodeQr(text: string): boolean[][] {
 }
 
 function makeDataCodewords(text: string): number[] {
+  if (isAlphanumericText(text)) {
+    const config = selectConfigForBits(alphanumericBitLength(text));
+    return makeDataCodewordsForBits(alphanumericBits(text), config);
+  }
   const bytes = new TextEncoder().encode(text);
   const config = selectConfig(text);
   return makeDataCodewordsForBytes(bytes, config);
@@ -62,6 +69,14 @@ function selectConfig(text: string): QrConfig {
   return config;
 }
 
+function selectConfigForBits(bitLength: number): QrConfig {
+  const config = QR_CONFIGS.find((candidate) => bitLength <= candidate.dataCodewords * 8);
+  if (!config) {
+    throw new Error("invite is too long for QR code");
+  }
+  return config;
+}
+
 function makeDataCodewordsForBytes(bytes: Uint8Array, config: QrConfig): number[] {
   const bits: number[] = [];
   appendBits(bits, 0b0100, 4);
@@ -69,6 +84,10 @@ function makeDataCodewordsForBytes(bytes: Uint8Array, config: QrConfig): number[
   for (const byte of bytes) {
     appendBits(bits, byte, 8);
   }
+  return makeDataCodewordsForBits(bits, config);
+}
+
+function makeDataCodewordsForBits(bits: number[], config: QrConfig): number[] {
   appendBits(bits, 0, Math.min(4, config.dataCodewords * 8 - bits.length));
   while (bits.length % 8 !== 0) {
     bits.push(0);
@@ -85,6 +104,30 @@ function makeDataCodewordsForBytes(bytes: Uint8Array, config: QrConfig): number[
     data.push(pad);
   }
   return data;
+}
+
+function alphanumericBits(text: string): number[] {
+  const bits: number[] = [];
+  appendBits(bits, 0b0010, 4);
+  appendBits(bits, text.length, 9);
+  for (let index = 0; index < text.length; index += 2) {
+    const first = ALPHANUMERIC_CHARS.indexOf(text[index]);
+    const second = index + 1 < text.length ? ALPHANUMERIC_CHARS.indexOf(text[index + 1]) : -1;
+    if (second >= 0) {
+      appendBits(bits, first * 45 + second, 11);
+    } else {
+      appendBits(bits, first, 6);
+    }
+  }
+  return bits;
+}
+
+function alphanumericBitLength(text: string): number {
+  return 4 + 9 + Math.floor(text.length / 2) * 11 + (text.length % 2 === 0 ? 0 : 6);
+}
+
+function isAlphanumericText(text: string): boolean {
+  return Array.from(text).every((char) => ALPHANUMERIC_CHARS.includes(char));
 }
 
 function addErrorCorrection(data: number[], config: QrConfig): number[] {

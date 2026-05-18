@@ -9,6 +9,9 @@ on:
 permissions:
   contents: write
   packages: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -54,6 +57,13 @@ jobs:
           cp plugin/main.js plugin/manifest.json plugin/styles.css dist/plugin/
           cp plugin/main.js plugin/manifest.json plugin/styles.css dist/
           (cd dist/plugin && zip -r ../mylonite-obsidian-plugin.zip main.js manifest.json styles.css)
+
+      - name: Attest plugin assets
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/main.js
+            dist/styles.css
 
       - uses: actions/upload-artifact@v4
         with:

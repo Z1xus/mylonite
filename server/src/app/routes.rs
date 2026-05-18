@@ -40,16 +40,31 @@ pub(super) struct PairInvitePageQuery {
 pub(super) async fn pair_invite_page(
     Query(query): Query<PairInvitePageQuery>,
 ) -> Result<Html<String>, ApiError> {
-    let invite = query.invite.unwrap_or_default();
+    render_pair_invite_page(query.invite, query.c.or(query.code))
+}
+
+pub(super) async fn pair_invite_page_with_code(
+    Path(code): Path<String>,
+    Query(query): Query<PairInvitePageQuery>,
+) -> Result<Html<String>, ApiError> {
+    render_pair_invite_page(query.invite, Some(code))
+}
+
+fn render_pair_invite_page(
+    invite: Option<String>,
+    code: Option<String>,
+) -> Result<Html<String>, ApiError> {
+    let invite = invite.unwrap_or_default();
     if !invite.is_empty() {
         validate_pairing_invite_text(&invite)?;
     }
-    let code = query.c.or(query.code).unwrap_or_default();
+    let code = code.unwrap_or_default();
     let code = normalize_invite_code(&code);
     if !code.is_empty() {
         validation::validate_invite_code(&code)?;
     }
     let encoded_invite = percent_encode(&invite);
+    let escaped_invite = html_escape(&invite);
     let escaped_code = html_escape(&code);
     Ok(Html(format!(
         r#"<!doctype html>
@@ -83,13 +98,15 @@ button.secondary {{ background: #e7e9ed; color: #1f2328; }}
 <p>Open this invite in Obsidian on the device you want to add. If Obsidian does not open, copy the invite code and paste it in Mylonite settings.</p>
 <div class="actions">
 <a id="open" href="obsidian://mylonite-pair?invite={encoded_invite}">Open in Obsidian</a>
-<button class="secondary" type="button" onclick="navigator.clipboard.writeText(document.getElementById('code').value)">Copy invite code</button>
+<button class="secondary" type="button" onclick="navigator.clipboard.writeText(document.getElementById('invite').value)">Copy invite code</button>
 </div>
-<textarea id="code" readonly>{escaped_code}</textarea>
+<textarea id="invite" data-code="{escaped_code}" readonly>{escaped_invite}</textarea>
 <script>
-const code = document.getElementById("code").value;
+const textarea = document.getElementById("invite");
+const code = textarea.dataset.code;
 if (code) {{
   const invite = "MYLONITE:" + btoa(JSON.stringify({{ version: 1, server_url: location.origin, invite_code: code }})).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  textarea.value = invite;
   document.getElementById("open").href = "obsidian://mylonite-pair?invite=" + encodeURIComponent(invite);
 }}
 </script>

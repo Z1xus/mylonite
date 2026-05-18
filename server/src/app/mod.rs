@@ -149,6 +149,8 @@ fn build_router(
         .route("/health", get(routes::health))
         .route("/pair", get(routes::pair_invite_page))
         .route("/p", get(routes::pair_invite_page))
+        .route("/p/{code}", get(routes::pair_invite_page_with_code))
+        .route("/P/{code}", get(routes::pair_invite_page_with_code))
         .route(
             "/api/v1/admin/vaults",
             get(routes::admin_list_vaults)

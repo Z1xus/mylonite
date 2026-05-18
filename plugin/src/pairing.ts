@@ -71,7 +71,7 @@ export function devicePairingInviteText(invite: DevicePairingInvitePayload): str
 
 export function devicePairingInviteUrl(invite: DevicePairingInvitePayload): string {
   validateDevicePairingInvite(invite);
-  return `${invite.server_url}/p?c=${encodeURIComponent(invite.invite_code.replace(/-/g, ""))}`;
+  return `${invite.server_url.toUpperCase()}/P/${encodeURIComponent(invite.invite_code.replace(/-/g, ""))}`;
 }
 
 export function parseDevicePairingInviteInput(value: string): DevicePairingInvitePayload {
@@ -227,7 +227,8 @@ function inviteFromUrl(value: string): string | null {
     if (invite) {
       return invite;
     }
-    const code = url.searchParams.get("c") ?? url.searchParams.get("code");
+    const pathCode = url.pathname.match(/^\/[pP]\/([A-Za-z2-9-]+)$/)?.[1] ?? null;
+    const code = pathCode ?? url.searchParams.get("c") ?? url.searchParams.get("code");
     if (code) {
       return JSON.stringify({
         version: 1,
