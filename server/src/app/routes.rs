@@ -3,7 +3,7 @@ use axum::{
     body::Bytes,
     extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -28,6 +28,69 @@ pub(super) async fn health(State(app_state): State<AppState>) -> impl IntoRespon
         Ok(storage_stats) => format!("ok vaults={}\n", storage_stats.vault_count),
         Err(error) => format!("degraded error={error}\n"),
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct PairInvitePageQuery {
+    invite: Option<String>,
+    code: Option<String>,
+}
+
+pub(super) async fn pair_invite_page(
+    Query(query): Query<PairInvitePageQuery>,
+) -> Result<Html<String>, ApiError> {
+    let invite = query.invite.unwrap_or_default();
+    if !invite.is_empty() {
+        validate_pairing_invite_text(&invite)?;
+    }
+    let code = query.code.unwrap_or_default();
+    if !code.is_empty() {
+        validation::validate_invite_code(&code)?;
+    }
+    let escaped_invite = html_escape(&invite);
+    let encoded_invite = percent_encode(&invite);
+    let escaped_code = html_escape(&code);
+    Ok(Html(format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mylonite device invite</title>
+<style>
+body {{ color: #1f2328; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; }}
+main {{ margin: 0 auto; max-width: 680px; padding: 32px 20px; }}
+h1 {{ font-size: 1.5rem; margin: 0 0 12px; }}
+p {{ color: #4f5866; line-height: 1.5; }}
+textarea {{ box-sizing: border-box; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; min-height: 120px; width: 100%; }}
+.actions {{ display: flex; flex-wrap: wrap; gap: 10px; margin: 20px 0; }}
+a, button {{ background: #1f2328; border: 0; border-radius: 6px; color: #fff; cursor: pointer; font: inherit; padding: 10px 14px; text-decoration: none; }}
+button.secondary {{ background: #e7e9ed; color: #1f2328; }}
+</style>
+</head>
+<body>
+<main>
+<h1>Mylonite device invite</h1>
+<p>Open this invite in Obsidian on the device you want to add. If that handoff is unavailable, copy the invite text or code and paste it in Mylonite settings.</p>
+<div class="actions">
+<a id="open" href="obsidian://mylonite-pair?invite={encoded_invite}">Open in Obsidian</a>
+<button class="secondary" type="button" onclick="navigator.clipboard.writeText(document.querySelector('textarea').value)">Copy invite</button>
+</div>
+<textarea readonly>{escaped_invite}</textarea>
+<p><strong>Invite code:</strong> <code id="code">{escaped_code}</code></p>
+<script>
+const code = document.getElementById("code").textContent;
+const textarea = document.querySelector("textarea");
+if (!textarea.value && code) {{
+  const invite = "MYLONITE:" + btoa(JSON.stringify({{ version: 1, server_url: location.origin, invite_code: code }})).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  textarea.value = invite;
+  document.getElementById("open").href = "obsidian://mylonite-pair?invite=" + encodeURIComponent(invite);
+}}
+</script>
+</main>
+</body>
+</html>"#
+    )))
 }
 
 #[derive(Debug, Deserialize)]
@@ -788,11 +851,41 @@ fn now_unix() -> anyhow::Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
 }
 
+fn validate_pairing_invite_text(invite: &str) -> Result<(), ApiError> {
+    if invite.len() > 2048 || !(invite.starts_with("MYLONITE:") || invite.starts_with('{')) {
+        return Err(ApiError(anyhow::anyhow!("invalid pairing invite")));
+    }
+    Ok(())
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn percent_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push('%');
+            out.push(char::from(b"0123456789ABCDEF"[usize::from(byte >> 4)]));
+            out.push(char::from(b"0123456789ABCDEF"[usize::from(byte & 0x0f)]));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        PairingSessionGrantPayload, PairingSessionRequestPayload, invite_code_hash,
-        require_loopback_admin, validate_body_device_matches_signer,
+        PairingSessionGrantPayload, PairingSessionRequestPayload, invite_code_hash, percent_encode,
+        require_loopback_admin, validate_body_device_matches_signer, validate_pairing_invite_text,
         validate_pairing_session_grant, validate_pairing_session_request,
     };
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -877,5 +970,13 @@ mod tests {
             invite_code_hash("psaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ABCD-2345-WXYZ"),
             invite_code_hash("psaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ABCD-2345-WXY2")
         );
+    }
+
+    #[test]
+    fn pairing_invite_page_helpers_reject_bad_invites_and_encode_urls() {
+        assert!(validate_pairing_invite_text("MYLONITE:abc").is_ok());
+        assert!(validate_pairing_invite_text("{\"version\":1}").is_ok());
+        assert!(validate_pairing_invite_text("https://example.com").is_err());
+        assert_eq!(percent_encode("MYLONITE:a+b"), "MYLONITE%3Aa%2Bb");
     }
 }

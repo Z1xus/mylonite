@@ -258,6 +258,7 @@ mod tests {
             std::process::id(),
             TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
     }

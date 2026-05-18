@@ -4,6 +4,7 @@ import {
   createDevicePairingInvitePayload,
   createDevicePairingRequestPayload,
   devicePairingInviteText,
+  devicePairingInviteUrl,
   inviteCodeHash,
   pairingSafetyCode,
   parseDevicePairingInviteInput,
@@ -22,6 +23,17 @@ describe("device pairing join payloads", () => {
       server_url: "http://localhost:9821",
     });
     expect(parsed.invite_code).toMatch(/^[A-Z2-9]{4}-[A-Z2-9]{4}-[A-Z2-9]{4}$/);
+  });
+
+  it("round trips through a camera-friendly HTTPS invite URL", () => {
+    const invite = {
+      version: 1,
+      server_url: "https://sync.example.com",
+      invite_code: "ABCD-2345-WXYZ",
+    };
+
+    expect(devicePairingInviteUrl(invite)).toBe("https://sync.example.com/pair?code=ABCD-2345-WXYZ");
+    expect(parseDevicePairingInviteInput(devicePairingInviteUrl(invite))).toEqual(invite);
   });
 
   it("hashes invite codes against the server session id", () => {

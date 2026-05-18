@@ -69,8 +69,17 @@ export function devicePairingInviteText(invite: DevicePairingInvitePayload): str
   return `MYLONITE:${base64UrlEncode(textEncoder.encode(JSON.stringify(invite)))}`;
 }
 
+export function devicePairingInviteUrl(invite: DevicePairingInvitePayload): string {
+  validateDevicePairingInvite(invite);
+  return `${invite.server_url}/pair?code=${encodeURIComponent(invite.invite_code)}`;
+}
+
 export function parseDevicePairingInviteInput(value: string): DevicePairingInvitePayload {
   const trimmed = value.trim();
+  const urlInvite = inviteFromUrl(trimmed);
+  if (urlInvite) {
+    return parseDevicePairingInviteInput(urlInvite);
+  }
   const raw = trimmed.startsWith("MYLONITE:") ? trimmed.slice("MYLONITE:".length) : trimmed;
   let decoded = raw;
   if (!raw.startsWith("{")) {
@@ -209,6 +218,27 @@ function base64UrlDecode(value: string): Uint8Array {
     out[index] = binary.charCodeAt(index);
   }
   return out;
+}
+
+function inviteFromUrl(value: string): string | null {
+  try {
+    const url = new URL(value);
+    const invite = url.searchParams.get("invite");
+    if (invite) {
+      return invite;
+    }
+    const code = url.searchParams.get("code");
+    if (code) {
+      return JSON.stringify({
+        version: 1,
+        server_url: url.origin,
+        invite_code: normalizeInviteCode(code),
+      });
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 function validServerUrl(value: string): boolean {

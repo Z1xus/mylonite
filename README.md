@@ -116,7 +116,9 @@ The first device must be paired with the pairing token. Every other device joins
 ### Additional devices
 
 1. On an already-paired device, open Mylonite settings -> Add another device -> Create. Mylonite shows a QR code, an invite code, and the server URL.
-2. On the new device, open Mylonite settings -> Join an existing vault. Scan the QR code or paste the invite text to fill the server URL automatically. If QR scanning is unavailable, enter the invite code and server URL manually.
+2. On the new device:
+* If the camera is available, scan the QR code. It will open an invite page on your Mylonite server.
+* Otherwise, type the server URL and invite code manually or paste the invite code.
 3. Compare the six-digit safety code on both devices, then click Approve on the already-paired device.
 
 If you ever lose access to every paired device, the vault data is unrecoverable — the encryption key was generated on the first device and the server only holds ciphertext. Wipe the dead vault and start fresh:

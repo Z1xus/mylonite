@@ -68,15 +68,6 @@
   overflow-wrap: anywhere;
 }
 
-.mylonite-qr-video {
-  background: #000;
-  border-radius: 8px;
-  display: block;
-  margin: 12px 0;
-  max-height: 70vh;
-  width: 100%;
-}
-
 input.mylonite-safety-code {
   font-family: var(--font-monospace);
   font-size: var(--font-ui-large);

@@ -48,6 +48,7 @@ export default class MylonitePlugin extends Plugin {
   private vaultKeys: Promise<VaultKeys> | null = null;
   private syncEngine = new SyncEngine(this);
   private pairingPollTimer: number | null = null;
+  private settingTab: MyloniteSettingTab | null = null;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -73,7 +74,13 @@ export default class MylonitePlugin extends Plugin {
       callback: () => void this.syncEngine.restoreLatestSnapshot().catch((error) => new Notice(`Restore failed. Check the server connection and try again. ${String(error)}`)),
     });
 
-    this.addSettingTab(new MyloniteSettingTab(this.app, this));
+    this.registerObsidianProtocolHandler("mylonite-pair", (params) => {
+      const invite = typeof params.invite === "string" ? params.invite : "";
+      void this.submitDevicePairingInvite(invite).then(() => this.refreshSettingsTab());
+    });
+
+    this.settingTab = new MyloniteSettingTab(this.app, this);
+    this.addSettingTab(this.settingTab);
     this.status = this.addStatusBarItem();
     this.updateStatus("idle");
     this.startPairingPolling();
@@ -251,6 +258,7 @@ export default class MylonitePlugin extends Plugin {
         await this.pollPairingState(true);
         return;
       }
+      await this.syncEngine.createSnapshot({ silent: true });
       const registered = await client.registerDevice(
         this.settings.vaultId,
         request.label || "Obsidian device",
@@ -279,6 +287,7 @@ export default class MylonitePlugin extends Plugin {
       this.settings.devicePairingResponse = "";
       await this.saveSettings();
       this.stopPairingPolling();
+      this.refreshSettingsTab();
       new Notice("Device approved. The new device will finish automatically.");
     } catch (error) {
       new Notice(`Authorization failed. Check the request and try again. ${String(error)}`);
@@ -324,7 +333,14 @@ export default class MylonitePlugin extends Plugin {
       await this.saveSettings();
       this.stopPairingPolling();
       this.updateStatus("paired");
+      try {
+        await this.syncEngine.restoreLatestSnapshot({ deleteMissing: false, silent: true, requireSnapshot: false });
+      } catch (error) {
+        this.debug(`automatic snapshot restore failed: ${String(error)}`);
+        new Notice("Device paired. Snapshot restore failed, so normal sync will catch up instead.");
+      }
       this.syncEngine.start();
+      this.refreshSettingsTab();
       new Notice("Device paired.");
     } catch (error) {
       new Notice(`Pairing failed. Check the approval and try again. ${String(error)}`);
@@ -381,6 +397,7 @@ export default class MylonitePlugin extends Plugin {
         this.settings.devicePairingRequest = "";
         await this.saveSettings();
         this.stopPairingPolling();
+        this.refreshSettingsTab();
         if (showNotice) {
           new Notice("Invite expired. Create a new one.");
         }
@@ -398,6 +415,7 @@ export default class MylonitePlugin extends Plugin {
         this.settings.devicePairingRequest = "";
         await this.saveSettings();
         this.stopPairingPolling();
+        this.refreshSettingsTab();
         return;
       }
       const invite = this.currentPairingInvite();
@@ -407,6 +425,7 @@ export default class MylonitePlugin extends Plugin {
         this.settings.devicePairingRequest = "";
         await this.saveSettings();
         this.stopPairingPolling();
+        this.refreshSettingsTab();
         if (showNotice) {
           new Notice("Invite state is invalid. Create a new invite.");
         }
@@ -417,6 +436,7 @@ export default class MylonitePlugin extends Plugin {
       if (this.settings.devicePairingRequest !== JSON.stringify(request)) {
         this.settings.devicePairingRequest = JSON.stringify(request);
         await this.saveSettings();
+        this.refreshSettingsTab();
         new Notice(`New device request received. Safety code ${pairingSafetyCode(request.request_hash)}.`);
       }
     } catch (error) {
@@ -547,6 +567,10 @@ export default class MylonitePlugin extends Plugin {
     await this.saveSettings();
     this.updateStatus("unpaired");
     new Notice("Device unpaired.");
+  }
+
+  refreshSettingsTab(): void {
+    this.settingTab?.display();
   }
 
   updateStatus(state: string): void {

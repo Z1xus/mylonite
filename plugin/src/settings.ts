@@ -1,9 +1,10 @@
-import { App, Modal, Plugin, PluginSettingTab, Setting } from "obsidian";
+import { App, Plugin, PluginSettingTab, Setting } from "obsidian";
 
 import {
   DevicePairingInvitePayload,
   DevicePairingRequestPayload,
   devicePairingInviteText,
+  devicePairingInviteUrl,
   pairingSafetyCode,
   parseDevicePairingInviteInput,
   validatePairingRequestShape,
@@ -72,17 +73,10 @@ type MyloniteSettingsPlugin = Plugin & {
   createDevicePairingInvite(): Promise<void>;
   submitDevicePairingInvite(inviteInput: string): Promise<void>;
   authorizeDevicePairingRequest(): Promise<void>;
-  checkDevicePairingStatus(): Promise<void>;
   createSnapshot(): Promise<void>;
   restoreLatestSnapshot(): Promise<void>;
   unpairDevice(): Promise<void>;
 };
-
-type BarcodeDetectorLike = {
-  detect(source: CanvasImageSource): Promise<Array<{ rawValue: string }>>;
-};
-
-type BarcodeDetectorCtor = new (options?: { formats?: string[] }) => BarcodeDetectorLike;
 
 export class MyloniteSettingTab extends PluginSettingTab {
   constructor(app: App, private readonly plugin: MyloniteSettingsPlugin) {
@@ -182,12 +176,6 @@ export class MyloniteSettingTab extends PluginSettingTab {
         .onClick(async () => {
           await this.plugin.createDevicePairingInvite();
           this.display();
-        }))
-      .addButton((button) => button
-        .setButtonText("Check")
-        .onClick(async () => {
-          await this.plugin.checkDevicePairingStatus();
-          this.display();
         }));
 
     if (invite) {
@@ -263,24 +251,10 @@ export class MyloniteSettingTab extends PluginSettingTab {
         await this.plugin.submitDevicePairingInvite(this.plugin.settings.devicePairingInvite);
         this.display();
       },
-      secondaryButtonText: "Scan QR",
-      onSecondaryButtonClick: async () => {
-        await this.scanDevicePairingInvite();
-        this.display();
-      },
     });
 
     if (request) {
       this.addSafetyCode(containerEl, request.request_hash);
-      new Setting(containerEl)
-        .setName("Approval")
-        .setDesc("Checks whether the paired device has approved this request.")
-        .addButton((button) => button
-          .setButtonText("Check now")
-          .onClick(async () => {
-            await this.plugin.checkDevicePairingStatus();
-            this.display();
-          }));
     }
   }
 
@@ -310,10 +284,11 @@ export class MyloniteSettingTab extends PluginSettingTab {
 
   private addInviteDisplay(containerEl: HTMLElement, invite: DevicePairingInvitePayload): void {
     const inviteText = devicePairingInviteText(invite);
+    const inviteUrl = devicePairingInviteUrl(invite);
     const wrap = containerEl.createDiv({ cls: "mylonite-invite-panel" });
     wrap.createEl("img", {
       attr: {
-        src: qrSvgDataUrl(inviteText),
+        src: qrSvgDataUrl(inviteUrl),
         alt: "Mylonite device invite QR code",
       },
       cls: "mylonite-invite-qr",
@@ -322,8 +297,16 @@ export class MyloniteSettingTab extends PluginSettingTab {
     details.createEl("div", { text: invite.invite_code, cls: "mylonite-invite-code" });
     details.createEl("div", { text: invite.server_url, cls: "setting-item-description mylonite-invite-server" });
     new Setting(details)
+      .setName("Invite link")
+      .setDesc("Use this when the QR code is unavailable.")
+      .addButton((button) => button
+        .setButtonText("Copy")
+        .onClick(async () => {
+          await navigator.clipboard.writeText(inviteUrl);
+        }));
+    new Setting(details)
       .setName("Invite text")
-      .setDesc("Use this when QR scanning is unavailable.")
+      .setDesc("Fallback for devices that cannot open the link.")
       .addButton((button) => button
         .setButtonText("Copy")
         .onClick(async () => {
@@ -344,18 +327,6 @@ export class MyloniteSettingTab extends PluginSettingTab {
       });
   }
 
-  private async scanDevicePairingInvite(): Promise<void> {
-    const scanned = await new Promise<string | null>((resolve) => {
-      new InviteQrScanModal(this.app, resolve).open();
-    });
-    if (!scanned) {
-      return;
-    }
-    this.plugin.settings.devicePairingInvite = scanned;
-    await this.plugin.saveSettings();
-    await this.plugin.submitDevicePairingInvite(scanned);
-  }
-
   private addCodeInput(
     containerEl: HTMLElement,
     options: {
@@ -368,8 +339,6 @@ export class MyloniteSettingTab extends PluginSettingTab {
       rows?: number;
       onChange(value: string): Promise<void>;
       onButtonClick(): Promise<void>;
-      secondaryButtonText?: string;
-      onSecondaryButtonClick?(): Promise<void>;
     },
   ): void {
     const setting = new Setting(containerEl)
@@ -393,126 +362,9 @@ export class MyloniteSettingTab extends PluginSettingTab {
         }
         return button;
       });
-    const secondaryButtonText = options.secondaryButtonText;
-    const onSecondaryButtonClick = options.onSecondaryButtonClick;
-    if (secondaryButtonText && onSecondaryButtonClick) {
-      setting.addButton((button) => button
-        .setButtonText(secondaryButtonText)
-        .onClick(() => onSecondaryButtonClick()));
-    }
     if (options.desc) {
       setting.setDesc(options.desc);
     }
     setting.settingEl.addClass("mylonite-code-setting");
-  }
-}
-
-class InviteQrScanModal extends Modal {
-  private done = false;
-  private frameId: number | null = null;
-  private stream: MediaStream | null = null;
-
-  constructor(app: App, private readonly resolve: (value: string | null) => void) {
-    super(app);
-  }
-
-  onOpen(): void {
-    const { contentEl } = this;
-    contentEl.empty();
-    contentEl.createEl("h2", { text: "Scan invite QR" });
-    const status = contentEl.createEl("p", {
-      text: "Point the camera at the Mylonite invite QR code.",
-      cls: "setting-item-description",
-    });
-    const video = contentEl.createEl("video", {
-      attr: {
-        autoplay: "true",
-        muted: "true",
-        playsinline: "true",
-      },
-      cls: "mylonite-qr-video",
-    });
-    video.muted = true;
-    new Setting(contentEl)
-      .addButton((button) => button
-        .setButtonText("Cancel")
-        .onClick(() => this.close()));
-    void this.start(video, status);
-  }
-
-  onClose(): void {
-    this.stop();
-    this.contentEl.empty();
-    if (!this.done) {
-      this.done = true;
-      this.resolve(null);
-    }
-  }
-
-  private async start(video: HTMLVideoElement, status: HTMLElement): Promise<void> {
-    const BarcodeDetector = (window as typeof window & { BarcodeDetector?: BarcodeDetectorCtor }).BarcodeDetector;
-    if (!BarcodeDetector || !navigator.mediaDevices?.getUserMedia) {
-      status.setText("QR scanning is not available here. Paste invite text or enter the code instead.");
-      return;
-    }
-
-    try {
-      this.stream = await navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: { facingMode: { ideal: "environment" } },
-      });
-      video.srcObject = this.stream;
-      await video.play();
-      this.scheduleScan(new BarcodeDetector({ formats: ["qr_code"] }), video, status);
-    } catch (error) {
-      status.setText(`Camera unavailable. Paste invite text or enter the code instead. ${String(error)}`);
-    }
-  }
-
-  private scheduleScan(detector: BarcodeDetectorLike, video: HTMLVideoElement, status: HTMLElement): void {
-    if (this.done) {
-      return;
-    }
-    this.frameId = window.requestAnimationFrame(() => {
-      void this.scanOnce(detector, video, status);
-    });
-  }
-
-  private async scanOnce(detector: BarcodeDetectorLike, video: HTMLVideoElement, status: HTMLElement): Promise<void> {
-    try {
-      if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-        const results = await detector.detect(video);
-        const rawValue = results.find((result) => result.rawValue.trim().length > 0)?.rawValue;
-        if (rawValue) {
-          this.finish(rawValue);
-          return;
-        }
-      }
-    } catch (error) {
-      status.setText(`Could not read QR code. ${String(error)}`);
-    }
-    this.scheduleScan(detector, video, status);
-  }
-
-  private finish(value: string): void {
-    if (this.done) {
-      return;
-    }
-    this.done = true;
-    this.resolve(value);
-    this.close();
-  }
-
-  private stop(): void {
-    if (this.frameId !== null) {
-      window.cancelAnimationFrame(this.frameId);
-      this.frameId = null;
-    }
-    if (this.stream) {
-      for (const track of this.stream.getTracks()) {
-        track.stop();
-      }
-      this.stream = null;
-    }
   }
 }

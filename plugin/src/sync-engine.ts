@@ -174,9 +174,11 @@ export class SyncEngine {
     }
   }
 
-  async createSnapshot(): Promise<void> {
+  async createSnapshot(options: { silent?: boolean } = {}): Promise<void> {
     if (!this.host.settings.vaultId || !this.host.settings.deviceId) {
-      new Notice("Device is not paired. Pair it before creating a snapshot.");
+      if (!options.silent) {
+        new Notice("Device is not paired. Pair it before creating a snapshot.");
+      }
       return;
     }
     const keys = await this.host.loadVaultKeys();
@@ -197,29 +199,37 @@ export class SyncEngine {
       ciphertext_hex: encrypted.ciphertextHex,
     });
     this.host.updateStatus("snapshot uploaded");
-    new Notice("Snapshot uploaded.");
+    if (!options.silent) {
+      new Notice("Snapshot uploaded.");
+    }
   }
 
-  async restoreLatestSnapshot(): Promise<void> {
+  async restoreLatestSnapshot(options: { deleteMissing?: boolean; silent?: boolean; requireSnapshot?: boolean } = {}): Promise<void> {
     if (!this.host.settings.vaultId || !this.host.settings.deviceId) {
-      new Notice("Device is not paired. Pair it before restoring a snapshot.");
+      if (!options.silent) {
+        new Notice("Device is not paired. Pair it before restoring a snapshot.");
+      }
       return;
     }
     const snapshots = await this.host.createApiClient().listSnapshots(this.host.settings.vaultId);
     const latest = snapshots.at(-1);
     if (!latest) {
-      new Notice("No snapshots found. Create a snapshot on another device first.");
+      if (options.requireSnapshot ?? !options.silent) {
+        new Notice("No snapshots found. Create a snapshot on another device first.");
+      }
       return;
     }
     validateSnapshotRecord(latest, this.host.settings.vaultId);
-    const deleteMissing = window.confirm(
+    const deleteMissing = options.deleteMissing ?? window.confirm(
       "Delete files missing from the snapshot? This removes local files that are not in the latest snapshot.",
     );
     await this.restoreSnapshot(latest, deleteMissing);
     this.host.settings.lastServerSeq = Math.max(this.host.settings.lastServerSeq, latest.covers_through_seq);
     await this.host.saveSettings();
     this.host.updateStatus("snapshot restored");
-    new Notice("Snapshot restored.");
+    if (!options.silent) {
+      new Notice("Snapshot restored.");
+    }
   }
 
   private registerVaultEvents(): void {
