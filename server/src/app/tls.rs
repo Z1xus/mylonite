@@ -16,12 +16,30 @@ pub enum ServerTls {
 pub async fn load_server_config(config: &TlsConfig, data_dir: &Path) -> anyhow::Result<ServerTls> {
     match config.mode.as_str() {
         "off" => Ok(ServerTls::Off),
-        "manual" => load_manual(config).await.map(ServerTls::Enabled),
-        "self-signed" => load_self_signed(config, data_dir)
-            .await
-            .map(ServerTls::Enabled),
+        "manual" => {
+            install_rustls_provider();
+            load_manual(config).await.map(ServerTls::Enabled)
+        }
+        "self-signed" => {
+            install_rustls_provider();
+            load_self_signed(config, data_dir)
+                .await
+                .map(ServerTls::Enabled)
+        }
         mode => bail!("unsupported tls.mode {mode:?}; expected off, manual, or self-signed"),
     }
+}
+
+fn install_rustls_provider() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        assert!(
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .is_ok(),
+            "install rustls ring crypto provider"
+        );
+    });
 }
 
 async fn load_manual(config: &TlsConfig) -> anyhow::Result<RustlsConfig> {
