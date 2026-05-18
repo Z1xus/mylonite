@@ -606,7 +606,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libredox"
-version = "0.1.16"
+version = "0.1.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e02f3bb43d335493c96bf3fd3a321600bf6bd07ed34bc64118e9293bdffea46c"
 dependencies = [
@@ -659,7 +659,7 @@ dependencies = [
 
 [[package]]
 name = "mylonite"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "anyhow",
  "axum",
@@ -685,7 +685,7 @@ dependencies = [
 
 [[package]]
 name = "mylonite-protocol"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "thiserror",
 ]
