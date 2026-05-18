@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   createDevicePairingInvitePayload,
   createDevicePairingRequestPayload,
+  devicePairingInviteQrUrl,
   devicePairingInviteText,
   devicePairingInviteUrl,
   inviteCodeHash,
@@ -32,8 +33,10 @@ describe("device pairing join payloads", () => {
       invite_code: "ABCD-2345-WXYZ",
     };
 
-    expect(devicePairingInviteUrl(invite)).toBe("HTTPS://SYNC.EXAMPLE.COM/P/ABCD2345WXYZ");
+    expect(devicePairingInviteUrl(invite)).toBe("https://sync.example.com/p/ABCD2345WXYZ");
+    expect(devicePairingInviteQrUrl(invite)).toBe("HTTPS://SYNC.EXAMPLE.COM/P/ABCD2345WXYZ");
     expect(parseDevicePairingInviteInput(devicePairingInviteUrl(invite))).toEqual(invite);
+    expect(parseDevicePairingInviteInput(devicePairingInviteQrUrl(invite))).toEqual(invite);
   });
 
   it("hashes invite codes against the server session id", () => {

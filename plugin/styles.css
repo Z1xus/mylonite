@@ -35,7 +35,7 @@
 }
 
 .mylonite-invite-panel {
-  align-items: center;
+  align-items: flex-start;
   border: 1px solid var(--background-modifier-border);
   border-radius: 8px;
   display: flex;
@@ -53,6 +53,7 @@
 
 .mylonite-invite-details {
   flex: 1;
+  padding-top: 10px;
   min-width: 0;
 }
 

@@ -3,6 +3,8 @@ import { App, Plugin, PluginSettingTab, Setting } from "obsidian";
 import {
   DevicePairingInvitePayload,
   DevicePairingRequestPayload,
+  devicePairingInviteQrUrl,
+  devicePairingInviteText,
   devicePairingInviteUrl,
   pairingSafetyCode,
   parseDevicePairingInviteInput,
@@ -282,11 +284,13 @@ export class MyloniteSettingTab extends PluginSettingTab {
   }
 
   private addInviteDisplay(containerEl: HTMLElement, invite: DevicePairingInvitePayload): void {
+    const inviteText = devicePairingInviteText(invite);
+    const inviteQrUrl = devicePairingInviteQrUrl(invite);
     const inviteUrl = devicePairingInviteUrl(invite);
     const wrap = containerEl.createDiv({ cls: "mylonite-invite-panel" });
     wrap.createEl("img", {
       attr: {
-        src: qrSvgDataUrl(inviteUrl),
+        src: qrSvgDataUrl(inviteQrUrl),
         alt: "Mylonite device invite QR code",
       },
       cls: "mylonite-invite-qr",
@@ -308,7 +312,7 @@ export class MyloniteSettingTab extends PluginSettingTab {
       .addButton((button) => button
         .setButtonText("Copy")
         .onClick(async () => {
-          await navigator.clipboard.writeText(invite.invite_code);
+          await navigator.clipboard.writeText(inviteText);
         }));
   }
 

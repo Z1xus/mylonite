@@ -71,6 +71,11 @@ export function devicePairingInviteText(invite: DevicePairingInvitePayload): str
 
 export function devicePairingInviteUrl(invite: DevicePairingInvitePayload): string {
   validateDevicePairingInvite(invite);
+  return `${invite.server_url}/p/${encodeURIComponent(invite.invite_code.replace(/-/g, ""))}`;
+}
+
+export function devicePairingInviteQrUrl(invite: DevicePairingInvitePayload): string {
+  validateDevicePairingInvite(invite);
   return `${invite.server_url.toUpperCase()}/P/${encodeURIComponent(invite.invite_code.replace(/-/g, ""))}`;
 }
 
