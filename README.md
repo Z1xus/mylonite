@@ -9,7 +9,7 @@
 Mylonite is a self-hosted sync server for Obsidian. Use it with the Mylonite plugin to pair devices and sync end-to-end encrypted vault data through your own storage.
 
 <p align="center">
-<img width="960" height="540" alt="Image" src="https://github.com/user-attachments/assets/83c73568-f482-4cb8-8103-48ea9a87cf7d" />
+<img width="960" height="540" alt="Image" src=".github/assets/593691024-83c73568-f482-4cb8-8103-48ea9a87cf7d.gif" />
 <sub> Synchronization showcase using a remote server hundreds of kilometers away. Vault data remains end-to-end encrypted throughout the sync process.</sub>
 </p>
 <br>
