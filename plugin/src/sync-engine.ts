@@ -2,11 +2,11 @@ import { Notice, Plugin, TFile, normalizePath } from "obsidian";
 import * as Y from "yjs";
 
 import { EncryptedOpRecord, MyloniteApiClient, SnapshotRecord } from "./api";
-import { VaultKeys } from "./crypto";
+import { bytesToHex, hexToBytes, VaultKeys } from "./crypto";
 import { ClientMsgKind, OpKind, ServerMsgKind, decodeFrame, encodeFrame } from "./protocol";
 import { createEncryptedSnapshot, restoreEncryptedSnapshot } from "./snapshot-service";
 import { decodeEncryptedOpPayload, decryptBlobEnvelope, encodeEncryptedOp, encryptBlob } from "./sync-codec";
-import { PendingEncryptedOp, RemotePayload, RemoteV2Payload, SnapshotBinaryEntry } from "./sync-types";
+import { PendingEncryptedBlob, PendingEncryptedOp, RemotePayload, RemoteV2Payload, SnapshotBinaryEntry } from "./sync-types";
 import {
   applyBinaryUpsertWithCollision,
   applyFileDelete,
@@ -18,7 +18,7 @@ import { MyloniteSettings } from "./settings";
 import { decideRemoteV2Apply } from "./conflict-policy";
 import { LocalEventClassifier } from "./local-event-classifier";
 import { VaultStateIndex } from "./state-index";
-import { FileKind, SyncJournalEntry } from "./sync-state";
+import { FileKind, hashBytes, SyncJournalEntry } from "./sync-state";
 import {
   applyMarkdownUpdate,
   encodeMarkdownDeleteUpdate,
@@ -32,6 +32,7 @@ export const MARKDOWN_DEBOUNCE_MS = 75;
 export const OFFLINE_POLL_INTERVAL_MS = 15_000;
 export const LIVE_POLL_INTERVAL_MS = 60_000;
 export const WEBSOCKET_RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 15_000] as const;
+const MAX_REPORTED_CONFLICTS = 256;
 
 export interface SyncEngineHost extends Plugin {
   settings: MyloniteSettings;
@@ -48,6 +49,8 @@ export class SyncEngine {
   private readonly locallyDirtyFileIds = new Set<string>();
   private readonly pendingOpPaths = new Map<string, string[]>();
   private readonly pendingOpFileIds = new Map<string, string[]>();
+  private readonly reportedConflictKeys = new Set<string>();
+  private readonly reportedConflictOrder: string[] = [];
   private stateIndex: VaultStateIndex;
   private classifier: LocalEventClassifier;
   private readonly modifyTimers = new Map<string, { file: TFile; timer: number }>();
@@ -62,6 +65,9 @@ export class SyncEngine {
   private started = false;
 
   constructor(private readonly host: SyncEngineHost) {
+    if (!Array.isArray(this.host.settings.pendingBlobs)) {
+      this.host.settings.pendingBlobs = [];
+    }
     if (!this.host.settings.durableSyncState) {
       this.host.settings.durableSyncState = {
         version: 1,
@@ -71,6 +77,7 @@ export class SyncEngine {
     }
     this.stateIndex = VaultStateIndex.fromSnapshot(this.host.settings.durableSyncState?.index);
     this.classifier = new LocalEventClassifier(this.stateIndex);
+    this.rehydratePendingLocalState();
   }
 
   start(): void {
@@ -117,13 +124,34 @@ export class SyncEngine {
     this.pendingOpPaths.clear();
     this.pendingOpFileIds.clear();
     this.suppressedPaths.clear();
+    this.rehydratePendingLocalState();
+  }
+
+  private rehydratePendingLocalState(): void {
+    const journal = this.host.settings.durableSyncState?.journal ?? [];
+    for (const entry of journal) {
+      if (entry.status === "acknowledged" || entry.status === "applied") {
+        continue;
+      }
+      const paths = entry.affectedPaths.map((path) => normalizeVaultPath(path));
+      for (const path of paths) {
+        this.locallyDirtyPaths.add(path);
+      }
+      this.locallyDirtyFileIds.add(entry.fileId);
+      if (entry.clientOpId) {
+        this.pendingOpPaths.set(entry.clientOpId, paths);
+        this.pendingOpFileIds.set(entry.clientOpId, [entry.fileId]);
+      }
+    }
   }
 
   async catchUp(): Promise<void> {
     if (!this.host.settings.vaultId || !this.host.settings.deviceId) {
       return;
     }
-    await this.flushPendingOps();
+    if (await this.flushPendingBlobs()) {
+      await this.flushPendingOps();
+    }
     let appliedCount = 0;
     for (;;) {
       const ops = await this.host.createApiClient().listOps(this.host.settings.vaultId, this.host.settings.lastServerSeq, OP_PAGE_SIZE);
@@ -275,10 +303,10 @@ export class SyncEngine {
     this.locallyDirtyPaths.add(normalizedPath);
     const keys = await this.host.loadVaultKeys();
     const plaintext = new Uint8Array(await this.host.app.vault.readBinary(file));
-    const transition = this.classifier.classifyModify({ path: normalizedPath, kind: "binary", content: plaintext });
-    this.queueTransition(transition);
     const { blobId, envelope } = encryptBlob(keys, this.host.settings.vaultId, plaintext);
-    await this.host.createApiClient().putBlob(this.host.settings.vaultId, blobId, envelope);
+    const transition = this.classifier.classifyModify({ path: normalizedPath, kind: "binary", content: plaintext, blobId, size: plaintext.byteLength });
+    this.queueTransition(transition);
+    const blobUploaded = await this.putBlobOrQueue(blobId, envelope);
     await this.pushEncryptedOp(OpKind.FileUpdate, [normalizedPath], {
       version: 2,
       kind: "file-update",
@@ -289,7 +317,7 @@ export class SyncEngine {
       size: plaintext.byteLength,
       baseHash: transition.baseHash,
       contentHash: transition.contentHash,
-    }, [transition.fileId], transition.transitionId);
+    }, [transition.fileId], transition.transitionId, { forceQueue: !blobUploaded });
     this.host.updateStatus("synced binary change");
   }
 
@@ -365,9 +393,21 @@ export class SyncEngine {
       this.host.updateStatus("synced local rename");
       return;
     }
+    const keys = await this.host.loadVaultKeys();
     const bytes = new Uint8Array(await this.host.app.vault.readBinary(file));
-    const transition = this.classifier.classifyRename(normalizedOldPath, { path: normalizedNewPath, kind: "binary", content: bytes });
+    const existing = this.stateIndex.byPath(normalizedOldPath);
+    const contentHash = hashBytes(bytes);
+    const reusableBlobId = existing?.kind === "binary" && existing.contentHash === contentHash && existing.size === bytes.byteLength
+      ? existing.blobId
+      : undefined;
+    const encrypted = reusableBlobId ? null : encryptBlob(keys, this.host.settings.vaultId, bytes);
+    const blobId = reusableBlobId ?? encrypted?.blobId;
+    if (!blobId) {
+      throw new Error("missing binary rename blob id");
+    }
+    const transition = this.classifier.classifyRename(normalizedOldPath, { path: normalizedNewPath, kind: "binary", content: bytes, blobId, size: bytes.byteLength });
     this.queueTransition(transition);
+    const blobUploaded = encrypted ? await this.putBlobOrQueue(blobId, encrypted.envelope) : true;
     await this.pushEncryptedOp(OpKind.FileRename, [normalizedOldPath, normalizedNewPath], {
       version: 2,
       kind: "file-rename",
@@ -377,11 +417,20 @@ export class SyncEngine {
       path: normalizedNewPath,
       fileKind: "binary",
       contentHash: transition.contentHash,
-    }, [transition.fileId], transition.transitionId);
+      blobId,
+      size: bytes.byteLength,
+    }, [transition.fileId], transition.transitionId, { forceQueue: !blobUploaded });
     this.host.updateStatus("synced local rename");
   }
 
-  private async pushEncryptedOp(kind: number, affectedPaths: string[], payloadObject: object, changedFileIds: string[] = [], transitionId?: string): Promise<void> {
+  private async pushEncryptedOp(
+    kind: number,
+    affectedPaths: string[],
+    payloadObject: object,
+    changedFileIds: string[] = [],
+    transitionId?: string,
+    options: { forceQueue?: boolean } = {},
+  ): Promise<void> {
     const keys = await this.host.loadVaultKeys();
     const lamport = this.host.settings.lamport + 1;
     const op = encodeEncryptedOp(keys, this.host.settings.vaultId, this.host.settings.deviceId, lamport, kind, payloadObject);
@@ -390,7 +439,10 @@ export class SyncEngine {
     this.pendingOpFileIds.set(op.client_op_id, changedFileIds);
     this.attachOpToTransition(transitionId, op.client_op_id);
     try {
-      if (this.canPushOpOverWebSocket()) {
+      if (options.forceQueue) {
+        this.queuePendingOp(op);
+        this.host.updateStatus("queued offline");
+      } else if (this.canPushOpOverWebSocket()) {
         this.queuePendingOp(op);
         this.sendWebSocketOpPush(op);
       } else {
@@ -437,10 +489,10 @@ export class SyncEngine {
     }
     const keys = await this.host.loadVaultKeys();
     const plaintext = new Uint8Array(await this.host.app.vault.readBinary(file));
-    const transition = this.classifier.classifyCreate({ path: normalizedPath, kind: "binary", content: plaintext });
-    this.queueTransition(transition);
     const { blobId, envelope } = encryptBlob(keys, this.host.settings.vaultId, plaintext);
-    await this.host.createApiClient().putBlob(this.host.settings.vaultId, blobId, envelope);
+    const transition = this.classifier.classifyCreate({ path: normalizedPath, kind: "binary", content: plaintext, blobId, size: plaintext.byteLength });
+    this.queueTransition(transition);
+    const blobUploaded = await this.putBlobOrQueue(blobId, envelope);
     await this.pushEncryptedOp(transition.kind === "file-copy" ? OpKind.FileCopy : OpKind.FileCreate, [normalizedPath], {
       version: 2,
       kind: transition.kind,
@@ -452,7 +504,53 @@ export class SyncEngine {
       blobId,
       size: plaintext.byteLength,
       contentHash: transition.contentHash,
-    }, [transition.fileId], transition.transitionId);
+    }, [transition.fileId], transition.transitionId, { forceQueue: !blobUploaded });
+  }
+
+  private async putBlobOrQueue(blobId: string, envelope: Uint8Array): Promise<boolean> {
+    try {
+      await this.host.createApiClient().putBlob(this.host.settings.vaultId, blobId, envelope);
+      this.removePendingBlob(blobId);
+      return true;
+    } catch (error) {
+      this.queuePendingBlob({ blobId, envelopeHex: bytesToHex(envelope) });
+      this.host.debug(`queued blob ${blobId}: ${String(error)}`);
+      this.host.updateStatus("queued offline");
+      return false;
+    }
+  }
+
+  private queuePendingBlob(blob: PendingEncryptedBlob): void {
+    if (this.host.settings.pendingBlobs.some((pending) => pending.blobId === blob.blobId)) {
+      return;
+    }
+    this.host.settings.pendingBlobs.push(blob);
+  }
+
+  private removePendingBlob(blobId: string): void {
+    this.host.settings.pendingBlobs = this.host.settings.pendingBlobs.filter((blob) => blob.blobId !== blobId);
+  }
+
+  private async flushPendingBlobs(): Promise<boolean> {
+    if (this.host.settings.pendingBlobs.length === 0 || !this.host.settings.vaultId) {
+      return true;
+    }
+    const client = this.host.createApiClient();
+    const remaining: PendingEncryptedBlob[] = [];
+    for (const [index, blob] of this.host.settings.pendingBlobs.entries()) {
+      try {
+        await client.putBlob(this.host.settings.vaultId, blob.blobId, hexToBytes(blob.envelopeHex));
+      } catch (error) {
+        remaining.push(...this.host.settings.pendingBlobs.slice(index));
+        this.host.debug(`pending blob flush stopped: ${String(error)}`);
+        break;
+      }
+    }
+    if (remaining.length !== this.host.settings.pendingBlobs.length) {
+      this.host.settings.pendingBlobs = remaining;
+      await this.host.saveSettings();
+    }
+    return remaining.length === 0;
   }
 
   private async flushPendingOps(): Promise<void> {
@@ -653,20 +751,8 @@ export class SyncEngine {
     const keys = await this.host.loadVaultKeys();
     const payload = decodeEncryptedOpPayload(keys, this.host.settings.vaultId, op) as RemotePayload;
     validateRemotePayload(payload);
-    this.reportRemoteRace(remotePayloadPaths(payload));
     await this.applyRemoteV2Payload(payload, op.server_seq);
     this.persistSyncState();
-  }
-
-  private reportRemoteRace(remotePaths: string[]): void {
-    const races = racedPaths(remotePaths, this.locallyDirtyPaths);
-    if (races.length === 0) {
-      return;
-    }
-    const summary = races.slice(0, 3).join(", ");
-    this.host.updateStatus(`edit conflict: ${summary}`);
-    this.host.debug(`remote op raced local dirty paths: ${races.join(", ")}`);
-    new Notice(`Remote edit overlapped a local edit. Check ${summary}.`);
   }
 
   private clearDirtyPathsForOp(clientOpId: string): void {
@@ -752,8 +838,7 @@ export class SyncEngine {
   private async applyRemoteV2Payload(payload: RemoteV2Payload, serverSeq: number): Promise<void> {
     const decision = decideRemoteV2Apply(this.stateIndex, payload, this.locallyDirtyFileIds);
     if (decision.action === "prompt") {
-      this.host.updateStatus("conflict needs input");
-      new Notice(`Mylonite needs input: ${decision.reason}. Keeping local work for now.`);
+      this.reportConflictOnce("needs-input", decision.reason, remotePayloadPaths(payload), payload.fileId);
       return;
     }
     if (decision.action === "noop") {
@@ -765,13 +850,23 @@ export class SyncEngine {
       }
       const targetPath = decision.action === "conflict-path" ? decision.path : payload.newPath;
       const result = await applyFileRenameWithCollision(this.host.app.vault, this.suppressedPaths, payload.oldPath, targetPath, payload.fileId);
-      const finalPath = result.status === "missing-local-file" ? targetPath : result.path;
+      const finalPath = result.status === "missing-local-file"
+        ? await this.materializeMissingRenamedFile(payload, targetPath)
+        : result.path;
+      if (!finalPath) {
+        return;
+      }
+      if (decision.action === "conflict-path") {
+        this.reportConflictOnce("kept-both", decision.reason, [payload.newPath, finalPath], payload.fileId);
+      }
       const current = this.stateIndex.byFileId(payload.fileId);
       this.stateIndex.upsertFile({
         fileId: payload.fileId,
         path: finalPath,
         kind: payload.fileKind,
         contentHash: payload.contentHash ?? current?.contentHash ?? "",
+        blobId: payload.fileKind === "binary" ? payload.blobId ?? current?.blobId : undefined,
+        size: payload.fileKind === "binary" ? payload.size ?? current?.size : undefined,
         tombstone: false,
         lastLocalSeq: current?.lastLocalSeq ?? 0,
         lastRemoteSeq: serverSeq,
@@ -790,27 +885,33 @@ export class SyncEngine {
     if (payload.kind === "file-create" || payload.kind === "file-copy") {
       const fileId = payload.kind === "file-copy" ? payload.newFileId : payload.fileId;
       const path = decision.action === "conflict-path" ? decision.path : payload.path;
-      await this.applyRemoteV2Content({ ...payload, fileId, path }, false, serverSeq);
+      await this.applyRemoteV2Content({ ...payload, fileId }, path, false, serverSeq);
+      if (decision.action === "conflict-path") {
+        this.reportConflictOnce("kept-both", decision.reason, [payload.path, path], fileId);
+      }
       return;
     }
     if (payload.kind === "file-update") {
       const path = decision.action === "conflict-path" ? decision.path : payload.path;
-      await this.applyRemoteV2Content({ ...payload, path }, decision.action !== "conflict-path", serverSeq);
+      await this.applyRemoteV2Content(payload, path, decision.action !== "conflict-path", serverSeq);
+      if (decision.action === "conflict-path") {
+        this.reportConflictOnce("kept-both", decision.reason, [payload.path, path], payload.fileId);
+      }
     }
   }
 
-  private async applyRemoteV2Content(payload: RemoteV2Payload & { path: string; fileId: string }, allowOverwrite: boolean, serverSeq: number): Promise<void> {
+  private async applyRemoteV2Content(payload: RemoteV2Payload & { fileId: string }, targetPath: string, allowOverwrite: boolean, serverSeq: number): Promise<void> {
     if ((payload.kind === "file-create" || payload.kind === "file-copy") && payload.fileKind === "markdown") {
       applyMarkdownUpdate(this.ydoc, requiredMarkdownUpdateHex(payload));
-      const content = getMarkdownText(this.ytree, normalizeVaultPath(payload.path))?.toString() ?? "";
-      const result = await applyMarkdownUpsertWithCollision(this.host.app.vault, this.suppressedPaths, payload.path, content, payload.fileId, allowOverwrite);
+      const content = getMarkdownText(this.ytree, markdownContentPath(payload))?.toString() ?? "";
+      const result = await applyMarkdownUpsertWithCollision(this.host.app.vault, this.suppressedPaths, targetPath, content, payload.fileId, allowOverwrite);
       this.recordRemoteFile(payload.fileId, result.path, "markdown", payload.contentHash, serverSeq);
       return;
     }
     if (payload.kind === "file-update" && payload.fileKind === "markdown") {
       applyMarkdownUpdate(this.ydoc, requiredMarkdownUpdateHex(payload));
-      const content = getMarkdownText(this.ytree, normalizeVaultPath(payload.path))?.toString() ?? "";
-      const result = await applyMarkdownUpsertWithCollision(this.host.app.vault, this.suppressedPaths, payload.path, content, payload.fileId, allowOverwrite);
+      const content = getMarkdownText(this.ytree, markdownContentPath(payload))?.toString() ?? "";
+      const result = await applyMarkdownUpsertWithCollision(this.host.app.vault, this.suppressedPaths, targetPath, content, payload.fileId, allowOverwrite);
       this.recordRemoteFile(payload.fileId, result.path, "markdown", payload.contentHash, serverSeq);
       return;
     }
@@ -818,24 +919,79 @@ export class SyncEngine {
       if (!payload.blobId) {
         throw new Error("missing v2 binary blob id");
       }
-      const keys = await this.host.loadVaultKeys();
-      const blobBytes = await this.host.createApiClient().getBlob(this.host.settings.vaultId, payload.blobId);
-      if (!blobBytes) {
-        throw new Error(`missing blob ${payload.blobId}`);
-      }
-      const plaintext = decryptBlobEnvelope(keys, this.host.settings.vaultId, payload.blobId, blobBytes);
-      const result = await applyBinaryUpsertWithCollision(this.host.app.vault, this.suppressedPaths, payload.path, plaintext, payload.fileId, allowOverwrite);
-      this.recordRemoteFile(payload.fileId, result.path, "binary", payload.contentHash, serverSeq);
+      const plaintext = await this.loadRemoteBinaryBlob(payload.blobId);
+      const result = await applyBinaryUpsertWithCollision(this.host.app.vault, this.suppressedPaths, targetPath, plaintext, payload.fileId, allowOverwrite);
+      this.recordRemoteFile(payload.fileId, result.path, "binary", payload.contentHash, serverSeq, { blobId: payload.blobId, size: payload.size });
     }
   }
 
-  private recordRemoteFile(fileId: string, path: string, kind: FileKind, contentHash: string, serverSeq: number): void {
+  private async materializeMissingRenamedFile(payload: Extract<RemoteV2Payload, { kind: "file-rename" }>, targetPath: string): Promise<string | null> {
+    if (payload.fileKind === "markdown") {
+      const content = getMarkdownText(this.ytree, normalizeVaultPath(payload.newPath))?.toString() ?? "";
+      const result = await applyMarkdownUpsertWithCollision(this.host.app.vault, this.suppressedPaths, targetPath, content, payload.fileId, false);
+      return result.path;
+    }
+    const current = this.stateIndex.byFileId(payload.fileId);
+    const blobId = payload.blobId ?? current?.blobId;
+    if (!blobId) {
+      this.reportConflictOnce(
+        "needs-input",
+        "remote binary rename is missing content and the old local file is gone",
+        [payload.oldPath, payload.newPath],
+        payload.fileId,
+      );
+      return null;
+    }
+    const plaintext = await this.loadRemoteBinaryBlob(blobId);
+    const result = await applyBinaryUpsertWithCollision(this.host.app.vault, this.suppressedPaths, targetPath, plaintext, payload.fileId, false);
+    return result.path;
+  }
+
+  private async loadRemoteBinaryBlob(blobId: string): Promise<Uint8Array> {
+    const keys = await this.host.loadVaultKeys();
+    const blobBytes = await this.host.createApiClient().getBlob(this.host.settings.vaultId, blobId);
+    if (!blobBytes) {
+      throw new Error(`missing blob ${blobId}`);
+    }
+    return decryptBlobEnvelope(keys, this.host.settings.vaultId, blobId, blobBytes);
+  }
+
+  private reportConflictOnce(kind: "kept-both" | "needs-input", reason: string, paths: string[], fileId?: string): void {
+    const normalizedPaths = Array.from(new Set(paths.map((path) => normalizeVaultPath(path))));
+    const key = [kind, reason, fileId ?? "", ...normalizedPaths].join("\0");
+    if (this.reportedConflictKeys.has(key)) {
+      return;
+    }
+    this.reportedConflictKeys.add(key);
+    this.reportedConflictOrder.push(key);
+    while (this.reportedConflictOrder.length > MAX_REPORTED_CONFLICTS) {
+      const expired = this.reportedConflictOrder.shift();
+      if (expired) {
+        this.reportedConflictKeys.delete(expired);
+      }
+    }
+
+    const summary = normalizedPaths.slice(0, 3).join(", ");
+    if (kind === "needs-input") {
+      this.host.updateStatus("conflict needs input");
+      this.host.debug(`sync conflict needs input: ${reason}; ${summary}`);
+      new Notice(`Mylonite needs input: ${reason}. Check ${summary}.`);
+      return;
+    }
+    this.host.updateStatus(`kept both: ${summary}`);
+    this.host.debug(`remote change kept alongside local file: ${reason}; ${summary}`);
+    new Notice(`Mylonite kept both versions: ${reason}. Check ${summary}.`);
+  }
+
+  private recordRemoteFile(fileId: string, path: string, kind: FileKind, contentHash: string, serverSeq: number, contentRef: { blobId?: string; size?: number } = {}): void {
     const current = this.stateIndex.byFileId(fileId);
     this.stateIndex.upsertFile({
       fileId,
       path,
       kind,
       contentHash,
+      blobId: kind === "binary" ? contentRef.blobId ?? current?.blobId : undefined,
+      size: kind === "binary" ? contentRef.size ?? current?.size : undefined,
       tombstone: false,
       lastLocalSeq: current?.lastLocalSeq ?? 0,
       lastRemoteSeq: serverSeq,
@@ -964,6 +1120,13 @@ function remotePayloadPaths(payload: RemotePayload): string[] {
   return [payload.path];
 }
 
+function markdownContentPath(payload: RemoteV2Payload & { path: string }): string {
+  if (payload.kind === "file-rename") {
+    return normalizeVaultPath(payload.newPath);
+  }
+  return normalizeVaultPath(payload.path);
+}
+
 function requiredMarkdownUpdateHex(payload: RemoteV2Payload): string {
   if (payload.fileKind !== "markdown" || typeof payload.updateHex !== "string") {
     throw new Error("missing v2 markdown update");
@@ -987,12 +1150,7 @@ function validateRemoteV2Payload(payload: RemoteV2Payload): void {
   if (payload.kind === "file-create" || payload.kind === "file-update" || payload.kind === "file-copy") {
     validateContentHash(payload.contentHash);
     if (payload.fileKind === "binary") {
-      if (typeof payload.blobId !== "string" || !/^[0-9a-f]{64}$/.test(payload.blobId)) {
-        throw new Error("invalid v2 blob id");
-      }
-      if (typeof payload.size !== "number" || !Number.isSafeInteger(payload.size) || payload.size < 0) {
-        throw new Error("invalid v2 binary size");
-      }
+      validateBinaryContentRef(payload.blobId, payload.size);
     }
   }
   if (payload.kind === "file-rename") {
@@ -1000,6 +1158,9 @@ function validateRemoteV2Payload(payload: RemoteV2Payload): void {
     normalizeVaultPath(payload.newPath);
     if (payload.contentHash !== undefined) {
       validateContentHash(payload.contentHash);
+    }
+    if (payload.fileKind === "binary" && (payload.blobId !== undefined || payload.size !== undefined)) {
+      validateBinaryContentRef(payload.blobId, payload.size);
     }
   }
   if (payload.kind === "file-delete") {
@@ -1028,6 +1189,15 @@ function validateFileId(value: unknown): asserts value is string {
 function validateContentHash(value: unknown): asserts value is string {
   if (typeof value !== "string" || value.length === 0 || value.length > 128 || /[^0-9a-f]/.test(value)) {
     throw new Error("invalid v2 content hash");
+  }
+}
+
+function validateBinaryContentRef(blobId: unknown, size: unknown): void {
+  if (typeof blobId !== "string" || !/^[0-9a-f]{64}$/.test(blobId)) {
+    throw new Error("invalid v2 blob id");
+  }
+  if (typeof size !== "number" || !Number.isSafeInteger(size) || size < 0) {
+    throw new Error("invalid v2 binary size");
   }
 }
 

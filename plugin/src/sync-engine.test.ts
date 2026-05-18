@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { TFile } from "obsidian";
+import { Notice, TFile } from "obsidian";
 import * as Y from "yjs";
 import {
   MARKDOWN_DEBOUNCE_MS,
@@ -14,7 +14,20 @@ import {
 } from "./sync-engine";
 import { PendingEncryptedOp } from "./sync-types";
 import { ServerMsgKind, encodeFrame } from "./protocol";
-import { encodeMarkdownUpsertUpdate, hexToBytes } from "./yjs-markdown";
+import { encodeMarkdownRenameUpdate, encodeMarkdownUpsertUpdate, hexToBytes } from "./yjs-markdown";
+import { VaultKeys } from "./crypto";
+import { encryptBlob } from "./sync-codec";
+
+const keys: VaultKeys = {
+  opKey: new Uint8Array(32).fill(1),
+  blobKey: new Uint8Array(32).fill(2),
+  blobIdKey: new Uint8Array(32).fill(3),
+  snapshotKey: new Uint8Array(32).fill(4),
+};
+
+function noticeMessages(): string[] {
+  return (Notice as unknown as { messages: string[] }).messages;
+}
 
 describe("pending op queue", () => {
   it("keeps the failed op and later queued ops after a flush failure", () => {
@@ -214,6 +227,10 @@ describe("remote payload validation", () => {
 });
 
 describe("v2 markdown application", () => {
+  beforeEach(() => {
+    noticeMessages().length = 0;
+  });
+
   it("applies text updates after an empty create on a receiver", async () => {
     const path = "Notes/a.md";
     const fileId = "f" + "a".repeat(32);
@@ -242,6 +259,170 @@ describe("v2 markdown application", () => {
     }), 2);
 
     expect(vault.readText(path)).toBe("hello");
+  });
+
+  it("materializes a remote markdown rename when the old local file is missing", async () => {
+    const oldPath = "Notes/a.md";
+    const newPath = "Moved/a.md";
+    const fileId = "f" + "a".repeat(32);
+    const localDoc = new Y.Doc();
+    const localTree = localDoc.getMap<Y.Map<unknown>>("tree");
+    const renameUpdate = encodeMarkdownRenameUpdate(localDoc, localTree, oldPath, newPath, "hello after move");
+    const vault = new MemoryVault();
+    const engine = new SyncEngine(testHost(vault));
+
+    await callPrivate(engine, "applyRemoteV2Payload", v2Payload({
+      kind: "file-rename",
+      fileId,
+      path: newPath,
+      oldPath,
+      newPath,
+      fileKind: "markdown",
+      updateHex: renameUpdate,
+      contentHash: "abcd",
+    }), 4);
+
+    expect(vault.readText(newPath)).toBe("hello after move");
+  });
+
+  it("writes conflicted markdown content from the remote op path, not the generated conflict path", async () => {
+    const path = "Notes/a.md";
+    const remoteFileId = "f" + "a".repeat(32);
+    const localFileId = "f" + "b".repeat(32);
+    const localDoc = new Y.Doc();
+    const localTree = localDoc.getMap<Y.Map<unknown>>("tree");
+    const updateHex = encodeMarkdownUpsertUpdate(localDoc, localTree, path, "remote content");
+    const vault = new MemoryVault([[path, "local content"]]);
+    const host = testHost(vault);
+    host.settings.durableSyncState.index.files = [{
+      fileId: localFileId,
+      path,
+      kind: "markdown",
+      contentHash: "local",
+      tombstone: false,
+      lastLocalSeq: 0,
+      lastRemoteSeq: 0,
+      updatedAtMs: 1,
+    }];
+    const engine = new SyncEngine(host);
+
+    await callPrivate(engine, "applyRemoteV2Payload", v2Payload({
+      kind: "file-update",
+      fileId: remoteFileId,
+      path,
+      fileKind: "markdown",
+      updateHex,
+      contentHash: "abcd",
+    }), 5);
+
+    expect(vault.readText(path)).toBe("local content");
+    expect(vault.readText("Notes/a conflict-faaaaaaa.md")).toBe("remote content");
+    expect(noticeMessages().filter((message) => message.startsWith("Mylonite kept both versions"))).toHaveLength(1);
+  });
+});
+
+describe("v2 binary rename application", () => {
+  beforeEach(() => {
+    noticeMessages().length = 0;
+  });
+
+  it("materializes a remote binary rename when the old local file is missing", async () => {
+    const oldPath = "assets/a.png";
+    const newPath = "images/a.png";
+    const fileId = "f" + "a".repeat(32);
+    const bytes = new Uint8Array([1, 2, 3, 4]);
+    const encrypted = encryptBlob(keys, "vault-a", bytes);
+    const vault = new MemoryVault();
+    const host = testHost(vault);
+    host.loadVaultKeys = vi.fn().mockResolvedValue(keys);
+    host.createApiClient = () => ({
+      websocketUrl: () => "wss://example.test/ws",
+      listOps: vi.fn().mockResolvedValue([]),
+      getBlob: vi.fn().mockResolvedValue(encrypted.envelope),
+    }) as never;
+    const engine = new SyncEngine(host);
+
+    await callPrivate(engine, "applyRemoteV2Payload", v2Payload({
+      kind: "file-rename",
+      fileId,
+      path: newPath,
+      oldPath,
+      newPath,
+      fileKind: "binary",
+      contentHash: "abcd",
+      blobId: encrypted.blobId,
+      size: bytes.byteLength,
+    }), 6);
+
+    expect(Array.from(vault.readBinaryBytes(newPath) ?? [])).toEqual([1, 2, 3, 4]);
+  });
+});
+
+describe("binary outbox", () => {
+  it("queues a binary rename op behind its blob when blob upload fails", async () => {
+    const oldPath = "assets/a.png";
+    const newPath = "images/a.png";
+    const vault = new MemoryVault();
+    vault.binaries.set(newPath, new Uint8Array([1, 2, 3]));
+    const host = testHost(vault);
+    const putBlob = vi.fn().mockRejectedValue(new Error("offline"));
+    const appendOp = vi.fn().mockResolvedValue(undefined);
+    host.loadVaultKeys = vi.fn().mockResolvedValue(keys);
+    host.createApiClient = () => ({
+      websocketUrl: () => "wss://example.test/ws",
+      listOps: vi.fn().mockResolvedValue([]),
+      putBlob,
+      appendOp,
+    }) as never;
+    const engine = new SyncEngine(host);
+
+    await callPrivate(engine, "pushFileRename", oldPath, testFile(newPath, "png"));
+
+    expect(host.settings.pendingBlobs).toHaveLength(1);
+    expect(host.settings.pendingOps).toHaveLength(1);
+    expect(appendOp).not.toHaveBeenCalled();
+  });
+});
+
+describe("durable local dirty state", () => {
+  beforeEach(() => {
+    noticeMessages().length = 0;
+  });
+
+  it("rehydrates queued local changes before remote conflict decisions", async () => {
+    const path = "assets/a.png";
+    const fileId = "f" + "a".repeat(32);
+    const host = testHost(new MemoryVault());
+    host.settings.durableSyncState.journal = [{
+      transitionId: "x" + "1".repeat(32),
+      status: "queued",
+      kind: "file-update",
+      fileId,
+      path,
+      fileKind: "binary",
+      contentHash: "abcd",
+      observedAtMs: 1,
+      affectedPaths: [path],
+    }];
+    const engine = new SyncEngine(host);
+
+    await callPrivate(engine, "applyRemoteV2Payload", v2Payload({
+      kind: "file-delete",
+      fileId,
+      path,
+      fileKind: "binary",
+      tombstoneId: "t" + "b".repeat(32),
+    }), 7);
+    await callPrivate(engine, "applyRemoteV2Payload", v2Payload({
+      kind: "file-delete",
+      fileId,
+      path,
+      fileKind: "binary",
+      tombstoneId: "t" + "b".repeat(32),
+    }), 8);
+
+    expect(host.updateStatus).toHaveBeenCalledWith("conflict needs input");
+    expect(noticeMessages().filter((message) => message.startsWith("Mylonite needs input"))).toHaveLength(1);
   });
 });
 
@@ -365,6 +546,7 @@ function testHost(vault: MemoryVault | null = null) {
       deviceId: "d" + "1".repeat(32),
       lastServerSeq: 0,
       lamport: 0,
+      pendingBlobs: [],
       pendingOps: [],
       durableSyncState: {
         version: 1,
@@ -376,6 +558,8 @@ function testHost(vault: MemoryVault | null = null) {
     createApiClient: () => ({
       websocketUrl: () => "wss://example.test/ws",
       listOps: vi.fn().mockResolvedValue([]),
+      putBlob: vi.fn().mockResolvedValue(undefined),
+      appendOp: vi.fn().mockResolvedValue(undefined),
     }),
     debug: vi.fn(),
     loadVaultKeys: vi.fn(),
@@ -388,15 +572,22 @@ function testHost(vault: MemoryVault | null = null) {
 
 class MemoryVault {
   readonly files = new Map<string, string>();
+  readonly binaries = new Map<string, Uint8Array>();
+
+  constructor(initialFiles: [string, string][] = []) {
+    for (const [path, content] of initialFiles) {
+      this.files.set(path, content);
+    }
+  }
 
   getFiles(): TFile[] {
-    return Array.from(this.files.keys()).map((path) => testFile(path, path.split(".").pop() ?? ""));
+    return [...this.files.keys(), ...this.binaries.keys()].map((path) => testFile(path, path.split(".").pop() ?? ""));
   }
 
   on(): void {}
 
   getFileByPath(path: string): TFile | null {
-    return this.files.has(path) ? testFile(path, path.split(".").pop() ?? "") : null;
+    return this.files.has(path) || this.binaries.has(path) ? testFile(path, path.split(".").pop() ?? "") : null;
   }
 
   getFolderByPath(): object | null {
@@ -413,18 +604,42 @@ class MemoryVault {
 
   async delete(file: TFile): Promise<void> {
     this.files.delete(file.path);
+    this.binaries.delete(file.path);
   }
 
   async rename(file: TFile, newPath: string): Promise<void> {
+    if (this.binaries.has(file.path)) {
+      const content = this.binaries.get(file.path) ?? new Uint8Array();
+      this.binaries.delete(file.path);
+      this.binaries.set(newPath, content);
+      return;
+    }
     const content = this.files.get(file.path) ?? "";
     this.files.delete(file.path);
     this.files.set(newPath, content);
+  }
+
+  async createBinary(path: string, content: ArrayBuffer): Promise<void> {
+    this.binaries.set(path, new Uint8Array(content));
+  }
+
+  async modifyBinary(file: TFile, content: ArrayBuffer): Promise<void> {
+    this.binaries.set(file.path, new Uint8Array(content));
+  }
+
+  async readBinary(file: TFile): Promise<ArrayBuffer> {
+    const bytes = this.binaries.get(file.path) ?? new Uint8Array();
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
   }
 
   async createFolder(): Promise<void> {}
 
   readText(path: string): string | undefined {
     return this.files.get(path);
+  }
+
+  readBinaryBytes(path: string): Uint8Array | undefined {
+    return this.binaries.get(path);
   }
 }
 

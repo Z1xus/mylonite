@@ -103,6 +103,8 @@ export default class MylonitePlugin extends Plugin {
       this.settings.deviceId = response.device_id;
       this.settings.devicePublicKeyHex = keypair.publicKeyHex;
       this.settings.pairingToken = "";
+      this.settings.pendingBlobs = [];
+      this.settings.pendingOps = [];
       storeDevicePrivateKey(this.app, this.settings, keypair.privateKeyHex);
       storePassphrase(this.app, this.settings, randomHex(32));
       this.vaultKeys = null;
@@ -209,6 +211,7 @@ export default class MylonitePlugin extends Plugin {
       this.settings.deviceId = secret.device_id;
       this.settings.lastServerSeq = secret.last_server_seq;
       this.settings.lamport = 0;
+      this.settings.pendingBlobs = [];
       this.settings.pendingOps = [];
       clearDevicePairingPrivateKey(this.app, this.settings);
       this.settings.devicePairingResponse = "";
@@ -258,6 +261,7 @@ export default class MylonitePlugin extends Plugin {
     this.settings.devicePairingResponse = "";
     this.settings.lamport = 0;
     this.settings.lastServerSeq = 0;
+    this.settings.pendingBlobs = [];
     this.settings.pendingOps = [];
     this.settings.durableSyncState = {
       version: 1,

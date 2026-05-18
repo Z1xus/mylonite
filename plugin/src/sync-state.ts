@@ -9,6 +9,8 @@ export interface VaultFileState {
   path: string;
   kind: FileKind;
   contentHash: string;
+  blobId?: string;
+  size?: number;
   tombstone: boolean;
   lastLocalSeq: number;
   lastRemoteSeq: number;

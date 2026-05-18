@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import { SnapshotRecord } from "./api";
 import { VaultKeys } from "./crypto";
-import { encryptSnapshot } from "./sync-codec";
-import { restoreEncryptedSnapshot, validateSnapshotPayload } from "./snapshot-service";
+import { decryptSnapshot, encryptSnapshot } from "./sync-codec";
+import { createEncryptedSnapshot, restoreEncryptedSnapshot, validateSnapshotPayload } from "./snapshot-service";
 import { SnapshotPayload } from "./sync-types";
 
 const keys: VaultKeys = {
@@ -27,6 +27,7 @@ function fakeVault(initialFiles: FakeFile[]) {
       getFiles: () => [...files.values()],
       getFileByPath: (path: string) => files.get(path) ?? null,
       getFolderByPath: () => ({}),
+      read: async (file: FakeFile) => file.content,
       modify: async (file: FakeFile, content: string) => {
         file.content = content;
       },
@@ -129,5 +130,34 @@ describe("snapshot restore", () => {
       version: 1,
       entries: [{ kind: "binary", path: "assets/a.png", blobId: "a".repeat(64), size: -1 }],
     })).toThrow("invalid snapshot binary size");
+  });
+});
+
+describe("snapshot creation", () => {
+  it("stores an authoritative state index for snapshot entries", async () => {
+    const { vault } = fakeVault([
+      { path: "notes/a.md", extension: "md", content: "hello" },
+    ]);
+
+    const encrypted = await createEncryptedSnapshot(
+      vault as never,
+      keys,
+      "vault-a",
+      12,
+      async () => undefined,
+      { version: 1, files: [], tombstones: [] },
+    );
+    const payload = decryptSnapshot<SnapshotPayload>(
+      keys,
+      "vault-a",
+      encrypted.snapshotId,
+      12,
+      encrypted.nonceHex,
+      encrypted.ciphertextHex,
+    );
+
+    expect(payload.state?.files).toHaveLength(1);
+    expect(payload.state?.files[0]?.path).toBe("notes/a.md");
+    expect(payload.state?.files[0]?.fileId).toBe(payload.entries[0]?.fileId);
   });
 });

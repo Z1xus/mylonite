@@ -126,6 +126,8 @@ function isValidFileState(value: VaultFileState): boolean {
     && typeof value.path === "string"
     && (value.kind === "markdown" || value.kind === "binary")
     && typeof value.contentHash === "string"
+    && (value.blobId === undefined || /^[0-9a-f]{64}$/.test(value.blobId))
+    && (value.size === undefined || (typeof value.size === "number" && Number.isSafeInteger(value.size) && value.size >= 0))
     && !value.tombstone;
 }
 

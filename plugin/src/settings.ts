@@ -1,6 +1,6 @@
 import { App, Plugin, PluginSettingTab, Setting } from "obsidian";
 
-import { DurableSyncState, PendingEncryptedOp } from "./sync-types";
+import { DurableSyncState, PendingEncryptedBlob, PendingEncryptedOp } from "./sync-types";
 
 export interface MyloniteSettings {
   serverUrl: string;
@@ -10,6 +10,7 @@ export interface MyloniteSettings {
   passphraseDevelopmentFallback: string;
   lamport: number;
   lastServerSeq: number;
+  pendingBlobs: PendingEncryptedBlob[];
   pendingOps: PendingEncryptedOp[];
   durableSyncState: DurableSyncState;
   deviceId: string;
@@ -32,6 +33,7 @@ export const DEFAULT_SETTINGS: MyloniteSettings = {
   passphraseDevelopmentFallback: "",
   lamport: 0,
   lastServerSeq: 0,
+  pendingBlobs: [],
   pendingOps: [],
   durableSyncState: {
     version: 1,

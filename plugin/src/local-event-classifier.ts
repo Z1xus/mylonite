@@ -14,6 +14,8 @@ export interface FileObservation {
   path: string;
   kind: FileKind;
   content: string | Uint8Array;
+  blobId?: string;
+  size?: number;
 }
 
 export class LocalEventClassifier {
@@ -24,7 +26,8 @@ export class LocalEventClassifier {
     const contentHash = observationHash(observation);
     const copiedFrom = this.index.findCurrentByHash(contentHash, observation.kind);
     const fileId = newFileId();
-    this.index.ensureFile(path, observation.kind, contentHash, fileId, now);
+    const file = this.index.ensureFile(path, observation.kind, contentHash, fileId, now);
+    this.index.upsertFile(withObservedContentRef(file, observation));
     return baseEntry({
       kind: copiedFrom ? "file-copy" : "file-create",
       fileId,
@@ -41,7 +44,7 @@ export class LocalEventClassifier {
     const path = normalizeVaultPath(observation.path);
     const contentHash = observationHash(observation);
     const existing = this.index.byPath(path) ?? this.index.ensureFile(path, observation.kind, contentHash, newFileId(), now);
-    const updated = { ...existing, kind: observation.kind, contentHash, updatedAtMs: now };
+    const updated = withObservedContentRef({ ...existing, kind: observation.kind, contentHash, updatedAtMs: now }, observation);
     this.index.upsertFile(updated);
     return baseEntry({
       kind: "file-update",
@@ -65,7 +68,7 @@ export class LocalEventClassifier {
     this.index.renameFile(existing.fileId, normalizedOldPath, normalizedNewPath, now);
     const current = this.index.byFileId(existing.fileId);
     if (current) {
-      this.index.upsertFile({ ...current, contentHash, kind: observation.kind, updatedAtMs: now });
+      this.index.upsertFile(withObservedContentRef({ ...current, contentHash, kind: observation.kind, updatedAtMs: now }, observation));
     }
     return baseEntry({
       kind: "file-rename",
@@ -102,6 +105,17 @@ export class LocalEventClassifier {
 
 function observationHash(observation: FileObservation): string {
   return typeof observation.content === "string" ? hashText(observation.content) : hashBytes(observation.content);
+}
+
+function withObservedContentRef<T extends { kind: FileKind; blobId?: string; size?: number }>(file: T, observation: FileObservation): T {
+  if (observation.kind !== "binary") {
+    return { ...file, blobId: undefined, size: undefined };
+  }
+  return {
+    ...file,
+    blobId: observation.blobId,
+    size: observation.size,
+  };
 }
 
 function baseEntry(entry: Omit<SyncJournalEntry, "transitionId" | "status">): SyncJournalEntry {

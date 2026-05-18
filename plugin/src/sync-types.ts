@@ -10,6 +10,11 @@ export interface PendingEncryptedOp {
   ciphertext_hex: string;
 }
 
+export interface PendingEncryptedBlob {
+  blobId: string;
+  envelopeHex: string;
+}
+
 export type RemotePayload = RemoteV2Payload;
 
 export type RemoteV2Payload =
@@ -79,6 +84,8 @@ export interface RemoteV2BinaryFileRename extends RemoteV2BinaryBase {
   oldPath: string;
   newPath: string;
   contentHash?: string;
+  blobId?: string;
+  size?: number;
 }
 
 export type RemoteV2FileDelete = RemoteV2MarkdownFileDelete | RemoteV2BinaryFileDelete;

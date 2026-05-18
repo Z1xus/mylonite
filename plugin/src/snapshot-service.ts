@@ -24,26 +24,55 @@ export async function createEncryptedSnapshot(
 ): Promise<EncryptedSnapshotUpload> {
   const entries: SnapshotEntry[] = [];
   const index = VaultStateIndex.fromSnapshot(state);
+  const snapshotIndex = new VaultStateIndex();
+  const now = Date.now();
   for (const file of vault.getFiles()) {
     const path = normalizeVaultPath(file.path, "invalid snapshot path");
     if (file.extension === "md") {
       const content = await vault.read(file);
       const contentHash = hashText(content);
-      const fileId = index.byPath(path)?.fileId ?? newFileId();
+      const previous = index.byPath(path);
+      const fileId = previous?.fileId ?? newFileId();
       entries.push({ kind: "markdown", path, fileId, contentHash, content });
+      snapshotIndex.upsertFile({
+        fileId,
+        path,
+        kind: "markdown",
+        contentHash,
+        tombstone: false,
+        lastLocalSeq: previous?.lastLocalSeq ?? 0,
+        lastRemoteSeq: Math.max(previous?.lastRemoteSeq ?? 0, coversThroughSeq),
+        updatedAtMs: previous?.updatedAtMs ?? now,
+      });
       continue;
     }
     const bytes = new Uint8Array(await vault.readBinary(file as TFile));
     const { blobId, envelope } = encryptBlob(keys, vaultId, bytes);
     await putBlob(blobId, envelope);
-    entries.push({ kind: "binary", path, fileId: index.byPath(path)?.fileId ?? newFileId(), contentHash: hashBytes(bytes), blobId, size: bytes.byteLength });
+    const previous = index.byPath(path);
+    const fileId = previous?.fileId ?? newFileId();
+    const contentHash = hashBytes(bytes);
+    entries.push({ kind: "binary", path, fileId, contentHash, blobId, size: bytes.byteLength });
+    snapshotIndex.upsertFile({
+      fileId,
+      path,
+      kind: "binary",
+      contentHash,
+      blobId,
+      size: bytes.byteLength,
+      tombstone: false,
+      lastLocalSeq: previous?.lastLocalSeq ?? 0,
+      lastRemoteSeq: Math.max(previous?.lastRemoteSeq ?? 0, coversThroughSeq),
+      updatedAtMs: previous?.updatedAtMs ?? now,
+    });
   }
+  const snapshotState = snapshotIndex.toSnapshot();
 
   const snapshotId = randomHex(16);
   const encrypted = encryptSnapshot(keys, vaultId, snapshotId, coversThroughSeq, {
     version: 1,
     entries,
-    state: state ?? { version: 1, files: [], tombstones: [] },
+    state: { ...snapshotState, tombstones: state?.tombstones ?? [] },
   });
   return {
     snapshotId,
