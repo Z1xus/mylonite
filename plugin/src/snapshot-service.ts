@@ -8,6 +8,8 @@ import { applyBinaryUpsert, applyMarkdownUpsert, normalizeVaultPath } from "./va
 import { VaultStateIndex } from "./state-index";
 import { hashBytes, hashText, newFileId, VaultStateSnapshot } from "./sync-state";
 
+const SLOW_SNAPSHOT_FILE_MS = 50;
+
 export interface EncryptedSnapshotUpload {
   snapshotId: string;
   nonceHex: string;
@@ -21,12 +23,14 @@ export async function createEncryptedSnapshot(
   coversThroughSeq: number,
   putBlob: (blobId: string, bytes: Uint8Array) => Promise<void>,
   state?: VaultStateSnapshot,
+  debug?: (message: string) => void,
 ): Promise<EncryptedSnapshotUpload> {
   const entries: SnapshotEntry[] = [];
   const index = VaultStateIndex.fromSnapshot(state);
   const snapshotIndex = new VaultStateIndex();
   const now = Date.now();
   for (const file of vault.getFiles()) {
+    const started = performance.now();
     const path = normalizeVaultPath(file.path, "invalid snapshot path");
     if (file.extension === "md") {
       const content = await vault.read(file);
@@ -44,6 +48,7 @@ export async function createEncryptedSnapshot(
         lastRemoteSeq: Math.max(previous?.lastRemoteSeq ?? 0, coversThroughSeq),
         updatedAtMs: previous?.updatedAtMs ?? now,
       });
+      logSlowSnapshotFile("snapshot read markdown", path, started, debug);
       continue;
     }
     const bytes = new Uint8Array(await vault.readBinary(file as TFile));
@@ -65,6 +70,7 @@ export async function createEncryptedSnapshot(
       lastRemoteSeq: Math.max(previous?.lastRemoteSeq ?? 0, coversThroughSeq),
       updatedAtMs: previous?.updatedAtMs ?? now,
     });
+    logSlowSnapshotFile("snapshot read binary", path, started, debug);
   }
   const snapshotState = snapshotIndex.toSnapshot();
 
@@ -89,6 +95,7 @@ export async function restoreEncryptedSnapshot(
   snapshot: SnapshotRecord,
   loadBlob: (entry: SnapshotBinaryEntry) => Promise<Uint8Array>,
   deleteMissing = false,
+  debug?: (message: string) => void,
 ): Promise<SnapshotPayload> {
   const payload = decryptSnapshot<SnapshotPayload>(
     keys,
@@ -101,14 +108,17 @@ export async function restoreEncryptedSnapshot(
   validateSnapshotPayload(payload);
   const snapshotPaths = new Set(payload.entries.map((entry) => normalizeVaultPath(entry.path, "invalid snapshot path")));
   for (const entry of payload.entries) {
+    const started = performance.now();
     if (entry.kind === "markdown") {
       await applyMarkdownUpsert(vault, suppressedPaths, entry.path, entry.content);
+      logSlowSnapshotFile("snapshot restore markdown", entry.path, started, debug);
     } else {
       const bytes = await loadBlob(entry);
       if (bytes.byteLength !== entry.size) {
         throw new Error("snapshot binary size mismatch");
       }
       await applyBinaryUpsert(vault, suppressedPaths, entry.path, bytes);
+      logSlowSnapshotFile("snapshot restore binary", entry.path, started, debug);
     }
   }
   if (!deleteMissing) {
@@ -154,4 +164,11 @@ export function validateSnapshotPayload(payload: unknown): asserts payload is Sn
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function logSlowSnapshotFile(label: string, path: string, started: number, debug?: (message: string) => void): void {
+  const elapsedMs = performance.now() - started;
+  if (elapsedMs >= SLOW_SNAPSHOT_FILE_MS && debug) {
+    debug(`slow sync span ${label} ${path}: ${elapsedMs.toFixed(1)}ms`);
+  }
 }

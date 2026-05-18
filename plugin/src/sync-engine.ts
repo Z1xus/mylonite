@@ -33,6 +33,7 @@ export const OFFLINE_POLL_INTERVAL_MS = 15_000;
 export const LIVE_POLL_INTERVAL_MS = 60_000;
 export const WEBSOCKET_RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 15_000] as const;
 const MAX_REPORTED_CONFLICTS = 256;
+const SLOW_SYNC_SPAN_MS = 50;
 
 export interface SyncEngineHost extends Plugin {
   settings: MyloniteSettings;
@@ -146,6 +147,10 @@ export class SyncEngine {
   }
 
   async catchUp(): Promise<void> {
+    await this.measure("catchUp", async () => this.catchUpInner());
+  }
+
+  private async catchUpInner(): Promise<void> {
     if (!this.host.settings.vaultId || !this.host.settings.deviceId) {
       return;
     }
@@ -162,7 +167,7 @@ export class SyncEngine {
         continue;
       }
       for (const op of ops) {
-        await this.applyRemoteOp(op);
+        await this.measure(`applyRemoteOp seq=${op.server_seq} kind=${op.kind}`, () => this.applyRemoteOp(op));
         this.host.settings.lastServerSeq = Math.max(this.host.settings.lastServerSeq, op.server_seq);
         this.host.settings.lamport = Math.max(this.host.settings.lamport, op.lamport);
         appliedCount += 1;
@@ -175,6 +180,10 @@ export class SyncEngine {
   }
 
   async createSnapshot(options: { silent?: boolean } = {}): Promise<void> {
+    await this.measure("createSnapshot", async () => this.createSnapshotInner(options));
+  }
+
+  private async createSnapshotInner(options: { silent?: boolean }): Promise<void> {
     if (!this.host.settings.vaultId || !this.host.settings.deviceId) {
       if (!options.silent) {
         new Notice("Device is not paired. Pair it before creating a snapshot.");
@@ -189,6 +198,7 @@ export class SyncEngine {
       this.host.settings.lastServerSeq,
       async (blobId, envelope) => this.host.createApiClient().putBlob(this.host.settings.vaultId, blobId, envelope),
       this.stateIndex.toSnapshot(),
+      (message) => this.host.debug(message),
     );
     await this.host.createApiClient().putSnapshot(this.host.settings.vaultId, {
       snapshot_id: encrypted.snapshotId,
@@ -205,6 +215,10 @@ export class SyncEngine {
   }
 
   async restoreLatestSnapshot(options: { deleteMissing?: boolean; silent?: boolean; requireSnapshot?: boolean } = {}): Promise<void> {
+    await this.measure("restoreLatestSnapshot", async () => this.restoreLatestSnapshotInner(options));
+  }
+
+  private async restoreLatestSnapshotInner(options: { deleteMissing?: boolean; silent?: boolean; requireSnapshot?: boolean }): Promise<void> {
     if (!this.host.settings.vaultId || !this.host.settings.deviceId) {
       if (!options.silent) {
         new Notice("Device is not paired. Pair it before restoring a snapshot.");
@@ -274,6 +288,10 @@ export class SyncEngine {
   }
 
   private async pushMarkdownUpdate(file: TFile): Promise<void> {
+    await this.measure(`pushMarkdownUpdate ${file.path}`, async () => this.pushMarkdownUpdateInner(file));
+  }
+
+  private async pushMarkdownUpdateInner(file: TFile): Promise<void> {
     if (!this.host.settings.vaultId || !this.host.settings.deviceId || file.extension !== "md") {
       return;
     }
@@ -302,6 +320,10 @@ export class SyncEngine {
   }
 
   private async pushBinaryUpdate(file: TFile): Promise<void> {
+    await this.measure(`pushBinaryUpdate ${file.path}`, async () => this.pushBinaryUpdateInner(file));
+  }
+
+  private async pushBinaryUpdateInner(file: TFile): Promise<void> {
     if (!this.host.settings.vaultId || !this.host.settings.deviceId || file.extension === "md") {
       return;
     }
@@ -443,7 +465,7 @@ export class SyncEngine {
   ): Promise<void> {
     const keys = await this.host.loadVaultKeys();
     const lamport = this.host.settings.lamport + 1;
-    const op = encodeEncryptedOp(keys, this.host.settings.vaultId, this.host.settings.deviceId, lamport, kind, payloadObject);
+    const op = this.measureSync(`encodeEncryptedOp kind=${kind}`, () => encodeEncryptedOp(keys, this.host.settings.vaultId, this.host.settings.deviceId, lamport, kind, payloadObject));
     const normalizedChangedPaths = affectedPaths.map((path) => normalizeVaultPath(path));
     this.pendingOpPaths.set(op.client_op_id, normalizedChangedPaths);
     this.pendingOpFileIds.set(op.client_op_id, changedFileIds);
@@ -467,7 +489,7 @@ export class SyncEngine {
     }
     this.host.settings.lamport = lamport;
     this.persistSyncState();
-    await this.host.saveSettings();
+    await this.measure("saveSettings after pushEncryptedOp", () => this.host.saveSettings());
   }
 
   private async pushFileCreate(file: TFile): Promise<void> {
@@ -620,7 +642,7 @@ export class SyncEngine {
   }
 
   private async handleSocketMessage(data: ArrayBuffer): Promise<void> {
-    const frame = decodeFrame(new Uint8Array(data));
+    const frame = this.measureSync("decode websocket frame", () => decodeFrame(new Uint8Array(data)));
     if (frame.kind === ServerMsgKind.HelloChallenge) {
       this.sendWebSocketHello(frame.payload);
       return;
@@ -634,7 +656,7 @@ export class SyncEngine {
     if (frame.kind !== ServerMsgKind.OpBroadcast) {
       return;
     }
-    const op = JSON.parse(new TextDecoder().decode(frame.payload)) as unknown;
+    const op = this.measureSync("parse websocket op", () => JSON.parse(new TextDecoder().decode(frame.payload)) as unknown);
     validateRemoteOpRecord(op);
     if (op.server_seq <= this.host.settings.lastServerSeq) {
       return;
@@ -643,12 +665,12 @@ export class SyncEngine {
       await this.catchUp();
       return;
     }
-    await this.applyRemoteOp(op);
+    await this.measure(`applyRemoteOp websocket seq=${op.server_seq} kind=${op.kind}`, () => this.applyRemoteOp(op));
     this.host.settings.lastServerSeq = Math.max(this.host.settings.lastServerSeq, op.server_seq);
     this.host.settings.lamport = Math.max(this.host.settings.lamport, op.lamport);
     this.clearDirtyPathsForOp(op.client_op_id);
     this.removePendingOp(op.client_op_id);
-    await this.host.saveSettings();
+    await this.measure("saveSettings after websocket op", () => this.host.saveSettings());
   }
 
   private sendWebSocketHello(payload: Uint8Array): void {
@@ -759,7 +781,7 @@ export class SyncEngine {
       return;
     }
     const keys = await this.host.loadVaultKeys();
-    const payload = decodeEncryptedOpPayload(keys, this.host.settings.vaultId, op) as RemotePayload;
+    const payload = this.measureSync(`decodeEncryptedOpPayload seq=${op.server_seq}`, () => decodeEncryptedOpPayload(keys, this.host.settings.vaultId, op) as RemotePayload);
     validateRemotePayload(payload);
     await this.applyRemoteV2Payload(payload, op.server_seq);
     this.persistSyncState();
@@ -914,14 +936,14 @@ export class SyncEngine {
     if ((payload.kind === "file-create" || payload.kind === "file-copy") && payload.fileKind === "markdown") {
       applyMarkdownUpdate(this.ydoc, requiredMarkdownUpdateHex(payload));
       const content = getMarkdownText(this.ytree, markdownContentPath(payload))?.toString() ?? "";
-      const result = await applyMarkdownUpsertWithCollision(this.host.app.vault, this.suppressedPaths, targetPath, content, payload.fileId, allowOverwrite);
+      const result = await this.measure(`applyMarkdownUpsert ${targetPath}`, () => applyMarkdownUpsertWithCollision(this.host.app.vault, this.suppressedPaths, targetPath, content, payload.fileId, allowOverwrite));
       this.recordRemoteFile(payload.fileId, result.path, "markdown", payload.contentHash, serverSeq);
       return;
     }
     if (payload.kind === "file-update" && payload.fileKind === "markdown") {
       applyMarkdownUpdate(this.ydoc, requiredMarkdownUpdateHex(payload));
       const content = getMarkdownText(this.ytree, markdownContentPath(payload))?.toString() ?? "";
-      const result = await applyMarkdownUpsertWithCollision(this.host.app.vault, this.suppressedPaths, targetPath, content, payload.fileId, allowOverwrite);
+      const result = await this.measure(`applyMarkdownUpsert ${targetPath}`, () => applyMarkdownUpsertWithCollision(this.host.app.vault, this.suppressedPaths, targetPath, content, payload.fileId, allowOverwrite));
       this.recordRemoteFile(payload.fileId, result.path, "markdown", payload.contentHash, serverSeq);
       return;
     }
@@ -929,8 +951,8 @@ export class SyncEngine {
       if (!payload.blobId) {
         throw new Error("missing v2 binary blob id");
       }
-      const plaintext = await this.loadRemoteBinaryBlob(payload.blobId);
-      const result = await applyBinaryUpsertWithCollision(this.host.app.vault, this.suppressedPaths, targetPath, plaintext, payload.fileId, allowOverwrite);
+      const plaintext = await this.measure(`loadRemoteBinaryBlob ${payload.blobId}`, () => this.loadRemoteBinaryBlob(payload.blobId));
+      const result = await this.measure(`applyBinaryUpsert ${targetPath}`, () => applyBinaryUpsertWithCollision(this.host.app.vault, this.suppressedPaths, targetPath, plaintext, payload.fileId, allowOverwrite));
       this.recordRemoteFile(payload.fileId, result.path, "binary", payload.contentHash, serverSeq, { blobId: payload.blobId, size: payload.size });
     }
   }
@@ -952,8 +974,8 @@ export class SyncEngine {
       );
       return null;
     }
-    const plaintext = await this.loadRemoteBinaryBlob(blobId);
-    const result = await applyBinaryUpsertWithCollision(this.host.app.vault, this.suppressedPaths, targetPath, plaintext, payload.fileId, false);
+    const plaintext = await this.measure(`loadRemoteBinaryBlob ${blobId}`, () => this.loadRemoteBinaryBlob(blobId));
+    const result = await this.measure(`applyBinaryUpsert ${targetPath}`, () => applyBinaryUpsertWithCollision(this.host.app.vault, this.suppressedPaths, targetPath, plaintext, payload.fileId, false));
     return result.path;
   }
 
@@ -1011,7 +1033,7 @@ export class SyncEngine {
 
   private async restoreSnapshot(snapshot: SnapshotRecord, deleteMissing: boolean): Promise<void> {
     const keys = await this.host.loadVaultKeys();
-    const payload = await restoreEncryptedSnapshot(
+    const payload = await this.measure(`restoreSnapshot ${snapshot.snapshot_id}`, () => restoreEncryptedSnapshot(
       this.host.app.vault,
       this.suppressedPaths,
       keys,
@@ -1019,7 +1041,8 @@ export class SyncEngine {
       snapshot,
       (entry) => this.loadSnapshotBinary(entry),
       deleteMissing,
-    );
+      (message) => this.host.debug(message),
+    ));
     if (payload.state) {
       this.host.settings.durableSyncState.index = payload.state;
       this.stateIndex = VaultStateIndex.fromSnapshot(payload.state);
@@ -1037,9 +1060,9 @@ export class SyncEngine {
     if (latest.covers_through_seq <= this.host.settings.lastServerSeq) {
       return false;
     }
-    await this.restoreSnapshot(latest, false);
+    await this.measure(`restoreSnapshotForCatchUp ${latest.snapshot_id}`, () => this.restoreSnapshot(latest, false));
     this.host.settings.lastServerSeq = latest.covers_through_seq;
-    await this.host.saveSettings();
+    await this.measure("saveSettings after snapshot catch-up", () => this.host.saveSettings());
     this.host.updateStatus("snapshot restored");
     return true;
   }
@@ -1050,7 +1073,31 @@ export class SyncEngine {
     if (!blobBytes) {
       throw new Error(`missing blob ${entry.blobId}`);
     }
-    return decryptBlobEnvelope(keys, this.host.settings.vaultId, entry.blobId, blobBytes);
+    return this.measureSync(`decryptSnapshotBinary ${entry.blobId}`, () => decryptBlobEnvelope(keys, this.host.settings.vaultId, entry.blobId, blobBytes));
+  }
+
+  private async measure<T>(label: string, fn: () => Promise<T>): Promise<T> {
+    const started = performance.now();
+    try {
+      return await fn();
+    } finally {
+      this.reportSlowSpan(label, performance.now() - started);
+    }
+  }
+
+  private measureSync<T>(label: string, fn: () => T): T {
+    const started = performance.now();
+    try {
+      return fn();
+    } finally {
+      this.reportSlowSpan(label, performance.now() - started);
+    }
+  }
+
+  private reportSlowSpan(label: string, elapsedMs: number): void {
+    if (elapsedMs >= SLOW_SYNC_SPAN_MS) {
+      this.host.debug(`slow sync span ${label}: ${elapsedMs.toFixed(1)}ms`);
+    }
   }
 }
 

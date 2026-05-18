@@ -103,7 +103,15 @@ export default class MylonitePlugin extends Plugin {
   }
 
   async saveSettings(): Promise<void> {
-    await this.saveData(this.settings);
+    const started = performance.now();
+    try {
+      await this.saveData(this.settings);
+    } finally {
+      const elapsedMs = performance.now() - started;
+      if (elapsedMs >= 50) {
+        this.debug(`slow sync span saveData settings: ${elapsedMs.toFixed(1)}ms`);
+      }
+    }
   }
 
   async pairFirstDevice(): Promise<void> {
