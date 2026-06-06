@@ -11,7 +11,7 @@ import {
   validatePairingRequestShape,
 } from "./pairing";
 import { qrSvgDataUrl } from "./qr";
-import { DurableSyncState, PendingEncryptedBlob, PendingEncryptedOp } from "./sync-types";
+import { DurableSyncState, MarkdownRecoveryEntry, PendingEncryptedBlob, PendingEncryptedOp } from "./sync-types";
 
 export interface MyloniteSettings {
   serverUrl: string;
@@ -23,6 +23,7 @@ export interface MyloniteSettings {
   lastServerSeq: number;
   pendingBlobs: PendingEncryptedBlob[];
   pendingOps: PendingEncryptedOp[];
+  recoveryLog: MarkdownRecoveryEntry[];
   durableSyncState: DurableSyncState;
   deviceId: string;
   devicePrivateKeyHex: string;
@@ -48,6 +49,7 @@ export const DEFAULT_SETTINGS: MyloniteSettings = {
   lastServerSeq: 0,
   pendingBlobs: [],
   pendingOps: [],
+  recoveryLog: [],
   durableSyncState: {
     version: 1,
     index: { version: 1, files: [], tombstones: [] },

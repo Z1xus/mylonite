@@ -1,4 +1,4 @@
-import { Notice, Plugin } from "obsidian";
+import { Notice, Plugin, TFile } from "obsidian";
 
 import { MyloniteApiClient, PairingGrantPayload } from "./api";
 import {
@@ -56,12 +56,17 @@ export default class MylonitePlugin extends Plugin {
     this.addCommand({
       id: "show-sync-status",
       name: "show sync status",
-      callback: () => new Notice(this.statusText()),
+      callback: () => new Notice(this.syncEngine.syncStatusSummary()),
     });
     this.addCommand({
       id: "sync-now",
       name: "sync now",
-      callback: () => void this.syncEngine.catchUp().catch((error) => new Notice(`Sync failed. Check the server URL and try again. ${String(error)}`)),
+      callback: () => void this.syncEngine.syncNow().catch((error) => new Notice(`Sync failed. Check the server URL and try again. ${String(error)}`)),
+    });
+    this.addCommand({
+      id: "restore-last-local-edit",
+      name: "restore last local edit for current file",
+      callback: () => void this.restoreLastLocalEditForCurrentFile(),
     });
     this.addCommand({
       id: "create-snapshot",
@@ -141,6 +146,7 @@ export default class MylonitePlugin extends Plugin {
       this.settings.pairingToken = "";
       this.settings.pendingBlobs = [];
       this.settings.pendingOps = [];
+      this.settings.recoveryLog = [];
       storeDevicePrivateKey(this.app, this.settings, keypair.privateKeyHex);
       storePassphrase(this.app, this.settings, randomHex(32));
       this.vaultKeys = null;
@@ -330,6 +336,7 @@ export default class MylonitePlugin extends Plugin {
       this.settings.lamport = 0;
       this.settings.pendingBlobs = [];
       this.settings.pendingOps = [];
+      this.settings.recoveryLog = [];
       clearDevicePairingPrivateKey(this.app, this.settings);
       this.settings.devicePairingInvite = "";
       this.settings.devicePairingSessionId = "";
@@ -542,6 +549,16 @@ export default class MylonitePlugin extends Plugin {
     await this.syncEngine.restoreLatestSnapshot();
   }
 
+  async restoreLastLocalEditForCurrentFile(): Promise<void> {
+    const file = this.app.workspace.getActiveFile();
+    if (!(file instanceof TFile) || file.extension !== "md") {
+      new Notice("Open a markdown file before restoring a local edit.");
+      return;
+    }
+    const restored = await this.syncEngine.restoreLatestRecoveryForPath(file.path);
+    new Notice(restored ? "Restored the last local edit for this file." : "No local recovery entry found for this file.");
+  }
+
   async unpairDevice(): Promise<void> {
     const confirmed = window.confirm("Unpair this device? It will stop syncing immediately.");
     if (!confirmed) {
@@ -565,6 +582,7 @@ export default class MylonitePlugin extends Plugin {
     this.settings.lastServerSeq = 0;
     this.settings.pendingBlobs = [];
     this.settings.pendingOps = [];
+    this.settings.recoveryLog = [];
     this.settings.durableSyncState = {
       version: 1,
       index: { version: 1, files: [], tombstones: [] },
@@ -585,13 +603,6 @@ export default class MylonitePlugin extends Plugin {
     if (this.status) {
       this.status.setText(`Mylonite: ${state}`);
     }
-  }
-
-  private statusText(): string {
-    if (!this.settings.serverUrl || !this.settings.vaultId) {
-      return "Not paired. Pair this device to start syncing.";
-    }
-    return `Paired with vault ${this.settings.vaultId}.`;
   }
 
   debug(message: string): void {

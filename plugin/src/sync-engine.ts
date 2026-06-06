@@ -2,11 +2,11 @@ import { Notice, Plugin, TFile, normalizePath } from "obsidian";
 import * as Y from "yjs";
 
 import { EncryptedOpRecord, MyloniteApiClient, SnapshotRecord } from "./api";
-import { bytesToHex, hexToBytes, VaultKeys } from "./crypto";
+import { bytesToHex, hexToBytes, randomHex, VaultKeys } from "./crypto";
 import { ClientMsgKind, OpKind, ServerMsgKind, decodeFrame, encodeFrame } from "./protocol";
 import { createEncryptedSnapshot, restoreEncryptedSnapshot } from "./snapshot-service";
 import { decodeEncryptedOpPayload, decryptBlobEnvelope, encodeEncryptedOp, encryptBlob } from "./sync-codec";
-import { PendingEncryptedBlob, PendingEncryptedOp, RemotePayload, RemoteV2Payload, SnapshotBinaryEntry } from "./sync-types";
+import { MarkdownRecoveryEntry, PendingEncryptedBlob, PendingEncryptedOp, RemotePayload, RemoteV2Payload, SnapshotBinaryEntry } from "./sync-types";
 import {
   applyBinaryUpsertWithCollision,
   applyFileDelete,
@@ -33,6 +33,7 @@ export const OFFLINE_POLL_INTERVAL_MS = 15_000;
 export const LIVE_POLL_INTERVAL_MS = 60_000;
 export const WEBSOCKET_RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 15_000] as const;
 const MAX_REPORTED_CONFLICTS = 256;
+const MAX_RECOVERY_LOG_ENTRIES = 256;
 const SLOW_SYNC_SPAN_MS = 50;
 
 export interface SyncEngineHost extends Plugin {
@@ -68,6 +69,9 @@ export class SyncEngine {
   constructor(private readonly host: SyncEngineHost) {
     if (!Array.isArray(this.host.settings.pendingBlobs)) {
       this.host.settings.pendingBlobs = [];
+    }
+    if (!Array.isArray(this.host.settings.recoveryLog)) {
+      this.host.settings.recoveryLog = [];
     }
     if (!this.host.settings.durableSyncState) {
       this.host.settings.durableSyncState = {
@@ -107,7 +111,10 @@ export class SyncEngine {
   close(options: { flushScheduledUpdates?: boolean } = {}): void {
     this.manuallyClosed = true;
     if (options.flushScheduledUpdates ?? true) {
-      this.flushScheduledMarkdownUpdates();
+      void this.flushScheduledMarkdownUpdates().catch((error) => {
+        this.host.updateStatus("sync error");
+        this.host.debug(`flush before close failed: ${String(error)}`);
+      });
     } else {
       this.dropScheduledMarkdownUpdates();
     }
@@ -125,6 +132,9 @@ export class SyncEngine {
     this.pendingOpPaths.clear();
     this.pendingOpFileIds.clear();
     this.suppressedPaths.clear();
+    if (!Array.isArray(this.host.settings.recoveryLog)) {
+      this.host.settings.recoveryLog = [];
+    }
     this.rehydratePendingLocalState();
   }
 
@@ -144,6 +154,73 @@ export class SyncEngine {
         this.pendingOpFileIds.set(entry.clientOpId, [entry.fileId]);
       }
     }
+    const pendingClientOpIds = new Set(this.host.settings.pendingOps.map((op) => op.client_op_id));
+    for (const entry of this.host.settings.recoveryLog) {
+      if (!entry.clientOpId || !pendingClientOpIds.has(entry.clientOpId)) {
+        continue;
+      }
+      const path = normalizeVaultPath(entry.path);
+      this.locallyDirtyPaths.add(path);
+      this.locallyDirtyFileIds.add(entry.fileId);
+      this.pendingOpPaths.set(entry.clientOpId, [path]);
+      this.pendingOpFileIds.set(entry.clientOpId, [entry.fileId]);
+    }
+  }
+
+  async syncNow(): Promise<void> {
+    await this.flushScheduledMarkdownUpdates();
+    await this.catchUp();
+    const queued = this.queuedLocalChangeCount();
+    if (queued > 0) {
+      const suffix = queued === 1 ? "edit is" : "edits are";
+      this.host.updateStatus(`${queued} local ${suffix} still queued`);
+      new Notice(`${queued} local ${suffix} still queued.`);
+      return;
+    }
+    this.host.updateStatus("sync complete");
+  }
+
+  syncStatusSummary(): string {
+    if (!this.host.settings.serverUrl || !this.host.settings.vaultId) {
+      return "Not paired. Pair this device to start syncing.";
+    }
+    return [
+      `Vault ${this.host.settings.vaultId}`,
+      `server seq ${this.host.settings.lastServerSeq}`,
+      `websocket ${this.socketLive ? "live" : "offline"}`,
+      `${this.host.settings.pendingBlobs.length} pending blobs`,
+      `${this.host.settings.pendingOps.length} pending ops`,
+      `${this.queuedLocalChangeCount()} queued local changes`,
+      `${this.host.settings.recoveryLog.length} recovery records`,
+    ].join("; ");
+  }
+
+  async restoreLatestRecoveryForPath(path: string): Promise<boolean> {
+    const normalizedPath = normalizeVaultPath(path);
+    const current = this.stateIndex.byPath(normalizedPath);
+    const recovery = [...this.host.settings.recoveryLog].reverse().find((entry) => {
+      if (normalizeVaultPath(entry.path) === normalizedPath) {
+        return true;
+      }
+      return current !== undefined && entry.fileId === current.fileId;
+    });
+    if (!recovery) {
+      return false;
+    }
+    await applyMarkdownUpsertWithCollision(
+      this.host.app.vault,
+      this.suppressedPaths,
+      normalizedPath,
+      recovery.afterContent,
+      recovery.fileId,
+      true,
+    );
+    this.suppressedPaths.delete(normalizedPath);
+    const file = this.host.app.vault.getFileByPath(normalizedPath);
+    if (file instanceof TFile) {
+      await this.pushMarkdownUpdate(file);
+    }
+    return true;
   }
 
   async catchUp(): Promise<void> {
@@ -302,11 +379,12 @@ export class SyncEngine {
       return;
     }
     this.locallyDirtyPaths.add(normalizedPath);
+    const beforeContent = getMarkdownText(this.ytree, normalizedPath)?.toString() ?? "";
     const content = await this.host.app.vault.read(file);
     const transition = this.classifier.classifyModify({ path: normalizedPath, kind: "markdown", content });
     this.queueTransition(transition);
     const updateHex = this.updateMarkdownYjs(normalizedPath, content);
-    await this.pushEncryptedOp(OpKind.FileUpdate, [normalizedPath], {
+    const clientOpId = await this.pushEncryptedOp(OpKind.FileUpdate, [normalizedPath], {
       version: 2,
       kind: "file-update",
       fileId: transition.fileId,
@@ -316,6 +394,8 @@ export class SyncEngine {
       baseHash: transition.baseHash,
       contentHash: transition.contentHash,
     }, [transition.fileId], transition.transitionId);
+    this.recordMarkdownRecovery(transition, normalizedPath, beforeContent, content, clientOpId);
+    await this.host.saveSettings();
     this.host.updateStatus("synced local change");
   }
 
@@ -407,11 +487,12 @@ export class SyncEngine {
     this.locallyDirtyPaths.add(normalizedOldPath);
     this.locallyDirtyPaths.add(normalizedNewPath);
     if (file.extension === "md") {
+      const beforeContent = getMarkdownText(this.ytree, normalizedOldPath)?.toString() ?? "";
       const content = await this.host.app.vault.read(file);
       const transition = this.classifier.classifyRename(normalizedOldPath, { path: normalizedNewPath, kind: "markdown", content });
       this.queueTransition(transition);
       const updateHex = this.renameMarkdownYjs(normalizedOldPath, normalizedNewPath, content);
-      await this.pushEncryptedOp(OpKind.FileRename, [normalizedOldPath, normalizedNewPath], {
+      const clientOpId = await this.pushEncryptedOp(OpKind.FileRename, [normalizedOldPath, normalizedNewPath], {
         version: 2,
         kind: "file-rename",
         fileId: transition.fileId,
@@ -422,6 +503,8 @@ export class SyncEngine {
         contentHash: transition.contentHash,
         updateHex,
       }, [transition.fileId], transition.transitionId);
+      this.recordMarkdownRecovery(transition, normalizedNewPath, beforeContent, content, clientOpId);
+      await this.host.saveSettings();
       this.host.updateStatus("synced local rename");
       return;
     }
@@ -462,7 +545,7 @@ export class SyncEngine {
     changedFileIds: string[] = [],
     transitionId?: string,
     options: { forceQueue?: boolean } = {},
-  ): Promise<void> {
+  ): Promise<string> {
     const keys = await this.host.loadVaultKeys();
     const lamport = this.host.settings.lamport + 1;
     const op = this.measureSync(`encodeEncryptedOp kind=${kind}`, () => encodeEncryptedOp(keys, this.host.settings.vaultId, this.host.settings.deviceId, lamport, kind, payloadObject));
@@ -479,8 +562,6 @@ export class SyncEngine {
         this.sendWebSocketOpPush(op);
       } else {
         await this.host.createApiClient().appendOp(this.host.settings.vaultId, op);
-        this.clearDirtyPathsForOp(op.client_op_id);
-        this.acknowledgeTransition(transitionId);
       }
     } catch (error) {
       this.host.settings.pendingOps.push(op);
@@ -490,6 +571,7 @@ export class SyncEngine {
     this.host.settings.lamport = lamport;
     this.persistSyncState();
     await this.measure("saveSettings after pushEncryptedOp", () => this.host.saveSettings());
+    return op.client_op_id;
   }
 
   private async pushFileCreate(file: TFile): Promise<void> {
@@ -506,7 +588,7 @@ export class SyncEngine {
       const transition = this.classifier.classifyCreate({ path: normalizedPath, kind: "markdown", content });
       this.queueTransition(transition);
       const updateHex = this.updateMarkdownYjs(normalizedPath, content);
-      await this.pushEncryptedOp(transition.kind === "file-copy" ? OpKind.FileCopy : OpKind.FileCreate, [normalizedPath], {
+      const clientOpId = await this.pushEncryptedOp(transition.kind === "file-copy" ? OpKind.FileCopy : OpKind.FileCreate, [normalizedPath], {
         version: 2,
         kind: transition.kind,
         fileId: transition.fileId,
@@ -517,6 +599,8 @@ export class SyncEngine {
         updateHex,
         contentHash: transition.contentHash,
       }, [transition.fileId], transition.transitionId);
+      this.recordMarkdownRecovery(transition, normalizedPath, "", content, clientOpId);
+      await this.host.saveSettings();
       return;
     }
     const keys = await this.host.loadVaultKeys();
@@ -594,8 +678,6 @@ export class SyncEngine {
     for (const [index, op] of this.host.settings.pendingOps.entries()) {
       try {
         await client.appendOp(this.host.settings.vaultId, op);
-        this.clearDirtyPathsForOp(op.client_op_id);
-        this.acknowledgeTransitionByClientOp(op.client_op_id);
       } catch (error) {
         remaining.push(...retainUnflushedPendingOps(this.host.settings.pendingOps, index));
         this.host.debug(`pending op flush stopped: ${String(error)}`);
@@ -727,16 +809,15 @@ export class SyncEngine {
     this.modifyTimers.delete(path);
   }
 
-  private flushScheduledMarkdownUpdates(): void {
+  private async flushScheduledMarkdownUpdates(): Promise<void> {
     const pending = Array.from(this.modifyTimers.entries());
     this.modifyTimers.clear();
+    const pushes: Promise<void>[] = [];
     for (const [, { file, timer }] of pending) {
       window.clearTimeout(timer);
-      void this.pushMarkdownUpdate(file).catch((error) => {
-        this.host.updateStatus("sync error");
-        this.host.debug(`flush before close failed: ${String(error)}`);
-      });
+      pushes.push(this.pushMarkdownUpdate(file));
     }
+    await Promise.all(pushes);
   }
 
   private dropScheduledMarkdownUpdates(): void {
@@ -778,6 +859,7 @@ export class SyncEngine {
   private async applyRemoteOp(op: EncryptedOpRecord): Promise<void> {
     validateRemoteOpRecord(op);
     if (op.device_id === this.host.settings.deviceId) {
+      this.confirmLocalOp(op.client_op_id);
       return;
     }
     const keys = await this.host.loadVaultKeys();
@@ -816,6 +898,28 @@ export class SyncEngine {
     this.persistSyncState();
   }
 
+  private recordMarkdownRecovery(
+    transition: SyncJournalEntry,
+    path: string,
+    beforeContent: string,
+    afterContent: string,
+    clientOpId: string,
+  ): void {
+    const entry: MarkdownRecoveryEntry = {
+      recoveryId: `r${randomHex(16)}`,
+      path: normalizeVaultPath(path),
+      fileId: transition.fileId,
+      baseHash: transition.baseHash,
+      contentHash: transition.contentHash,
+      beforeContent,
+      afterContent,
+      observedAtMs: transition.observedAtMs,
+      clientOpId,
+    };
+    this.host.settings.recoveryLog.push(entry);
+    this.host.settings.recoveryLog = this.host.settings.recoveryLog.slice(-MAX_RECOVERY_LOG_ENTRIES);
+  }
+
   private attachOpToTransition(transitionId: string | undefined, clientOpId: string): void {
     if (!transitionId) {
       return;
@@ -851,8 +955,28 @@ export class SyncEngine {
     this.host.settings.durableSyncState.journal = this.host.settings.durableSyncState.journal.slice(-2048);
   }
 
+  private queuedLocalChangeCount(): number {
+    return this.host.settings.durableSyncState.journal.filter((entry) => entry.status !== "acknowledged" && entry.status !== "applied").length;
+  }
+
+  private rebuildDirtyTracking(): void {
+    this.locallyDirtyPaths.clear();
+    this.locallyDirtyFileIds.clear();
+    this.pendingOpPaths.clear();
+    this.pendingOpFileIds.clear();
+    this.rehydratePendingLocalState();
+  }
+
   private removePendingOp(clientOpId: string): void {
     this.host.settings.pendingOps = this.host.settings.pendingOps.filter((op) => op.client_op_id !== clientOpId);
+  }
+
+  private confirmLocalOp(clientOpId: string): void {
+    this.acknowledgeTransitionByClientOp(clientOpId);
+    this.removePendingOp(clientOpId);
+    this.pendingOpPaths.delete(clientOpId);
+    this.pendingOpFileIds.delete(clientOpId);
+    this.rebuildDirtyTracking();
   }
 
   private updateMarkdownYjs(path: string, content: string): string {
@@ -881,6 +1005,13 @@ export class SyncEngine {
         applyMarkdownUpdate(this.ydoc, requiredMarkdownUpdateHex(payload));
       }
       const targetPath = decision.action === "conflict-path" ? decision.path : payload.newPath;
+      if (payload.fileKind === "markdown" && decision.action === "conflict-path" && this.locallyDirtyFileIds.has(payload.fileId)) {
+        const finalPath = await this.materializeMissingRenamedFile(payload, targetPath);
+        if (finalPath) {
+          this.reportConflictOnce("kept-both", decision.reason, [payload.newPath, finalPath], payload.fileId);
+        }
+        return;
+      }
       const result = await applyFileRenameWithCollision(this.host.app.vault, this.suppressedPaths, payload.oldPath, targetPath, payload.fileId);
       const finalPath = result.status === "missing-local-file"
         ? await this.materializeMissingRenamedFile(payload, targetPath)
@@ -925,26 +1056,31 @@ export class SyncEngine {
     }
     if (payload.kind === "file-update") {
       const path = decision.action === "conflict-path" ? decision.path : payload.path;
-      await this.applyRemoteV2Content(payload, path, decision.action !== "conflict-path", serverSeq);
+      const recordRemote = !(payload.fileKind === "markdown" && decision.action === "conflict-path" && this.locallyDirtyFileIds.has(payload.fileId));
+      await this.applyRemoteV2Content(payload, path, decision.action !== "conflict-path", serverSeq, recordRemote);
       if (decision.action === "conflict-path") {
         this.reportConflictOnce("kept-both", decision.reason, [payload.path, path], payload.fileId);
       }
     }
   }
 
-  private async applyRemoteV2Content(payload: RemoteV2Payload & { fileId: string }, targetPath: string, allowOverwrite: boolean, serverSeq: number): Promise<void> {
+  private async applyRemoteV2Content(payload: RemoteV2Payload & { fileId: string }, targetPath: string, allowOverwrite: boolean, serverSeq: number, recordRemote = true): Promise<void> {
     if ((payload.kind === "file-create" || payload.kind === "file-copy") && payload.fileKind === "markdown") {
       applyMarkdownUpdate(this.ydoc, requiredMarkdownUpdateHex(payload));
       const content = getMarkdownText(this.ytree, markdownContentPath(payload))?.toString() ?? "";
       const result = await this.measure(`applyMarkdownUpsert ${targetPath}`, () => applyMarkdownUpsertWithCollision(this.host.app.vault, this.suppressedPaths, targetPath, content, payload.fileId, allowOverwrite));
-      this.recordRemoteFile(payload.fileId, result.path, "markdown", payload.contentHash, serverSeq);
+      if (recordRemote) {
+        this.recordRemoteFile(payload.fileId, result.path, "markdown", payload.contentHash, serverSeq);
+      }
       return;
     }
     if (payload.kind === "file-update" && payload.fileKind === "markdown") {
       applyMarkdownUpdate(this.ydoc, requiredMarkdownUpdateHex(payload));
       const content = getMarkdownText(this.ytree, markdownContentPath(payload))?.toString() ?? "";
       const result = await this.measure(`applyMarkdownUpsert ${targetPath}`, () => applyMarkdownUpsertWithCollision(this.host.app.vault, this.suppressedPaths, targetPath, content, payload.fileId, allowOverwrite));
-      this.recordRemoteFile(payload.fileId, result.path, "markdown", payload.contentHash, serverSeq);
+      if (recordRemote) {
+        this.recordRemoteFile(payload.fileId, result.path, "markdown", payload.contentHash, serverSeq);
+      }
       return;
     }
     if ((payload.kind === "file-create" || payload.kind === "file-copy" || payload.kind === "file-update") && payload.fileKind === "binary") {

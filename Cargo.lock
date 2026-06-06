@@ -659,7 +659,7 @@ dependencies = [
 
 [[package]]
 name = "mylonite"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "anyhow",
  "axum",
@@ -685,7 +685,7 @@ dependencies = [
 
 [[package]]
 name = "mylonite-protocol"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "thiserror",
 ]

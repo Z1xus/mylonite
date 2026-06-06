@@ -15,6 +15,18 @@ export interface PendingEncryptedBlob {
   envelopeHex: string;
 }
 
+export interface MarkdownRecoveryEntry {
+  recoveryId: string;
+  path: string;
+  fileId: string;
+  baseHash?: string;
+  contentHash: string;
+  beforeContent: string;
+  afterContent: string;
+  observedAtMs: number;
+  clientOpId?: string;
+}
+
 export type RemotePayload = RemoteV2Payload;
 
 export type RemoteV2Payload =
