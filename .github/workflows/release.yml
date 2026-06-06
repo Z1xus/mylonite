@@ -63,7 +63,9 @@ jobs:
         with:
           subject-path: |
             dist/main.js
+            dist/manifest.json
             dist/styles.css
+            dist/mylonite-obsidian-plugin.zip
 
       - uses: actions/upload-artifact@v4
         with:
@@ -116,6 +118,11 @@ jobs:
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
 
+      - name: Attest server binary
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/${{ matrix.asset }}
+
       - uses: actions/upload-artifact@v4
         with:
           name: mylonite-${{ matrix.target }}
@@ -151,6 +158,7 @@ jobs:
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
 
       - uses: docker/build-push-action@v6
+        id: build
         with:
           context: .
           file: Dockerfile.release
@@ -159,6 +167,13 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Attest Docker image
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
 
   release:
     name: Publish GitHub Release

@@ -32,6 +32,20 @@ mylonite --version
 
 Other platforms: grab the matching binary from Releases and place it on your `PATH`.
 
+Release assets are signed with GitHub artifact attestations. After downloading a binary or plugin zip, verify its provenance with the GitHub CLI:
+
+```bash
+gh attestation verify ./mylonite-x86_64-unknown-linux-gnu -R z1xus/mylonite
+gh attestation verify ./mylonite-obsidian-plugin.zip -R z1xus/mylonite
+```
+
+The container image is attested too:
+
+```bash
+docker login ghcr.io
+gh attestation verify oci://ghcr.io/z1xus/mylonite:latest -R z1xus/mylonite
+```
+
 Create the config and the first vault's pairing token:
 
 ```bash
