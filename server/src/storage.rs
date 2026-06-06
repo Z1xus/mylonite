@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, bail};
 use rand::RngCore;
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadTransaction, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 const VAULTS: TableDefinition<&str, &[u8]> = TableDefinition::new("vaults");
@@ -118,6 +118,27 @@ pub struct StorageStats {
     pub blob_file_bytes: u64,
     pub total_storage_bytes: u64,
     pub data_dir: String,
+}
+
+#[derive(Debug, Default)]
+struct DeviceStats {
+    total: u64,
+    active: u64,
+    revoked: u64,
+}
+
+#[derive(Debug, Default)]
+struct PairingTokenStats {
+    total: u64,
+    active: u64,
+    consumed: u64,
+    expired: u64,
+}
+
+#[derive(Debug, Default)]
+struct BlobStats {
+    count: u64,
+    indexed_bytes: u64,
 }
 
 impl Storage {
@@ -634,116 +655,30 @@ impl Storage {
 
     pub fn stats(&self) -> anyhow::Result<StorageStats> {
         let read = self.db.begin_read().context("begin read")?;
-        let mut vault_count = 0_u64;
-        for item in read
-            .open_table(VAULTS)
-            .context("open vault table")?
-            .iter()
-            .context("iterate vaults")?
-        {
-            item.context("read vault row")?;
-            vault_count = vault_count.saturating_add(1);
-        }
+        let vault_count = count_rows(&read, VAULTS, "vaults")?;
+        let devices = collect_device_stats(&read)?;
+        let pairing_tokens = collect_pairing_token_stats(&read, now_unix()?)?;
+        let op_count = count_rows(&read, OPLOG, "oplog")?;
+        let snapshot_count = count_rows(&read, SNAPSHOTS, "snapshots")?;
+        let blobs = collect_blob_stats(&read)?;
 
-        let mut device_count = 0_u64;
-        let mut active_device_count = 0_u64;
-        let mut revoked_device_count = 0_u64;
-        for item in read
-            .open_table(DEVICES)
-            .context("open device table")?
-            .iter()
-            .context("iterate devices")?
-        {
-            let (_, value) = item.context("read device row")?;
-            let device: DeviceRecord =
-                serde_json::from_slice(value.value()).context("decode device row")?;
-            device_count = device_count.saturating_add(1);
-            if device.revoked_at_unix.is_some() {
-                revoked_device_count = revoked_device_count.saturating_add(1);
-            } else {
-                active_device_count = active_device_count.saturating_add(1);
-            }
-        }
-
-        let now = now_unix()?;
-        let mut pairing_token_count = 0_u64;
-        let mut active_pairing_token_count = 0_u64;
-        let mut consumed_pairing_token_count = 0_u64;
-        let mut expired_pairing_token_count = 0_u64;
-        for item in read
-            .open_table(PAIRING_TOKENS)
-            .context("open pairing token table")?
-            .iter()
-            .context("iterate pairing tokens")?
-        {
-            let (_, value) = item.context("read pairing token row")?;
-            let token: PairingTokenRecord =
-                serde_json::from_slice(value.value()).context("decode pairing token row")?;
-            pairing_token_count = pairing_token_count.saturating_add(1);
-            if token.consumed_at_unix.is_some() {
-                consumed_pairing_token_count = consumed_pairing_token_count.saturating_add(1);
-            } else if token.expires_at_unix < now {
-                expired_pairing_token_count = expired_pairing_token_count.saturating_add(1);
-            } else {
-                active_pairing_token_count = active_pairing_token_count.saturating_add(1);
-            }
-        }
-
-        let mut op_count = 0_u64;
-        for item in read
-            .open_table(OPLOG)
-            .context("open oplog")?
-            .iter()
-            .context("iterate oplog")?
-        {
-            item.context("read op row")?;
-            op_count = op_count.saturating_add(1);
-        }
-
-        let mut snapshot_count = 0_u64;
-        for item in read
-            .open_table(SNAPSHOTS)
-            .context("open snapshots")?
-            .iter()
-            .context("iterate snapshots")?
-        {
-            item.context("read snapshot row")?;
-            snapshot_count = snapshot_count.saturating_add(1);
-        }
-
-        let mut blob_count = 0_u64;
-        let mut indexed_blob_bytes = 0_u64;
-        for item in read
-            .open_table(BLOB_INDEX)
-            .context("open blob index")?
-            .iter()
-            .context("iterate blob index")?
-        {
-            let (_, value) = item.context("read blob row")?;
-            let blob: BlobRecord =
-                serde_json::from_slice(value.value()).context("decode blob row")?;
-            blob_count = blob_count.saturating_add(1);
-            indexed_blob_bytes = indexed_blob_bytes.saturating_add(blob.size);
-        }
-
-        let database_bytes = fs::metadata(self.data_dir.join("mylonite.redb"))
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
+        let database_bytes =
+            fs::metadata(self.data_dir.join("mylonite.redb")).map_or(0, |metadata| metadata.len());
         let blob_file_bytes = dir_size(&self.data_dir.join("blobs"))?;
         let total_storage_bytes = dir_size(&self.data_dir)?;
 
         Ok(StorageStats {
             vault_count,
-            device_count,
-            active_device_count,
-            revoked_device_count,
-            pairing_token_count,
-            active_pairing_token_count,
-            consumed_pairing_token_count,
-            expired_pairing_token_count,
+            device_count: devices.total,
+            active_device_count: devices.active,
+            revoked_device_count: devices.revoked,
+            pairing_token_count: pairing_tokens.total,
+            active_pairing_token_count: pairing_tokens.active,
+            consumed_pairing_token_count: pairing_tokens.consumed,
+            expired_pairing_token_count: pairing_tokens.expired,
             op_count,
-            blob_count,
-            indexed_blob_bytes,
+            blob_count: blobs.count,
+            indexed_blob_bytes: blobs.indexed_bytes,
             snapshot_count,
             database_bytes,
             blob_file_bytes,
@@ -843,6 +778,90 @@ fn write_json<T: Serialize>(
         .insert(key.as_ref(), bytes.as_slice())
         .context("insert json record")?;
     Ok(())
+}
+
+fn count_rows<V>(
+    read: &ReadTransaction,
+    table: TableDefinition<&str, V>,
+    table_name: &str,
+) -> anyhow::Result<u64>
+where
+    V: redb::Value + 'static,
+{
+    let mut count = 0_u64;
+    for item in read
+        .open_table(table)
+        .with_context(|| format!("open {table_name} table"))?
+        .iter()
+        .with_context(|| format!("iterate {table_name}"))?
+    {
+        item.with_context(|| format!("read {table_name} row"))?;
+        count = count.saturating_add(1);
+    }
+    Ok(count)
+}
+
+fn collect_device_stats(read: &ReadTransaction) -> anyhow::Result<DeviceStats> {
+    let mut stats = DeviceStats::default();
+    for item in read
+        .open_table(DEVICES)
+        .context("open device table")?
+        .iter()
+        .context("iterate devices")?
+    {
+        let (_, value) = item.context("read device row")?;
+        let device: DeviceRecord =
+            serde_json::from_slice(value.value()).context("decode device row")?;
+        stats.total = stats.total.saturating_add(1);
+        if device.revoked_at_unix.is_some() {
+            stats.revoked = stats.revoked.saturating_add(1);
+        } else {
+            stats.active = stats.active.saturating_add(1);
+        }
+    }
+    Ok(stats)
+}
+
+fn collect_pairing_token_stats(
+    read: &ReadTransaction,
+    now: u64,
+) -> anyhow::Result<PairingTokenStats> {
+    let mut stats = PairingTokenStats::default();
+    for item in read
+        .open_table(PAIRING_TOKENS)
+        .context("open pairing token table")?
+        .iter()
+        .context("iterate pairing tokens")?
+    {
+        let (_, value) = item.context("read pairing token row")?;
+        let token: PairingTokenRecord =
+            serde_json::from_slice(value.value()).context("decode pairing token row")?;
+        stats.total = stats.total.saturating_add(1);
+        if token.consumed_at_unix.is_some() {
+            stats.consumed = stats.consumed.saturating_add(1);
+        } else if token.expires_at_unix < now {
+            stats.expired = stats.expired.saturating_add(1);
+        } else {
+            stats.active = stats.active.saturating_add(1);
+        }
+    }
+    Ok(stats)
+}
+
+fn collect_blob_stats(read: &ReadTransaction) -> anyhow::Result<BlobStats> {
+    let mut stats = BlobStats::default();
+    for item in read
+        .open_table(BLOB_INDEX)
+        .context("open blob index")?
+        .iter()
+        .context("iterate blob index")?
+    {
+        let (_, value) = item.context("read blob row")?;
+        let blob: BlobRecord = serde_json::from_slice(value.value()).context("decode blob row")?;
+        stats.count = stats.count.saturating_add(1);
+        stats.indexed_bytes = stats.indexed_bytes.saturating_add(blob.size);
+    }
+    Ok(stats)
 }
 
 fn dir_size(path: &Path) -> anyhow::Result<u64> {

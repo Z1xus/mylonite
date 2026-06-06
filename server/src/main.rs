@@ -327,18 +327,27 @@ fn print_kv(label: &str, value: &str) {
 
 fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
-    let mut value = bytes as f64;
+    let mut divisor = 1_u64;
     let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
+    while bytes / divisor >= 1024 && unit < UNITS.len() - 1 {
+        divisor *= 1024;
         unit += 1;
     }
     if unit == 0 {
         format!("{bytes} B")
-    } else if value >= 10.0 {
-        format!("{value:.0} {}", UNITS[unit])
     } else {
-        format!("{value:.1} {}", UNITS[unit])
+        let mut whole = bytes / divisor;
+        let remainder = bytes % divisor;
+        let mut tenths = ((remainder * 10) + (divisor / 2)) / divisor;
+        if tenths == 10 {
+            whole += 1;
+            tenths = 0;
+        }
+        if whole >= 10 || tenths == 0 {
+            format!("{whole} {}", UNITS[unit])
+        } else {
+            format!("{whole}.{tenths} {}", UNITS[unit])
+        }
     }
 }
 
