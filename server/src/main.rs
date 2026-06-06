@@ -130,6 +130,37 @@ fn handle_stats(config_path: Option<&std::path::Path>) -> anyhow::Result<()> {
     let config = config::Config::load_or_default(config_path)?;
     let stats = with_admin_or_storage(&config, AdminClient::stats, storage::Storage::stats)?;
     println!("vaults={}", stats.vault_count);
+    println!("devices={}", stats.device_count);
+    println!("active_devices={}", stats.active_device_count);
+    println!("revoked_devices={}", stats.revoked_device_count);
+    println!("pairing_tokens={}", stats.pairing_token_count);
+    println!("active_pairing_tokens={}", stats.active_pairing_token_count);
+    println!(
+        "consumed_pairing_tokens={}",
+        stats.consumed_pairing_token_count
+    );
+    println!(
+        "expired_pairing_tokens={}",
+        stats.expired_pairing_token_count
+    );
+    println!("ops={}", stats.op_count);
+    println!("blobs={}", stats.blob_count);
+    println!("snapshots={}", stats.snapshot_count);
+    println!(
+        "indexed_blob_size={}",
+        format_bytes(stats.indexed_blob_bytes)
+    );
+    println!("database_size={}", format_bytes(stats.database_bytes));
+    println!("blob_file_size={}", format_bytes(stats.blob_file_bytes));
+    println!(
+        "total_storage_size={}",
+        format_bytes(stats.total_storage_bytes)
+    );
+    println!("indexed_blob_bytes={}", stats.indexed_blob_bytes);
+    println!("database_bytes={}", stats.database_bytes);
+    println!("blob_file_bytes={}", stats.blob_file_bytes);
+    println!("total_storage_bytes={}", stats.total_storage_bytes);
+    println!("data_dir={}", stats.data_dir);
     Ok(())
 }
 
@@ -292,6 +323,23 @@ fn print_status(label: &str, value: &str) {
 
 fn print_kv(label: &str, value: &str) {
     println!("  {} {}", dim(&format!("{label}:")), value);
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else if value >= 10.0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 fn green(text: &str) -> String {
@@ -480,5 +528,19 @@ impl AdminClient {
             anyhow::bail!("admin request failed with HTTP {status}: {message}");
         }
         Ok(body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_bytes;
+
+    #[test]
+    fn format_bytes_uses_compact_binary_units() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1536), "1.5 KiB");
+        assert_eq!(format_bytes(10 * 1024), "10 KiB");
+        assert_eq!(format_bytes(3_694_592), "3.5 MiB");
     }
 }

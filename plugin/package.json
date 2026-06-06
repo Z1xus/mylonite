@@ -1,6 +1,6 @@
 {
   "name": "mylonite-obsidian-plugin",
-  "version": "0.1.20",
+  "version": "0.1.21",
   "private": true,
   "license": "MIT",
   "packageManager": "bun@1.3",

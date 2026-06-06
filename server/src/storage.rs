@@ -103,6 +103,21 @@ pub struct SnapshotRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageStats {
     pub vault_count: u64,
+    pub device_count: u64,
+    pub active_device_count: u64,
+    pub revoked_device_count: u64,
+    pub pairing_token_count: u64,
+    pub active_pairing_token_count: u64,
+    pub consumed_pairing_token_count: u64,
+    pub expired_pairing_token_count: u64,
+    pub op_count: u64,
+    pub blob_count: u64,
+    pub indexed_blob_bytes: u64,
+    pub snapshot_count: u64,
+    pub database_bytes: u64,
+    pub blob_file_bytes: u64,
+    pub total_storage_bytes: u64,
+    pub data_dir: String,
 }
 
 impl Storage {
@@ -618,8 +633,122 @@ impl Storage {
     }
 
     pub fn stats(&self) -> anyhow::Result<StorageStats> {
+        let read = self.db.begin_read().context("begin read")?;
+        let mut vault_count = 0_u64;
+        for item in read
+            .open_table(VAULTS)
+            .context("open vault table")?
+            .iter()
+            .context("iterate vaults")?
+        {
+            item.context("read vault row")?;
+            vault_count = vault_count.saturating_add(1);
+        }
+
+        let mut device_count = 0_u64;
+        let mut active_device_count = 0_u64;
+        let mut revoked_device_count = 0_u64;
+        for item in read
+            .open_table(DEVICES)
+            .context("open device table")?
+            .iter()
+            .context("iterate devices")?
+        {
+            let (_, value) = item.context("read device row")?;
+            let device: DeviceRecord =
+                serde_json::from_slice(value.value()).context("decode device row")?;
+            device_count = device_count.saturating_add(1);
+            if device.revoked_at_unix.is_some() {
+                revoked_device_count = revoked_device_count.saturating_add(1);
+            } else {
+                active_device_count = active_device_count.saturating_add(1);
+            }
+        }
+
+        let now = now_unix()?;
+        let mut pairing_token_count = 0_u64;
+        let mut active_pairing_token_count = 0_u64;
+        let mut consumed_pairing_token_count = 0_u64;
+        let mut expired_pairing_token_count = 0_u64;
+        for item in read
+            .open_table(PAIRING_TOKENS)
+            .context("open pairing token table")?
+            .iter()
+            .context("iterate pairing tokens")?
+        {
+            let (_, value) = item.context("read pairing token row")?;
+            let token: PairingTokenRecord =
+                serde_json::from_slice(value.value()).context("decode pairing token row")?;
+            pairing_token_count = pairing_token_count.saturating_add(1);
+            if token.consumed_at_unix.is_some() {
+                consumed_pairing_token_count = consumed_pairing_token_count.saturating_add(1);
+            } else if token.expires_at_unix < now {
+                expired_pairing_token_count = expired_pairing_token_count.saturating_add(1);
+            } else {
+                active_pairing_token_count = active_pairing_token_count.saturating_add(1);
+            }
+        }
+
+        let mut op_count = 0_u64;
+        for item in read
+            .open_table(OPLOG)
+            .context("open oplog")?
+            .iter()
+            .context("iterate oplog")?
+        {
+            item.context("read op row")?;
+            op_count = op_count.saturating_add(1);
+        }
+
+        let mut snapshot_count = 0_u64;
+        for item in read
+            .open_table(SNAPSHOTS)
+            .context("open snapshots")?
+            .iter()
+            .context("iterate snapshots")?
+        {
+            item.context("read snapshot row")?;
+            snapshot_count = snapshot_count.saturating_add(1);
+        }
+
+        let mut blob_count = 0_u64;
+        let mut indexed_blob_bytes = 0_u64;
+        for item in read
+            .open_table(BLOB_INDEX)
+            .context("open blob index")?
+            .iter()
+            .context("iterate blob index")?
+        {
+            let (_, value) = item.context("read blob row")?;
+            let blob: BlobRecord =
+                serde_json::from_slice(value.value()).context("decode blob row")?;
+            blob_count = blob_count.saturating_add(1);
+            indexed_blob_bytes = indexed_blob_bytes.saturating_add(blob.size);
+        }
+
+        let database_bytes = fs::metadata(self.data_dir.join("mylonite.redb"))
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let blob_file_bytes = dir_size(&self.data_dir.join("blobs"))?;
+        let total_storage_bytes = dir_size(&self.data_dir)?;
+
         Ok(StorageStats {
-            vault_count: u64::try_from(self.list_vaults()?.len()).unwrap_or(u64::MAX),
+            vault_count,
+            device_count,
+            active_device_count,
+            revoked_device_count,
+            pairing_token_count,
+            active_pairing_token_count,
+            consumed_pairing_token_count,
+            expired_pairing_token_count,
+            op_count,
+            blob_count,
+            indexed_blob_bytes,
+            snapshot_count,
+            database_bytes,
+            blob_file_bytes,
+            total_storage_bytes,
+            data_dir: self.data_dir.display().to_string(),
         })
     }
 
@@ -714,6 +843,25 @@ fn write_json<T: Serialize>(
         .insert(key.as_ref(), bytes.as_slice())
         .context("insert json record")?;
     Ok(())
+}
+
+fn dir_size(path: &Path) -> anyhow::Result<u64> {
+    let mut total = 0_u64;
+    if !path.exists() {
+        return Ok(total);
+    }
+    for entry in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
+        let entry = entry.with_context(|| format!("read entry in {}", path.display()))?;
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("read metadata for {}", entry.path().display()))?;
+        if metadata.is_dir() {
+            total = total.saturating_add(dir_size(&entry.path())?);
+        } else if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Ok(total)
 }
 
 fn device_key(vault_id: &str, device_id: &str) -> String {
@@ -1013,6 +1161,49 @@ mod tests {
         storage
             .put_blob_with_vault_limit(&vault.id, "blob-b", b"12", 4)
             .expect("remaining quota is available after replacement");
+    }
+
+    #[test]
+    fn stats_reports_counts_and_storage_size() {
+        let storage = test_storage();
+        let vault = storage.create_vault("test vault").expect("create vault");
+        let device = storage
+            .register_first_device(&vault.pairing_token, "laptop", &"1".repeat(64))
+            .expect("register first device");
+        storage
+            .revoke_device(&vault.id, &device.device_id)
+            .expect("revoke device");
+        storage
+            .issue_pairing_token(&vault.id)
+            .expect("issue active pairing token");
+        storage
+            .append_op(test_op(&vault.id, "op-a"))
+            .expect("append op");
+        storage
+            .put_blob_with_vault_limit(&vault.id, "blob-a", b"1234", 1024)
+            .expect("put blob");
+        storage
+            .put_snapshot(test_snapshot(&vault.id, 1))
+            .expect("put snapshot");
+
+        let stats = storage.stats().expect("read stats");
+
+        assert_eq!(stats.vault_count, 1);
+        assert_eq!(stats.device_count, 1);
+        assert_eq!(stats.active_device_count, 0);
+        assert_eq!(stats.revoked_device_count, 1);
+        assert_eq!(stats.pairing_token_count, 2);
+        assert_eq!(stats.active_pairing_token_count, 1);
+        assert_eq!(stats.consumed_pairing_token_count, 1);
+        assert_eq!(stats.expired_pairing_token_count, 0);
+        assert_eq!(stats.op_count, 1);
+        assert_eq!(stats.blob_count, 1);
+        assert_eq!(stats.indexed_blob_bytes, 4);
+        assert_eq!(stats.snapshot_count, 1);
+        assert_eq!(stats.blob_file_bytes, 4);
+        assert!(stats.database_bytes > 0);
+        assert!(stats.total_storage_bytes >= stats.database_bytes + stats.blob_file_bytes);
+        assert_eq!(stats.data_dir, storage.data_dir.display().to_string());
     }
 
     #[test]
