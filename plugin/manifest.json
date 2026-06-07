@@ -1,7 +1,7 @@
 {
   "id": "mylonite",
   "name": "Mylonite",
-  "version": "0.1.24",
+  "version": "0.1.25",
   "minAppVersion": "1.7.2",
   "description": "Self-hosted encrypted sync for vaults.",
   "author": "Mylonite contributors",

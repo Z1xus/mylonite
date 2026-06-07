@@ -7,6 +7,10 @@ Object.defineProperty(globalThis, "activeWindow", {
   configurable: true,
   value: activeWindow,
 });
+Object.defineProperty(globalThis, "window", {
+  configurable: true,
+  value: activeWindow,
+});
 
 export class TFile {}
 
