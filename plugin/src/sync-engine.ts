@@ -761,11 +761,15 @@ export class SyncEngine {
     }
     const op = this.measureSync("parse websocket op", () => JSON.parse(new TextDecoder().decode(frame.payload)) as unknown);
     validateRemoteOpRecord(op);
+    await this.runExclusiveSyncTask(`websocket op seq=${op.server_seq}`, async () => this.applyWebSocketOp(op));
+  }
+
+  private async applyWebSocketOp(op: EncryptedOpRecord): Promise<void> {
     if (op.server_seq <= this.host.settings.lastServerSeq) {
       return;
     }
     if (op.server_seq > this.host.settings.lastServerSeq + 1) {
-      await this.catchUp();
+      await this.catchUpInner();
       return;
     }
     await this.measure(`applyRemoteOp websocket seq=${op.server_seq} kind=${op.kind}`, () => this.applyRemoteOp(op));

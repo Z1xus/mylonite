@@ -200,14 +200,14 @@ describe("websocket gap repair", () => {
     const host = testHost();
     host.settings.lastServerSeq = 3;
     const engine = new SyncEngine(host);
-    const catchUp = vi.fn().mockResolvedValue(undefined);
+    const catchUpInner = vi.fn().mockResolvedValue(undefined);
     const applyRemoteOp = vi.fn().mockResolvedValue(undefined);
-    (engine as unknown as { catchUp: typeof catchUp; applyRemoteOp: typeof applyRemoteOp }).catchUp = catchUp;
+    (engine as unknown as { catchUpInner: typeof catchUpInner; applyRemoteOp: typeof applyRemoteOp }).catchUpInner = catchUpInner;
     (engine as unknown as { applyRemoteOp: typeof applyRemoteOp }).applyRemoteOp = applyRemoteOp;
 
     await callPrivate(engine, "handleSocketMessage", opBroadcast({ server_seq: 5 }));
 
-    expect(catchUp).toHaveBeenCalledTimes(1);
+    expect(catchUpInner).toHaveBeenCalledTimes(1);
     expect(applyRemoteOp).not.toHaveBeenCalled();
     expect(host.settings.lastServerSeq).toBe(3);
   });
@@ -229,6 +229,36 @@ describe("websocket gap repair", () => {
     expect(host.settings.lastServerSeq).toBe(4);
     expect(host.settings.lamport).toBe(8);
     expect(host.settings.pendingOps).toEqual([]);
+  });
+
+  it("does not apply a websocket broadcast already covered by an active catch-up", async () => {
+    const host = testHost();
+    const listOpsResult = deferred<unknown[]>();
+    const op = testBroadcastOp();
+    const listOps = vi.fn()
+      .mockReturnValueOnce(listOpsResult.promise)
+      .mockResolvedValue([]);
+    host.createApiClient = () => ({
+      websocketUrl: () => "wss://example.test/ws",
+      listOps,
+      putBlob: vi.fn().mockResolvedValue(undefined),
+      appendOp: vi.fn().mockResolvedValue(undefined),
+    }) as never;
+    const engine = new SyncEngine(host);
+    const applyRemoteOp = vi.fn(async () => undefined);
+    (engine as unknown as { applyRemoteOp: typeof applyRemoteOp }).applyRemoteOp = applyRemoteOp;
+
+    const catchUp = engine.catchUp();
+    await Promise.resolve();
+    const socketApply = callPrivate<Promise<void>>(engine, "handleSocketMessage", opBroadcast(op));
+    await Promise.resolve();
+
+    listOpsResult.resolve([op]);
+    await catchUp;
+    await socketApply;
+
+    expect(applyRemoteOp).toHaveBeenCalledTimes(1);
+    expect(host.settings.lastServerSeq).toBe(op.server_seq);
   });
 });
 
