@@ -1,0 +1,12 @@
+{
+  "name": "mylonite-workspace",
+  "private": true,
+  "packageManager": "bun@1.3",
+  "workspaces": [
+    "plugin"
+  ],
+  "scripts": {
+    "build:plugin": "bun run --cwd plugin build",
+    "test:plugin": "bun run --cwd plugin test"
+  }
+}
