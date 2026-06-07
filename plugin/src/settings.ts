@@ -69,7 +69,7 @@ export const DEFAULT_SETTINGS: MyloniteSettings = {
   debugLogging: false,
 };
 
-type MyloniteSettingsPlugin = Plugin & {
+type MyloniteSettingsHost = {
   settings: MyloniteSettings;
   saveSettings(): Promise<void>;
   pairFirstDevice(): Promise<void>;
@@ -82,24 +82,28 @@ type MyloniteSettingsPlugin = Plugin & {
 };
 
 export class MyloniteSettingTab extends PluginSettingTab {
-  constructor(app: App, private readonly plugin: MyloniteSettingsPlugin) {
+  constructor(app: App, plugin: Plugin, private readonly host: MyloniteSettingsHost) {
     super(app, plugin);
   }
 
-  display(): void {
+  override display(): void {
+    this.render();
+  }
+
+  render(): void {
     const { containerEl } = this;
     containerEl.empty();
-    const paired = Boolean(this.plugin.settings.vaultId && this.plugin.settings.deviceId);
+    const paired = Boolean(this.host.settings.vaultId && this.host.settings.deviceId);
 
     new Setting(containerEl)
       .setName("Server URL")
       .setDesc("Used to reach your Mylonite server.")
       .addText((text) => text
         .setPlaceholder("http://127.0.0.1:9821")
-        .setValue(this.plugin.settings.serverUrl)
+        .setValue(this.host.settings.serverUrl)
         .onChange(async (value) => {
-          this.plugin.settings.serverUrl = value.trim();
-          await this.plugin.saveSettings();
+          this.host.settings.serverUrl = value.trim();
+          await this.host.saveSettings();
         }));
 
     new Setting(containerEl)
@@ -107,10 +111,10 @@ export class MyloniteSettingTab extends PluginSettingTab {
       .setDesc("Shown in the device list.")
       .addText((text) => text
         .setPlaceholder("Obsidian device")
-        .setValue(this.plugin.settings.deviceLabel)
+        .setValue(this.host.settings.deviceLabel)
         .onChange(async (value) => {
-          this.plugin.settings.deviceLabel = value.trim();
-          await this.plugin.saveSettings();
+          this.host.settings.deviceLabel = value.trim();
+          await this.host.saveSettings();
         }));
 
     if (paired) {
@@ -123,10 +127,10 @@ export class MyloniteSettingTab extends PluginSettingTab {
       .setName("Debug logging")
       .setDesc("Writes sync details to the developer console.")
       .addToggle((toggle) => toggle
-        .setValue(this.plugin.settings.debugLogging)
+        .setValue(this.host.settings.debugLogging)
         .onChange(async (value) => {
-          this.plugin.settings.debugLogging = value;
-          await this.plugin.saveSettings();
+          this.host.settings.debugLogging = value;
+          await this.host.saveSettings();
         }));
   }
 
@@ -135,7 +139,7 @@ export class MyloniteSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Paired")
-      .setDesc(`Vault ${this.plugin.settings.vaultId}, device ${this.plugin.settings.deviceId}.`);
+      .setDesc(`Vault ${this.host.settings.vaultId}, device ${this.host.settings.deviceId}.`);
 
     new Setting(containerEl)
       .setName("Encrypted snapshot")
@@ -143,7 +147,7 @@ export class MyloniteSettingTab extends PluginSettingTab {
       .addButton((button) => button
         .setButtonText("Create")
         .onClick(async () => {
-          await this.plugin.createSnapshot();
+          await this.host.createSnapshot();
         }));
 
     new Setting(containerEl)
@@ -152,7 +156,7 @@ export class MyloniteSettingTab extends PluginSettingTab {
       .addButton((button) => button
         .setButtonText("Restore")
         .onClick(async () => {
-          await this.plugin.restoreLatestSnapshot();
+          await this.host.restoreLatestSnapshot();
         }));
 
     new Setting(containerEl)
@@ -160,10 +164,10 @@ export class MyloniteSettingTab extends PluginSettingTab {
       .setDesc("Removes local credentials and stops syncing this vault.")
       .addButton((button) => button
         .setButtonText("Unpair")
-        .setWarning()
+        .setDestructive()
         .onClick(async () => {
-          await this.plugin.unpairDevice();
-          this.display();
+          await this.host.unpairDevice();
+          this.render();
         }));
 
     new Setting(containerEl).setName("Add another device").setHeading();
@@ -176,8 +180,8 @@ export class MyloniteSettingTab extends PluginSettingTab {
       .addButton((button) => button
         .setButtonText(invite ? "Regenerate" : "Create")
         .onClick(async () => {
-          await this.plugin.createDevicePairingInvite();
-          this.display();
+          await this.host.createDevicePairingInvite();
+          this.render();
         }));
 
     if (invite) {
@@ -193,8 +197,8 @@ export class MyloniteSettingTab extends PluginSettingTab {
           .setButtonText("Approve")
           .setCta()
           .onClick(async () => {
-            await this.plugin.authorizeDevicePairingRequest();
-            this.display();
+            await this.host.authorizeDevicePairingRequest();
+            this.render();
           }));
     }
   }
@@ -218,17 +222,17 @@ export class MyloniteSettingTab extends PluginSettingTab {
       .setName("Pairing token")
       .addText((text) => text
         .setPlaceholder("p...")
-        .setValue(this.plugin.settings.pairingToken)
+        .setValue(this.host.settings.pairingToken)
         .onChange(async (value) => {
-          this.plugin.settings.pairingToken = value.trim();
-          await this.plugin.saveSettings();
+          this.host.settings.pairingToken = value.trim();
+          await this.host.saveSettings();
         }))
       .addButton((button) => button
         .setButtonText("Pair")
         .setCta()
         .onClick(async () => {
-          await this.plugin.pairFirstDevice();
-          this.display();
+          await this.host.pairFirstDevice();
+          this.render();
         }));
 
     new Setting(containerEl).setName("Join an existing vault").setHeading();
@@ -241,17 +245,17 @@ export class MyloniteSettingTab extends PluginSettingTab {
       name: "Invite code",
       desc: "Enter the grouped invite code shown on the paired device.",
       placeholder: "ABCD-2345-WXYZ",
-      value: this.plugin.settings.devicePairingInvite,
+      value: this.host.settings.devicePairingInvite,
       buttonText: request ? "Retry" : "Join",
       cta: !request,
       rows: 3,
       onChange: async (value) => {
-        this.plugin.settings.devicePairingInvite = value.trim();
-        await this.plugin.saveSettings();
+        this.host.settings.devicePairingInvite = value.trim();
+        await this.host.saveSettings();
       },
       onButtonClick: async () => {
-        await this.plugin.submitDevicePairingInvite(this.plugin.settings.devicePairingInvite);
-        this.display();
+        await this.host.submitDevicePairingInvite(this.host.settings.devicePairingInvite);
+        this.render();
       },
     });
 
@@ -261,22 +265,22 @@ export class MyloniteSettingTab extends PluginSettingTab {
   }
 
   private currentPairingInvite(): DevicePairingInvitePayload | null {
-    if (!this.plugin.settings.devicePairingInvite) {
+    if (!this.host.settings.devicePairingInvite) {
       return null;
     }
     try {
-      return parseDevicePairingInviteInput(this.plugin.settings.devicePairingInvite);
+      return parseDevicePairingInviteInput(this.host.settings.devicePairingInvite);
     } catch {
       return null;
     }
   }
 
   private currentPairingRequest(): DevicePairingRequestPayload | null {
-    if (!this.plugin.settings.devicePairingRequest) {
+    if (!this.host.settings.devicePairingRequest) {
       return null;
     }
     try {
-      const request = JSON.parse(this.plugin.settings.devicePairingRequest) as DevicePairingRequestPayload;
+      const request = JSON.parse(this.host.settings.devicePairingRequest) as DevicePairingRequestPayload;
       validatePairingRequestShape(request);
       return request;
     } catch {
@@ -350,7 +354,9 @@ export class MyloniteSettingTab extends PluginSettingTab {
         text
           .setPlaceholder(options.placeholder)
           .setValue(options.value)
-          .onChange(options.onChange);
+          .onChange(async (value) => {
+            await options.onChange(value);
+          });
         text.inputEl.rows = options.rows ?? 6;
         text.inputEl.spellcheck = false;
         text.inputEl.addClass("mylonite-code-field");
@@ -359,7 +365,9 @@ export class MyloniteSettingTab extends PluginSettingTab {
       .addButton((button) => {
         button
           .setButtonText(options.buttonText)
-          .onClick(options.onButtonClick);
+          .onClick(async () => {
+            await options.onButtonClick();
+          });
         if (options.cta) {
           button.setCta();
         }

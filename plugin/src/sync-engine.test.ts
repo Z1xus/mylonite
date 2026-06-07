@@ -872,6 +872,11 @@ function testHost(vault: MemoryVault | null = null) {
         getFiles: () => [],
         on: vi.fn(),
       },
+      fileManager: {
+        trashFile: async (file: TFile) => {
+          await (vault as MemoryVault | null)?.delete(file);
+        },
+      },
     },
     settings: {
       serverUrl: "https://example.test",

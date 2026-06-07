@@ -1,4 +1,4 @@
-import { TFile, Vault, normalizePath } from "obsidian";
+import { FileManager, TFile, Vault, normalizePath } from "obsidian";
 
 export type VaultApplyResult =
   | { status: "applied"; path: string }
@@ -42,6 +42,7 @@ export async function applyMarkdownUpsert(
 
 export async function applyFileDelete(
   vault: Vault,
+  fileManager: FileManager,
   suppressedPaths: Set<string>,
   path: string,
 ): Promise<void> {
@@ -51,7 +52,7 @@ export async function applyFileDelete(
     return;
   }
   suppressedPaths.add(normalizedPath);
-  await vault.delete(existing);
+  await fileManager.trashFile(existing);
 }
 
 export async function applyFileRenameWithCollision(

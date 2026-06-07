@@ -10,6 +10,7 @@ plugin/node_modules/
 
 plugin/main.js
 plugin/main.js.map
+/main.js
 
 .DS_Store
 Thumbs.db

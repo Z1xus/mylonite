@@ -1065,7 +1065,7 @@ export class SyncEngine {
       if (payload.fileKind === "markdown") {
         applyMarkdownUpdate(this.ydoc, requiredMarkdownUpdateHex(payload));
       }
-      await applyFileDelete(this.host.app.vault, this.suppressedPaths, payload.path);
+      await applyFileDelete(this.host.app.vault, this.host.app.fileManager, this.suppressedPaths, payload.path);
       this.stateIndex.deleteFile(payload.fileId, payload.path, Date.now(), payload.tombstoneId);
       return;
     }
@@ -1195,6 +1195,7 @@ export class SyncEngine {
     const keys = await this.host.loadVaultKeys();
     const payload = await this.measure(`restoreSnapshot ${snapshot.snapshot_id}`, () => restoreEncryptedSnapshot(
       this.host.app.vault,
+      this.host.app.fileManager,
       this.suppressedPaths,
       keys,
       this.host.settings.vaultId,

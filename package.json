@@ -10,15 +10,15 @@
     "@noble/curves": "^2.2.0",
     "@noble/hashes": "^2.2.0",
     "@types/node": "^25.8.0",
-    "builtin-modules": "^5.2.0",
     "esbuild": "^0.28.0",
-    "obsidian": "^1.12.3",
+    "obsidian": "^1.13.0",
     "qrcode-generator": "^2.0.4",
     "typescript": "^6.0.3",
     "vitest": "^4.1.6",
     "yjs": "^13.6.30"
   },
   "scripts": {
+    "build": "bun run build:plugin && node scripts/copy-plugin-main.mjs",
     "build:plugin": "bun run --cwd plugin build",
     "test:plugin": "bun run --cwd plugin test"
   }

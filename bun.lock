@@ -9,9 +9,8 @@
         "@noble/curves": "^2.2.0",
         "@noble/hashes": "^2.2.0",
         "@types/node": "^25.8.0",
-        "builtin-modules": "^5.2.0",
         "esbuild": "^0.28.0",
-        "obsidian": "^1.12.3",
+        "obsidian": "^1.13.0",
         "qrcode-generator": "^2.0.4",
         "typescript": "^6.0.3",
         "vitest": "^4.1.6",
@@ -20,7 +19,7 @@
     },
     "plugin": {
       "name": "mylonite-obsidian-plugin",
-      "version": "0.1.25",
+      "version": "0.1.26",
       "dependencies": {
         "@noble/ciphers": "^2.2.0",
         "@noble/curves": "^2.2.0",
@@ -30,9 +29,8 @@
       },
       "devDependencies": {
         "@types/node": "^25.8.0",
-        "builtin-modules": "^5.2.0",
         "esbuild": "^0.28.0",
-        "obsidian": "^1.12.3",
+        "obsidian": "^1.13.0",
         "typescript": "^6.0.3",
         "vitest": "^4.1.6",
       },
@@ -584,13 +582,6 @@
       "",
       {},
       "sha512-Izi8RQcffqCeNVgFigKli1ssklIbpHnCYc6AknXGYoB6grJqyeby7jv12JUQgmTAnIDnbck1uxksT4dzN3PWBA==",
-    ],
-
-    "builtin-modules": [
-      "builtin-modules@5.2.0",
-      "",
-      {},
-      "sha512-02yxLeyxF4dNl6SlY6/5HfRSrSdZ/sCPoxy2kZNP5dZZX8LSAD9aE2gtJIUgWrsQTiMPl3mxESyrobSwvRGisQ==",
     ],
 
     "chai": [

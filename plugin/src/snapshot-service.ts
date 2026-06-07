@@ -1,4 +1,4 @@
-import { TFile, Vault } from "obsidian";
+import { FileManager, TFile, Vault } from "obsidian";
 
 import { SnapshotRecord } from "./api";
 import { VaultKeys, randomHex } from "./crypto";
@@ -100,6 +100,7 @@ export async function createEncryptedSnapshot(
 
 export async function restoreEncryptedSnapshot(
   vault: Vault,
+  fileManager: FileManager,
   suppressedPaths: Set<string>,
   keys: VaultKeys,
   vaultId: string,
@@ -146,7 +147,7 @@ export async function restoreEncryptedSnapshot(
     const path = normalizeVaultPath(file.path, "invalid snapshot path");
     if (!snapshotPaths.has(path)) {
       suppressedPaths.add(path);
-      await vault.delete(file);
+      await fileManager.trashFile(file);
     }
   }
   return payload;

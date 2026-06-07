@@ -68,7 +68,7 @@ class ButtonComponent {
     return this;
   }
 
-  setWarning(): this {
+  setDestructive(): this {
     return this;
   }
 

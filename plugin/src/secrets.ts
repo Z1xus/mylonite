@@ -10,8 +10,8 @@ export interface SecretStorage {
 }
 
 export function secretStorage(app: App): SecretStorage | null {
-  const appWithSecrets = app as App & { secretStorage?: SecretStorage };
-  return appWithSecrets.secretStorage ?? null;
+  const candidate = (app as unknown as Record<string, unknown>)["secretStorage"];
+  return isSecretStorage(candidate) ? candidate : null;
 }
 
 export function loadDevicePrivateKey(app: App, settings: MyloniteSettings): string {
@@ -114,4 +114,11 @@ function pluginDataSecretFallbackAllowed(): boolean {
   return typeof __MYLONITE_ALLOW_PLUGIN_DATA_SECRETS__ === "boolean"
     ? __MYLONITE_ALLOW_PLUGIN_DATA_SECRETS__
     : true;
+}
+
+function isSecretStorage(value: unknown): value is SecretStorage {
+  return typeof value === "object"
+    && value !== null
+    && typeof (value as Record<string, unknown>)["getSecret"] === "function"
+    && typeof (value as Record<string, unknown>)["setSecret"] === "function";
 }

@@ -85,7 +85,7 @@ export default class MylonitePlugin extends Plugin {
       void this.submitDevicePairingInvite(invite).then(() => this.refreshSettingsTab());
     });
 
-    this.settingTab = new MyloniteSettingTab(this.app, this);
+    this.settingTab = new MyloniteSettingTab(this.app, this, this);
     this.addSettingTab(this.settingTab);
     this.status = this.addStatusBarItem();
     this.updateStatus("idle");
@@ -104,7 +104,11 @@ export default class MylonitePlugin extends Plugin {
   }
 
   async loadSettings(): Promise<void> {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const storedData = await this.loadData() as unknown;
+    this.settings = {
+      ...DEFAULT_SETTINGS,
+      ...(isRecord(storedData) ? storedData : {}),
+    };
     this.syncEngine.reloadDurableState();
   }
 
@@ -605,7 +609,7 @@ export default class MylonitePlugin extends Plugin {
   }
 
   refreshSettingsTab(): void {
-    this.settingTab?.display();
+    this.settingTab?.render();
   }
 
   updateStatus(state: string): void {
@@ -646,4 +650,8 @@ export default class MylonitePlugin extends Plugin {
     }
     return { passphrase, saltHex: this.settings.vaultSaltHex };
   }
+}
+
+function isRecord(value: unknown): value is Partial<MyloniteSettings> {
+  return typeof value === "object" && value !== null;
 }

@@ -23,6 +23,11 @@ function fakeVault(initialFiles: FakeFile[]) {
   const files = new Map(initialFiles.map((file) => [file.path, { ...file }]));
   return {
     files,
+    fileManager: {
+      trashFile: async (file: FakeFile) => {
+        files.delete(file.path);
+      },
+    },
     vault: {
       getFiles: () => [...files.values()],
       getFileByPath: (path: string) => files.get(path) ?? null,
@@ -33,9 +38,6 @@ function fakeVault(initialFiles: FakeFile[]) {
       },
       create: async (path: string, content: string) => {
         files.set(path, { path, extension: path.split(".").at(-1) ?? "", content });
-      },
-      delete: async (file: FakeFile) => {
-        files.delete(file.path);
       },
     },
   };
@@ -57,7 +59,7 @@ function snapshotRecord(payload: SnapshotPayload): SnapshotRecord {
 
 describe("snapshot restore", () => {
   it("keeps local files absent from the snapshot by default", async () => {
-    const { files, vault } = fakeVault([
+    const { files, fileManager, vault } = fakeVault([
       { path: "keep.md", extension: "md", content: "old" },
       { path: "local-only.md", extension: "md", content: "local" },
     ]);
@@ -66,14 +68,14 @@ describe("snapshot restore", () => {
       entries: [{ kind: "markdown", path: "keep.md", content: "new" }],
     });
 
-    await restoreEncryptedSnapshot(vault as never, new Set(), keys, "vault-a", snapshot, async () => new Uint8Array());
+    await restoreEncryptedSnapshot(vault as never, fileManager as never, new Set(), keys, "vault-a", snapshot, async () => new Uint8Array());
 
     expect(files.get("keep.md")?.content).toBe("new");
     expect(files.has("local-only.md")).toBe(true);
   });
 
   it("deletes local files absent from the snapshot when requested", async () => {
-    const { files, vault } = fakeVault([
+    const { files, fileManager, vault } = fakeVault([
       { path: "keep.md", extension: "md", content: "old" },
       { path: "local-only.md", extension: "md", content: "local" },
     ]);
@@ -82,14 +84,14 @@ describe("snapshot restore", () => {
       entries: [{ kind: "markdown", path: "keep.md", content: "new" }],
     });
 
-    await restoreEncryptedSnapshot(vault as never, new Set(), keys, "vault-a", snapshot, async () => new Uint8Array(), true);
+    await restoreEncryptedSnapshot(vault as never, fileManager as never, new Set(), keys, "vault-a", snapshot, async () => new Uint8Array(), true);
 
     expect(files.get("keep.md")?.content).toBe("new");
     expect(files.has("local-only.md")).toBe(false);
   });
 
   it("rejects binary snapshot entries whose decrypted blob size differs from metadata", async () => {
-    const { vault } = fakeVault([]);
+    const { fileManager, vault } = fakeVault([]);
     const snapshot = snapshotRecord({
       version: 1,
       entries: [{ kind: "binary", path: "assets/a.bin", blobId: "a".repeat(64), size: 4 }],
@@ -97,6 +99,7 @@ describe("snapshot restore", () => {
 
     await expect(restoreEncryptedSnapshot(
       vault as never,
+      fileManager as never,
       new Set(),
       keys,
       "vault-a",
