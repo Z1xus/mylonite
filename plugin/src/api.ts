@@ -1,3 +1,5 @@
+import { requestUrl } from "obsidian";
+
 import { signRequest, signWebSocketChallenge } from "./crypto";
 import { OpKind } from "./protocol";
 
@@ -105,6 +107,19 @@ export interface PutSnapshotRequest {
   nonce_hex: string;
   ciphertext_hex: string;
 }
+
+type ApiRequestInit = {
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string | ArrayBuffer | Uint8Array;
+};
+
+type ApiResponse = {
+  status: number;
+  arrayBuffer(): Promise<ArrayBuffer>;
+  json(): Promise<unknown>;
+  text(): Promise<string>;
+};
 
 export class MyloniteApiClient {
   constructor(private readonly serverUrl: string, private readonly auth?: DeviceAuth) {}
@@ -309,17 +324,28 @@ export class MyloniteApiClient {
     });
   }
 
-  private async requestJson<T>(path: string, init?: RequestInit): Promise<T> {
+  private async requestJson<T>(path: string, init?: ApiRequestInit): Promise<T> {
     const response = await this.request(path, init);
     return response.json() as Promise<T>;
   }
 
-  private async request(path: string, init?: RequestInit): Promise<Response> {
-    const response = await fetch(`${this.serverUrl.replace(/\/$/, "")}${path}`, init);
-    if (!response.ok && response.status !== 404) {
-      throw new Error(await response.text());
+  private async request(path: string, init?: ApiRequestInit): Promise<ApiResponse> {
+    const response = await requestUrl({
+      url: `${this.serverUrl.replace(/\/$/, "")}${path}`,
+      method: init?.method,
+      headers: init?.headers,
+      body: toRequestUrlBody(init?.body),
+      throw: false,
+    });
+    if (response.status < 200 || (response.status >= 300 && response.status !== 404)) {
+      throw new Error(response.text);
     }
-    return response;
+    return {
+      status: response.status,
+      arrayBuffer: () => Promise.resolve(response.arrayBuffer),
+      json: () => Promise.resolve(response.json as unknown),
+      text: () => Promise.resolve(response.text),
+    };
   }
 
   private signedHeaders(method: string, path: string, body: Uint8Array, headers: Record<string, string> = {}): Record<string, string> {
@@ -374,6 +400,15 @@ function validatePairingToken(value: string): void {
   if (!/^p[0-9a-f]{48}$/.test(value)) {
     throw new Error("invalid pairing token");
   }
+}
+
+function toRequestUrlBody(body: ApiRequestInit["body"]): string | ArrayBuffer | undefined {
+  if (body instanceof Uint8Array) {
+    const copy = new Uint8Array(body.byteLength);
+    copy.set(body);
+    return copy.buffer;
+  }
+  return body;
 }
 
 function validatePairingSessionId(value: string): void {

@@ -89,7 +89,7 @@ export class MyloniteSettingTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "Mylonite" });
+    new Setting(containerEl).setName("Mylonite").setHeading();
     const paired = Boolean(this.plugin.settings.vaultId && this.plugin.settings.deviceId);
 
     new Setting(containerEl)
@@ -132,7 +132,7 @@ export class MyloniteSettingTab extends PluginSettingTab {
   }
 
   private renderPairedSections(containerEl: HTMLElement): void {
-    containerEl.createEl("h3", { text: "This device" });
+    new Setting(containerEl).setName("This device").setHeading();
 
     new Setting(containerEl)
       .setName("Paired")
@@ -167,7 +167,7 @@ export class MyloniteSettingTab extends PluginSettingTab {
           this.display();
         }));
 
-    containerEl.createEl("h3", { text: "Add another device" });
+    new Setting(containerEl).setName("Add another device").setHeading();
     const invite = this.currentPairingInvite();
     const request = this.currentPairingRequest();
 
@@ -203,13 +203,13 @@ export class MyloniteSettingTab extends PluginSettingTab {
   private renderUnpairedSections(containerEl: HTMLElement): void {
     const request = this.currentPairingRequest();
 
-    containerEl.createEl("h3", { text: "Pair this device" });
+    new Setting(containerEl).setName("Pair this device").setHeading();
     containerEl.createEl("p", {
       text: request ? "Waiting for approval on an already-paired device." : "Pick the option that matches your situation.",
       cls: "setting-item-description",
     });
 
-    containerEl.createEl("h4", { text: "First device for a new vault" });
+    new Setting(containerEl).setName("First device for a new vault").setHeading();
     containerEl.createEl("p", {
       text: "Paste the pairing token from `mylonite init`.",
       cls: "setting-item-description",
@@ -232,7 +232,7 @@ export class MyloniteSettingTab extends PluginSettingTab {
           this.display();
         }));
 
-    containerEl.createEl("h4", { text: "Join an existing vault" });
+    new Setting(containerEl).setName("Join an existing vault").setHeading();
     containerEl.createEl("p", {
       text: "Scan the invite QR code or enter the invite code from a paired device.",
       cls: "setting-item-description",

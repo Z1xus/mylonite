@@ -1,6 +1,7 @@
 import { Notice, Plugin, TFile } from "obsidian";
 
 import { MyloniteApiClient, PairingGrantPayload } from "./api";
+import { confirmAction } from "./confirm-modal";
 import {
   VaultKeys,
   decryptDevicePairingSecret,
@@ -251,7 +252,11 @@ export default class MylonitePlugin extends Plugin {
       new Notice(`Invalid device request. Ask the new device to try again. ${String(error)}`);
       return;
     }
-    const approved = window.confirm(`Approve "${request.label}"?\n\nSafety code: ${pairingSafetyCode(request.request_hash)}`);
+    const approved = await confirmAction(this.app, {
+      title: "Approve device",
+      message: `Approve "${request.label}"? Safety code: ${pairingSafetyCode(request.request_hash)}`,
+      confirmText: "Approve",
+    });
     if (!approved) {
       return;
     }
@@ -560,7 +565,11 @@ export default class MylonitePlugin extends Plugin {
   }
 
   async unpairDevice(): Promise<void> {
-    const confirmed = window.confirm("Unpair this device? It will stop syncing immediately.");
+    const confirmed = await confirmAction(this.app, {
+      title: "Unpair device",
+      message: "Unpair this device? It will stop syncing immediately.",
+      confirmText: "Unpair",
+    });
     if (!confirmed) {
       return;
     }

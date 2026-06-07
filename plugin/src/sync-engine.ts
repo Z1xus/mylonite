@@ -15,6 +15,7 @@ import {
   normalizeVaultPath,
 } from "./vault-adapter";
 import { MyloniteSettings } from "./settings";
+import { confirmAction } from "./confirm-modal";
 import { decideRemoteV2Apply } from "./conflict-policy";
 import { LocalEventClassifier } from "./local-event-classifier";
 import { VaultStateIndex } from "./state-index";
@@ -311,9 +312,11 @@ export class SyncEngine {
       return;
     }
     validateSnapshotRecord(latest, this.host.settings.vaultId);
-    const deleteMissing = options.deleteMissing ?? window.confirm(
-      "Delete files missing from the snapshot? This removes local files that are not in the latest snapshot.",
-    );
+    const deleteMissing = options.deleteMissing ?? await confirmAction(this.host.app, {
+      title: "Restore snapshot",
+      message: "Delete files missing from the snapshot? This removes local files that are not in the latest snapshot.",
+      confirmText: "Delete missing files",
+    });
     await this.restoreSnapshot(latest, deleteMissing);
     this.host.settings.lastServerSeq = Math.max(this.host.settings.lastServerSeq, latest.covers_through_seq);
     await this.host.saveSettings();
