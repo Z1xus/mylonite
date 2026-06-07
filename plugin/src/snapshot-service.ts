@@ -57,7 +57,10 @@ export async function createEncryptedSnapshot(
       logSlowSnapshotFile("snapshot read markdown", path, started, debug);
       continue;
     }
-    const bytes = new Uint8Array(await vault.readBinary(file as TFile));
+    if (!(file instanceof TFile)) {
+      continue;
+    }
+    const bytes = new Uint8Array(await vault.readBinary(file));
     await yieldToObsidian();
     const { blobId, envelope } = encryptBlob(keys, vaultId, bytes);
     await putBlob(blobId, envelope);

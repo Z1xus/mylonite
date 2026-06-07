@@ -89,7 +89,6 @@ export class MyloniteSettingTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
-    new Setting(containerEl).setName("Mylonite").setHeading();
     const paired = Boolean(this.plugin.settings.vaultId && this.plugin.settings.deviceId);
 
     new Setting(containerEl)

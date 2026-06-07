@@ -1,5 +1,5 @@
 export function yieldToObsidian(): Promise<void> {
   return new Promise((resolve) => {
-    globalThis.setTimeout(resolve, 0);
+    activeWindow.setTimeout(resolve, 0);
   });
 }

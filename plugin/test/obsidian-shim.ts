@@ -2,6 +2,12 @@ export function normalizePath(path: string): string {
   return path.replaceAll("\\", "/");
 }
 
+export const activeWindow = globalThis as unknown as Window;
+Object.defineProperty(globalThis, "activeWindow", {
+  configurable: true,
+  value: activeWindow,
+});
+
 export class TFile {}
 
 export class Modal {
