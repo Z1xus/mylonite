@@ -20,6 +20,7 @@ import { decideRemoteV2Apply } from "./conflict-policy";
 import { LocalEventClassifier } from "./local-event-classifier";
 import { VaultStateIndex } from "./state-index";
 import { FileKind, hashBytes, SyncJournalEntry } from "./sync-state";
+import { yieldToObsidian } from "./ui-yield";
 import {
   applyMarkdownUpdate,
   encodeMarkdownDeleteUpdate,
@@ -66,6 +67,8 @@ export class SyncEngine {
   private manuallyClosed = false;
   private lastPeriodicCatchUpAt = 0;
   private started = false;
+  private activeSyncTask: Promise<void> | null = null;
+  private catchUpPromise: Promise<void> | null = null;
 
   constructor(private readonly host: SyncEngineHost) {
     if (!Array.isArray(this.host.settings.pendingBlobs)) {
@@ -225,7 +228,19 @@ export class SyncEngine {
   }
 
   async catchUp(): Promise<void> {
-    await this.measure("catchUp", async () => this.catchUpInner());
+    if (this.catchUpPromise) {
+      await this.catchUpPromise;
+      return;
+    }
+    const promise = this.runExclusiveSyncTask("catchUp", async () => this.catchUpInner());
+    this.catchUpPromise = promise;
+    try {
+      await promise;
+    } finally {
+      if (this.catchUpPromise === promise) {
+        this.catchUpPromise = null;
+      }
+    }
   }
 
   private async catchUpInner(): Promise<void> {
@@ -258,7 +273,7 @@ export class SyncEngine {
   }
 
   async createSnapshot(options: { silent?: boolean } = {}): Promise<void> {
-    await this.measure("createSnapshot", async () => this.createSnapshotInner(options));
+    await this.runExclusiveSyncTask("createSnapshot", async () => this.createSnapshotInner(options));
   }
 
   private async createSnapshotInner(options: { silent?: boolean }): Promise<void> {
@@ -293,7 +308,7 @@ export class SyncEngine {
   }
 
   async restoreLatestSnapshot(options: { deleteMissing?: boolean; silent?: boolean; requireSnapshot?: boolean } = {}): Promise<void> {
-    await this.measure("restoreLatestSnapshot", async () => this.restoreLatestSnapshotInner(options));
+    await this.runExclusiveSyncTask("restoreLatestSnapshot", async () => this.restoreLatestSnapshotInner(options));
   }
 
   private async restoreLatestSnapshotInner(options: { deleteMissing?: boolean; silent?: boolean; requireSnapshot?: boolean }): Promise<void> {
@@ -418,6 +433,7 @@ export class SyncEngine {
     this.locallyDirtyPaths.add(normalizedPath);
     const keys = await this.host.loadVaultKeys();
     const plaintext = new Uint8Array(await this.host.app.vault.readBinary(file));
+    await yieldToObsidian();
     const { blobId, envelope } = encryptBlob(keys, this.host.settings.vaultId, plaintext);
     const transition = this.classifier.classifyModify({ path: normalizedPath, kind: "binary", content: plaintext, blobId, size: plaintext.byteLength });
     this.queueTransition(transition);
@@ -518,6 +534,7 @@ export class SyncEngine {
     const reusableBlobId = existing?.kind === "binary" && existing.contentHash === contentHash && existing.size === bytes.byteLength
       ? existing.blobId
       : undefined;
+    await yieldToObsidian();
     const encrypted = reusableBlobId ? null : encryptBlob(keys, this.host.settings.vaultId, bytes);
     const blobId = reusableBlobId ?? encrypted?.blobId;
     if (!blobId) {
@@ -608,6 +625,7 @@ export class SyncEngine {
     }
     const keys = await this.host.loadVaultKeys();
     const plaintext = new Uint8Array(await this.host.app.vault.readBinary(file));
+    await yieldToObsidian();
     const { blobId, envelope } = encryptBlob(keys, this.host.settings.vaultId, plaintext);
     const transition = this.classifier.classifyCreate({ path: normalizedPath, kind: "binary", content: plaintext, blobId, size: plaintext.byteLength });
     this.queueTransition(transition);
@@ -1221,6 +1239,26 @@ export class SyncEngine {
       return await fn();
     } finally {
       this.reportSlowSpan(label, performance.now() - started);
+    }
+  }
+
+  private async runExclusiveSyncTask(label: string, fn: () => Promise<void>): Promise<void> {
+    const previous = this.activeSyncTask;
+    let release: () => void = () => undefined;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.activeSyncTask = current;
+    if (previous) {
+      await previous.catch(() => undefined);
+    }
+    try {
+      await this.measure(label, fn);
+    } finally {
+      release();
+      if (this.activeSyncTask === current) {
+        this.activeSyncTask = null;
+      }
     }
   }
 

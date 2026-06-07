@@ -203,6 +203,62 @@ describe("websocket gap repair", () => {
   });
 });
 
+describe("sync task scheduling", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("coalesces concurrent catch-up requests into one remote op walk", async () => {
+    const host = testHost();
+    const listOpsResult = deferred<unknown[]>();
+    const listOps = vi.fn().mockReturnValue(listOpsResult.promise);
+    host.createApiClient = () => ({
+      websocketUrl: () => "wss://example.test/ws",
+      listOps,
+      putBlob: vi.fn().mockResolvedValue(undefined),
+      appendOp: vi.fn().mockResolvedValue(undefined),
+    }) as never;
+    const engine = new SyncEngine(host);
+
+    const first = engine.catchUp();
+    await Promise.resolve();
+    const second = engine.catchUp();
+    await Promise.resolve();
+
+    expect(listOps).toHaveBeenCalledTimes(1);
+
+    listOpsResult.resolve([]);
+    await Promise.all([first, second]);
+  });
+
+  it("queues snapshots behind an in-flight catch-up", async () => {
+    const host = testHost();
+    const listOpsResult = deferred<unknown[]>();
+    host.createApiClient = () => ({
+      websocketUrl: () => "wss://example.test/ws",
+      listOps: vi.fn().mockReturnValue(listOpsResult.promise),
+      putBlob: vi.fn().mockResolvedValue(undefined),
+      appendOp: vi.fn().mockResolvedValue(undefined),
+    }) as never;
+    const engine = new SyncEngine(host);
+    const createSnapshotInner = vi.fn().mockResolvedValue(undefined);
+    (engine as unknown as { createSnapshotInner: typeof createSnapshotInner }).createSnapshotInner = createSnapshotInner;
+
+    const catchUp = engine.catchUp();
+    await Promise.resolve();
+    const snapshot = engine.createSnapshot();
+    await Promise.resolve();
+
+    expect(createSnapshotInner).not.toHaveBeenCalled();
+
+    listOpsResult.resolve([]);
+    await catchUp;
+    await snapshot;
+
+    expect(createSnapshotInner).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("remote payload validation", () => {
   it("accepts well-formed v2 remote payloads", () => {
     expect(() => validateRemotePayload(v2Payload({ kind: "file-create", fileKind: "markdown", updateHex: "00ff" }))).not.toThrow();
@@ -722,6 +778,16 @@ function testSnapshot() {
     ciphertext_hex: "11".repeat(32),
     created_at_unix: 123,
   };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
 }
 
 function v2Payload(overrides: Record<string, unknown>) {

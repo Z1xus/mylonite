@@ -7,8 +7,10 @@ import { SnapshotBinaryEntry, SnapshotEntry, SnapshotPayload } from "./sync-type
 import { applyBinaryUpsert, applyMarkdownUpsert, normalizeVaultPath } from "./vault-adapter";
 import { VaultStateIndex } from "./state-index";
 import { hashBytes, hashText, newFileId, VaultStateSnapshot } from "./sync-state";
+import { yieldToObsidian } from "./ui-yield";
 
 const SLOW_SNAPSHOT_FILE_MS = 50;
+const SNAPSHOT_FILES_PER_UI_YIELD = 4;
 
 export interface EncryptedSnapshotUpload {
   snapshotId: string;
@@ -29,7 +31,11 @@ export async function createEncryptedSnapshot(
   const index = VaultStateIndex.fromSnapshot(state);
   const snapshotIndex = new VaultStateIndex();
   const now = Date.now();
-  for (const file of vault.getFiles()) {
+  const files = vault.getFiles();
+  for (const [fileIndex, file] of files.entries()) {
+    if (fileIndex > 0 && fileIndex % SNAPSHOT_FILES_PER_UI_YIELD === 0) {
+      await yieldToObsidian();
+    }
     const started = performance.now();
     const path = normalizeVaultPath(file.path, "invalid snapshot path");
     if (file.extension === "md") {
@@ -52,6 +58,7 @@ export async function createEncryptedSnapshot(
       continue;
     }
     const bytes = new Uint8Array(await vault.readBinary(file as TFile));
+    await yieldToObsidian();
     const { blobId, envelope } = encryptBlob(keys, vaultId, bytes);
     await putBlob(blobId, envelope);
     const previous = index.byPath(path);
@@ -75,6 +82,7 @@ export async function createEncryptedSnapshot(
   const snapshotState = snapshotIndex.toSnapshot();
 
   const snapshotId = randomHex(16);
+  await yieldToObsidian();
   const encrypted = encryptSnapshot(keys, vaultId, snapshotId, coversThroughSeq, {
     version: 1,
     entries,
@@ -107,7 +115,10 @@ export async function restoreEncryptedSnapshot(
   );
   validateSnapshotPayload(payload);
   const snapshotPaths = new Set(payload.entries.map((entry) => normalizeVaultPath(entry.path, "invalid snapshot path")));
-  for (const entry of payload.entries) {
+  for (const [entryIndex, entry] of payload.entries.entries()) {
+    if (entryIndex > 0 && entryIndex % SNAPSHOT_FILES_PER_UI_YIELD === 0) {
+      await yieldToObsidian();
+    }
     const started = performance.now();
     if (entry.kind === "markdown") {
       await applyMarkdownUpsert(vault, suppressedPaths, entry.path, entry.content);
@@ -124,7 +135,11 @@ export async function restoreEncryptedSnapshot(
   if (!deleteMissing) {
     return payload;
   }
-  for (const file of vault.getFiles()) {
+  const files = vault.getFiles();
+  for (const [fileIndex, file] of files.entries()) {
+    if (fileIndex > 0 && fileIndex % SNAPSHOT_FILES_PER_UI_YIELD === 0) {
+      await yieldToObsidian();
+    }
     const path = normalizeVaultPath(file.path, "invalid snapshot path");
     if (!snapshotPaths.has(path)) {
       suppressedPaths.add(path);
