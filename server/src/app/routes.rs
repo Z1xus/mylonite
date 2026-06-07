@@ -11,6 +11,7 @@ use std::{
     net::SocketAddr,
     time::{SystemTime, UNIX_EPOCH},
 };
+use tokio::task;
 
 use super::{
     ApiError, AppState, PairingSession, PairingSessionGrant, PairingSessionRequest,
@@ -24,7 +25,7 @@ const PAIRING_SESSION_TTL_SECS: u64 = 10 * 60;
 const MAX_PAIRING_SESSIONS: usize = 1024;
 
 pub(super) async fn health(State(app_state): State<AppState>) -> impl IntoResponse {
-    match app_state.storage.stats() {
+    match storage_call(app_state.storage.clone(), |storage| storage.stats()).await {
         Ok(storage_stats) => format!("ok vaults={}\n", storage_stats.vault_count),
         Err(error) => format!("degraded error={error}\n"),
     }
@@ -129,7 +130,12 @@ pub(super) async fn admin_create_vault(
     require_loopback_admin(peer)?;
     validate_json_body_len(&app_state, &body)?;
     let request: AdminCreateVaultRequest = serde_json::from_slice(&body)?;
-    Ok(Json(app_state.storage.create_vault(&request.name)?))
+    Ok(Json(
+        storage_call(app_state.storage.clone(), move |storage| {
+            storage.create_vault(&request.name)
+        })
+        .await?,
+    ))
 }
 
 pub(super) async fn admin_list_vaults(
@@ -137,7 +143,9 @@ pub(super) async fn admin_list_vaults(
     State(app_state): State<AppState>,
 ) -> Result<Json<Vec<CreatedVault>>, ApiError> {
     require_loopback_admin(peer)?;
-    Ok(Json(app_state.storage.list_vaults()?))
+    Ok(Json(
+        storage_call(app_state.storage.clone(), |storage| storage.list_vaults()).await?,
+    ))
 }
 
 pub(super) async fn admin_delete_vault(
@@ -147,7 +155,10 @@ pub(super) async fn admin_delete_vault(
 ) -> Result<StatusCode, ApiError> {
     require_loopback_admin(peer)?;
     validation::validate_vault_id(&vault_id)?;
-    app_state.storage.delete_vault(&vault_id)?;
+    storage_call(app_state.storage.clone(), move |storage| {
+        storage.delete_vault(&vault_id)
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -158,7 +169,12 @@ pub(super) async fn admin_list_devices(
 ) -> Result<Json<Vec<DeviceRecord>>, ApiError> {
     require_loopback_admin(peer)?;
     validation::validate_vault_id(&vault_id)?;
-    Ok(Json(app_state.storage.list_devices(&vault_id)?))
+    Ok(Json(
+        storage_call(app_state.storage.clone(), move |storage| {
+            storage.list_devices(&vault_id)
+        })
+        .await?,
+    ))
 }
 
 pub(super) async fn admin_revoke_device(
@@ -169,7 +185,10 @@ pub(super) async fn admin_revoke_device(
     require_loopback_admin(peer)?;
     validation::validate_vault_id(&vault_id)?;
     validation::validate_device_id(&device_id)?;
-    app_state.storage.revoke_device(&vault_id, &device_id)?;
+    storage_call(app_state.storage.clone(), move |storage| {
+        storage.revoke_device(&vault_id, &device_id)
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -178,7 +197,9 @@ pub(super) async fn admin_stats(
     State(app_state): State<AppState>,
 ) -> Result<Json<StorageStats>, ApiError> {
     require_loopback_admin(peer)?;
-    Ok(Json(app_state.storage.stats()?))
+    Ok(Json(
+        storage_call(app_state.storage.clone(), |storage| storage.stats()).await?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -287,11 +308,10 @@ pub(super) async fn pair_first_device(
     validate_json_body_len(&app_state, &body)?;
     let request: PairFirstDeviceRequest = serde_json::from_slice(&body)?;
     validation::validate_pairing_request(&request)?;
-    let device = app_state.storage.register_first_device(
-        &request.token,
-        &request.label,
-        &request.verifying_key,
-    )?;
+    let device = storage_call(app_state.storage.clone(), move |storage| {
+        storage.register_first_device(&request.token, &request.label, &request.verifying_key)
+    })
+    .await?;
     Ok(Json(PairFirstDeviceResponse {
         vault_id: device.vault_id,
         device_id: device.device_id,
@@ -313,7 +333,8 @@ pub(super) async fn open_pairing_session(
         &format!("/api/v1/vaults/{vault_id}/pairing-sessions"),
         &body,
         &headers,
-    )?;
+    )
+    .await?;
     let request: OpenPairingSessionRequest = serde_json::from_slice(&body)?;
     validation::validate_pairing_session_id(&request.session_id)?;
     validation::validate_invite_code_hash(&request.invite_code_hash)?;
@@ -323,15 +344,17 @@ pub(super) async fn open_pairing_session(
     let mut sessions = app_state
         .pairing_sessions
         .lock()
-        .map_err(|_| ApiError(anyhow::anyhow!("pairing session state unavailable")))?;
+        .map_err(|_| ApiError::internal(anyhow::anyhow!("pairing session state unavailable")))?;
     prune_pairing_sessions(&mut sessions, now);
     if sessions.len() >= MAX_PAIRING_SESSIONS {
-        return Err(ApiError(anyhow::anyhow!(
+        return Err(ApiError::payload_too_large(anyhow::anyhow!(
             "too many active pairing sessions"
         )));
     }
     if sessions.contains_key(&request.session_id) {
-        return Err(ApiError(anyhow::anyhow!("pairing session already exists")));
+        return Err(ApiError::conflict(anyhow::anyhow!(
+            "pairing session already exists"
+        )));
     }
 
     sessions.insert(
@@ -364,19 +387,22 @@ pub(super) async fn get_pairing_session(
         &format!("/api/v1/vaults/{vault_id}/pairing-sessions/{session_id}"),
         &[],
         &headers,
-    )?;
+    )
+    .await?;
 
     let now = now_unix()?;
     let mut sessions = app_state
         .pairing_sessions
         .lock()
-        .map_err(|_| ApiError(anyhow::anyhow!("pairing session state unavailable")))?;
+        .map_err(|_| ApiError::internal(anyhow::anyhow!("pairing session state unavailable")))?;
     prune_pairing_sessions(&mut sessions, now);
     let Some(session) = sessions.get(&session_id) else {
         return Ok(Json(PairingSessionResponse::Expired));
     };
     if session.vault_id != vault_id {
-        return Err(ApiError(anyhow::anyhow!("pairing session vault mismatch")));
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "pairing session vault mismatch"
+        )));
     }
     if let Some(grant) = &session.grant {
         return Ok(Json(PairingSessionResponse::Granted {
@@ -417,15 +443,19 @@ pub(super) async fn submit_pairing_session_request(
     let mut sessions = app_state
         .pairing_sessions
         .lock()
-        .map_err(|_| ApiError(anyhow::anyhow!("pairing session state unavailable")))?;
+        .map_err(|_| ApiError::internal(anyhow::anyhow!("pairing session state unavailable")))?;
     prune_pairing_sessions(&mut sessions, now);
     let Some((session_id, session)) = sessions.iter_mut().find(|(session_id, session)| {
         session.invite_code_hash == invite_code_hash(session_id, &request.invite_code)
     }) else {
-        return Err(ApiError(anyhow::anyhow!("invite code not found")));
+        return Err(ApiError::not_found(anyhow::anyhow!(
+            "invite code not found"
+        )));
     };
     if session.request.is_some() || session.grant.is_some() {
-        return Err(ApiError(anyhow::anyhow!("pairing session already claimed")));
+        return Err(ApiError::conflict(anyhow::anyhow!(
+            "pairing session already claimed"
+        )));
     }
     session.request = Some(PairingSessionRequest {
         request_hash: request.request.request_hash,
@@ -448,7 +478,7 @@ pub(super) async fn get_pairing_session_grant(
     let mut sessions = app_state
         .pairing_sessions
         .lock()
-        .map_err(|_| ApiError(anyhow::anyhow!("pairing session state unavailable")))?;
+        .map_err(|_| ApiError::internal(anyhow::anyhow!("pairing session state unavailable")))?;
     prune_pairing_sessions(&mut sessions, now);
     let Some(session) = sessions.get(&session_id) else {
         return Ok(Json(PairingSessionGrantResponse::Expired));
@@ -484,7 +514,8 @@ pub(super) async fn put_pairing_session_grant(
         &format!("/api/v1/vaults/{vault_id}/pairing-sessions/{session_id}/grant"),
         &body,
         &headers,
-    )?;
+    )
+    .await?;
     let request: PutPairingSessionGrantRequest = serde_json::from_slice(&body)?;
     validation::validate_request_hash(&request.request_hash)?;
     validate_pairing_session_grant(&request.grant)?;
@@ -493,22 +524,32 @@ pub(super) async fn put_pairing_session_grant(
     let mut sessions = app_state
         .pairing_sessions
         .lock()
-        .map_err(|_| ApiError(anyhow::anyhow!("pairing session state unavailable")))?;
+        .map_err(|_| ApiError::internal(anyhow::anyhow!("pairing session state unavailable")))?;
     prune_pairing_sessions(&mut sessions, now);
     let Some(session) = sessions.get_mut(&session_id) else {
-        return Err(ApiError(anyhow::anyhow!("pairing session expired")));
+        return Err(ApiError::not_found(anyhow::anyhow!(
+            "pairing session expired"
+        )));
     };
     if session.vault_id != vault_id {
-        return Err(ApiError(anyhow::anyhow!("pairing session vault mismatch")));
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "pairing session vault mismatch"
+        )));
     }
     let Some(pending_request) = &session.request else {
-        return Err(ApiError(anyhow::anyhow!("pairing session has no request")));
+        return Err(ApiError::conflict(anyhow::anyhow!(
+            "pairing session has no request"
+        )));
     };
     if pending_request.request_hash != request.request_hash {
-        return Err(ApiError(anyhow::anyhow!("pairing request hash mismatch")));
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "pairing request hash mismatch"
+        )));
     }
     if session.grant.is_some() {
-        return Err(ApiError(anyhow::anyhow!("pairing session already granted")));
+        return Err(ApiError::conflict(anyhow::anyhow!(
+            "pairing session already granted"
+        )));
     }
     session.grant = Some(PairingSessionGrant {
         x25519_public_key: request.grant.x25519_public_key,
@@ -531,8 +572,14 @@ pub(super) async fn list_devices(
         &format!("/api/v1/vaults/{vault_id}/devices"),
         &[],
         &headers,
-    )?;
-    Ok(Json(app_state.storage.list_devices(&vault_id)?))
+    )
+    .await?;
+    Ok(Json(
+        storage_call(app_state.storage.clone(), move |storage| {
+            storage.list_devices(&vault_id)
+        })
+        .await?,
+    ))
 }
 
 pub(super) async fn register_device(
@@ -550,15 +597,20 @@ pub(super) async fn register_device(
         &format!("/api/v1/vaults/{vault_id}/devices"),
         &body,
         &headers,
-    )?;
+    )
+    .await?;
     let request: RegisterDeviceRequest = serde_json::from_slice(&body)?;
     validation::validate_register_device_request(&request)?;
-    let device = app_state.storage.register_authorized_device(
-        &vault_id,
-        &request.label,
-        &request.verifying_key,
-        app_state.max_devices_per_vault,
-    )?;
+    let max_devices_per_vault = app_state.max_devices_per_vault;
+    let device = storage_call(app_state.storage.clone(), move |storage| {
+        storage.register_authorized_device(
+            &vault_id,
+            &request.label,
+            &request.verifying_key,
+            max_devices_per_vault,
+        )
+    })
+    .await?;
     Ok(Json(RegisterDeviceResponse {
         device_id: device.device_id,
     }))
@@ -580,8 +632,12 @@ pub(super) async fn revoke_device(
         &format!("/api/v1/vaults/{vault_id}/devices/{device_id}"),
         &body,
         &headers,
-    )?;
-    app_state.storage.revoke_device(&vault_id, &device_id)?;
+    )
+    .await?;
+    storage_call(app_state.storage.clone(), move |storage| {
+        storage.revoke_device(&vault_id, &device_id)
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -603,14 +659,17 @@ pub(super) async fn list_ops(
         Some(limit) => format!("/api/v1/vaults/{vault_id}/ops?after={after}&limit={limit}"),
         None => format!("/api/v1/vaults/{vault_id}/ops?after={after}"),
     };
-    verify_device_signature(&app_state, &vault_id, "GET", &signed_path, &[], &headers)?;
+    verify_device_signature(&app_state, &vault_id, "GET", &signed_path, &[], &headers).await?;
     let limit = query
         .limit
         .unwrap_or(app_state.max_ops_per_push)
         .min(app_state.max_ops_per_push);
     validation::validate_op_list_limit(limit)?;
     Ok(Json(
-        app_state.storage.list_ops_after(&vault_id, after, limit)?,
+        storage_call(app_state.storage.clone(), move |storage| {
+            storage.list_ops_after(&vault_id, after, limit)
+        })
+        .await?,
     ))
 }
 
@@ -655,7 +714,8 @@ pub(super) async fn append_op(
         &format!("/api/v1/vaults/{vault_id}/ops"),
         &body,
         &headers,
-    )?;
+    )
+    .await?;
     let request: AppendOpRequest = serde_json::from_slice(&body)?;
     validation::validate_op_request(&request, app_state.max_op_ciphertext_bytes)?;
     validate_body_device_matches_signer(&request.device_id, &signed_device_id)?;
@@ -671,7 +731,11 @@ pub(super) async fn append_op(
         ciphertext_hex: request.ciphertext_hex,
         accepted_at_unix: 0,
     };
-    let append = app_state.storage.append_op(op.clone())?;
+    let append = storage_call(app_state.storage.clone(), {
+        let op = op.clone();
+        move |storage| storage.append_op(op)
+    })
+    .await?;
     op.server_seq = append.server_seq;
     if append.inserted {
         let _ = app_state.op_broadcast.send(op);
@@ -690,7 +754,7 @@ pub(super) async fn put_blob(
     validation::validate_vault_id(&vault_id)?;
     validation::validate_blob_id(&blob_id)?;
     if body.len() > app_state.max_blob_size_bytes {
-        return Err(ApiError(anyhow::anyhow!(
+        return Err(ApiError::payload_too_large(anyhow::anyhow!(
             "blob exceeds configured size limit"
         )));
     }
@@ -701,13 +765,16 @@ pub(super) async fn put_blob(
         &format!("/api/v1/vaults/{vault_id}/blobs/{blob_id}"),
         &body,
         &headers,
-    )?;
-    Ok(Json(app_state.storage.put_blob_with_vault_limit(
-        &vault_id,
-        &blob_id,
-        &body,
-        app_state.max_vault_size_bytes,
-    )?))
+    )
+    .await?;
+    let max_vault_size_bytes = app_state.max_vault_size_bytes;
+    let bytes = body.to_vec();
+    Ok(Json(
+        storage_call(app_state.storage.clone(), move |storage| {
+            storage.put_blob_with_vault_limit(&vault_id, &blob_id, &bytes, max_vault_size_bytes)
+        })
+        .await?,
+    ))
 }
 
 pub(super) async fn get_blob(
@@ -724,8 +791,13 @@ pub(super) async fn get_blob(
         &format!("/api/v1/vaults/{vault_id}/blobs/{blob_id}"),
         &[],
         &headers,
-    )?;
-    match app_state.storage.get_blob(&vault_id, &blob_id)? {
+    )
+    .await?;
+    match storage_call(app_state.storage.clone(), move |storage| {
+        storage.get_blob(&vault_id, &blob_id)
+    })
+    .await?
+    {
         Some(bytes) => Ok((StatusCode::OK, bytes).into_response()),
         None => Ok(StatusCode::NOT_FOUND.into_response()),
     }
@@ -744,8 +816,14 @@ pub(super) async fn list_snapshots(
         &format!("/api/v1/vaults/{vault_id}/snapshots"),
         &[],
         &headers,
-    )?;
-    Ok(Json(app_state.storage.list_snapshots(&vault_id)?))
+    )
+    .await?;
+    Ok(Json(
+        storage_call(app_state.storage.clone(), move |storage| {
+            storage.list_snapshots(&vault_id)
+        })
+        .await?,
+    ))
 }
 
 pub(super) async fn put_snapshot(
@@ -763,11 +841,12 @@ pub(super) async fn put_snapshot(
         &format!("/api/v1/vaults/{vault_id}/snapshots"),
         &body,
         &headers,
-    )?;
+    )
+    .await?;
     let request: PutSnapshotRequest = serde_json::from_slice(&body)?;
     validation::validate_snapshot_request(&request, app_state.max_snapshot_ciphertext_bytes)?;
     validate_body_device_matches_signer(&request.device_id, &signed_device_id)?;
-    app_state.storage.put_snapshot(SnapshotRecord {
+    let snapshot = SnapshotRecord {
         vault_id: vault_id.clone(),
         snapshot_id: request.snapshot_id,
         device_id: request.device_id,
@@ -776,10 +855,13 @@ pub(super) async fn put_snapshot(
         nonce_hex: request.nonce_hex,
         ciphertext_hex: request.ciphertext_hex,
         created_at_unix: 0,
-    })?;
-    app_state
-        .storage
-        .prune_snapshots(&vault_id, app_state.snapshot_retain)?;
+    };
+    let snapshot_retain = app_state.snapshot_retain;
+    storage_call(app_state.storage.clone(), move |storage| {
+        storage.put_snapshot(snapshot)?;
+        storage.prune_snapshots(&vault_id, snapshot_retain)
+    })
+    .await?;
     Ok(StatusCode::CREATED)
 }
 
@@ -789,7 +871,7 @@ fn validate_json_body_len(app_state: &AppState, body: &Bytes) -> Result<(), ApiE
 
 fn validate_body_len(body: &Bytes, max_bytes: usize) -> Result<(), ApiError> {
     if body.len() > max_bytes {
-        return Err(ApiError(anyhow::anyhow!(
+        return Err(ApiError::payload_too_large(anyhow::anyhow!(
             "request body exceeds configured JSON size limit"
         )));
     }
@@ -801,18 +883,29 @@ fn validate_body_device_matches_signer(
     signed_device_id: &str,
 ) -> Result<(), ApiError> {
     if body_device_id != signed_device_id {
-        return Err(ApiError(anyhow::anyhow!(
+        return Err(ApiError::bad_request(anyhow::anyhow!(
             "request body device id does not match signing device"
         )));
     }
     Ok(())
 }
 
+async fn storage_call<T, F>(storage: crate::storage::Storage, f: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce(crate::storage::Storage) -> anyhow::Result<T> + Send + 'static,
+{
+    task::spawn_blocking(move || f(storage))
+        .await
+        .map_err(|error| ApiError::internal(anyhow::anyhow!("storage task failed: {error}")))?
+        .map_err(ApiError::from_storage)
+}
+
 fn require_loopback_admin(peer: SocketAddr) -> Result<(), ApiError> {
     if peer.ip().is_loopback() {
         return Ok(());
     }
-    Err(ApiError(anyhow::anyhow!(
+    Err(ApiError::forbidden(anyhow::anyhow!(
         "admin API is only available from loopback"
     )))
 }
@@ -834,7 +927,7 @@ fn validate_pairing_session_request(
 
 fn validate_device_label(label: &str) -> Result<(), ApiError> {
     if label.trim().is_empty() || label.len() > 128 {
-        return Err(ApiError(anyhow::anyhow!(
+        return Err(ApiError::bad_request(anyhow::anyhow!(
             "device label must be 1..128 bytes"
         )));
     }
@@ -843,7 +936,9 @@ fn validate_device_label(label: &str) -> Result<(), ApiError> {
 
 fn validate_verifying_key(verifying_key: &str) -> Result<(), ApiError> {
     if verifying_key.len() != 64 || !validation::is_lower_hex(verifying_key) {
-        return Err(ApiError(anyhow::anyhow!("invalid Ed25519 verifying key")));
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "invalid Ed25519 verifying key"
+        )));
     }
     Ok(())
 }
@@ -876,7 +971,9 @@ fn now_unix() -> anyhow::Result<u64> {
 
 fn validate_pairing_invite_text(invite: &str) -> Result<(), ApiError> {
     if invite.len() > 2048 || !(invite.starts_with("MYLONITE:") || invite.starts_with('{')) {
-        return Err(ApiError(anyhow::anyhow!("invalid pairing invite")));
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "invalid pairing invite"
+        )));
     }
     Ok(())
 }

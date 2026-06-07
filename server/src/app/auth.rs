@@ -1,10 +1,11 @@
 use axum::http::HeaderMap;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use tokio::task;
 
 use super::{ApiError, AppState};
-use crate::app::validation::is_lower_hex;
+use crate::{app::validation::is_lower_hex, storage::DeviceRecord};
 
-pub(super) fn verify_device_signature(
+pub(super) async fn verify_device_signature(
     app_state: &AppState,
     vault_id: &str,
     method: &str,
@@ -12,15 +13,17 @@ pub(super) fn verify_device_signature(
     body: &[u8],
     headers: &HeaderMap,
 ) -> Result<String, ApiError> {
-    let device_id = header_str(headers, "x-mylonite-device-id")?;
-    let signature_hex = header_str(headers, "x-mylonite-signature")?;
-    let device = app_state.storage.get_active_device(vault_id, device_id)?;
+    let device_id = header_str(headers, "x-mylonite-device-id")?.to_string();
+    let signature_hex = header_str(headers, "x-mylonite-signature")?.to_string();
+    let device = active_device(app_state, vault_id, &device_id).await?;
     if device.device_id != device_id {
-        return Err(ApiError(anyhow::anyhow!("device id mismatch")));
+        return Err(ApiError::unauthorized(anyhow::anyhow!(
+            "device id mismatch"
+        )));
     }
 
     let key_bytes = hex_decode(&device.verifying_key)?;
-    let signature_bytes = hex_decode(signature_hex)?;
+    let signature_bytes = hex_decode(&signature_hex)?;
     let verifying_key = VerifyingKey::from_bytes(
         key_bytes
             .as_slice()
@@ -35,10 +38,10 @@ pub(super) fn verify_device_signature(
     );
     let payload = format!("{}\n{}\n{}", method.to_uppercase(), path, hex_encode(body));
     verifying_key.verify(payload.as_bytes(), &signature)?;
-    Ok(device_id.to_string())
+    Ok(device_id)
 }
 
-pub(super) fn verify_ws_challenge_signature(
+pub(super) async fn verify_ws_challenge_signature(
     app_state: &AppState,
     vault_id: &str,
     device_id: &str,
@@ -46,7 +49,7 @@ pub(super) fn verify_ws_challenge_signature(
     challenge_hex: &str,
     signature_hex: &str,
 ) -> Result<(), ApiError> {
-    let device = app_state.storage.get_active_device(vault_id, device_id)?;
+    let device = active_device(app_state, vault_id, device_id).await?;
     let key_bytes = hex_decode(&device.verifying_key)?;
     let signature_bytes = hex_decode(signature_hex)?;
     let verifying_key = VerifyingKey::from_bytes(
@@ -66,17 +69,31 @@ pub(super) fn verify_ws_challenge_signature(
     Ok(())
 }
 
+async fn active_device(
+    app_state: &AppState,
+    vault_id: &str,
+    device_id: &str,
+) -> Result<DeviceRecord, ApiError> {
+    let storage = app_state.storage.clone();
+    let vault_id = vault_id.to_string();
+    let device_id = device_id.to_string();
+    task::spawn_blocking(move || storage.get_active_device(&vault_id, &device_id))
+        .await
+        .map_err(|error| ApiError::internal(anyhow::anyhow!("auth storage task failed: {error}")))?
+        .map_err(ApiError::unauthorized)
+}
+
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, ApiError> {
     headers
         .get(name)
-        .ok_or_else(|| ApiError(anyhow::anyhow!("missing {name} header")))?
+        .ok_or_else(|| ApiError::unauthorized(anyhow::anyhow!("missing {name} header")))?
         .to_str()
-        .map_err(|_| ApiError(anyhow::anyhow!("invalid {name} header")))
+        .map_err(|_| ApiError::unauthorized(anyhow::anyhow!("invalid {name} header")))
 }
 
 fn hex_decode(value: &str) -> Result<Vec<u8>, ApiError> {
     if value.len() % 2 != 0 || !is_lower_hex(value) {
-        return Err(ApiError(anyhow::anyhow!("invalid hex")));
+        return Err(ApiError::bad_request(anyhow::anyhow!("invalid hex")));
     }
     let mut out = Vec::with_capacity(value.len() / 2);
     for index in (0..value.len()).step_by(2) {
@@ -115,8 +132,8 @@ mod tests {
 
     static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    #[test]
-    fn signature_verification_accepts_valid_ed25519_signatures() {
+    #[tokio::test]
+    async fn signature_verification_accepts_valid_ed25519_signatures() {
         let (state, vault_id, device_id, signing_key) = signed_test_state();
         let body = br#"{"hello":"world"}"#;
         let headers = signed_headers(
@@ -135,12 +152,13 @@ mod tests {
             body,
             &headers,
         )
+        .await
         .expect("valid signature verifies");
         assert_eq!(verified_device_id, device_id);
     }
 
-    #[test]
-    fn signature_verification_rejects_invalid_ed25519_signatures() {
+    #[tokio::test]
+    async fn signature_verification_rejects_invalid_ed25519_signatures() {
         let (state, vault_id, device_id, signing_key) = signed_test_state();
         let body = br#"{"hello":"world"}"#;
         let headers = signed_headers(
@@ -160,12 +178,13 @@ mod tests {
                 body,
                 &headers,
             )
+            .await
             .is_err()
         );
     }
 
-    #[test]
-    fn websocket_challenge_verification_accepts_valid_signature() {
+    #[tokio::test]
+    async fn websocket_challenge_verification_accepts_valid_signature() {
         let (state, vault_id, device_id, signing_key) = signed_test_state();
         let path = format!("/ws?vault_id={vault_id}&device_id={device_id}");
         let challenge_hex = "00112233445566778899aabbccddeeff";
@@ -180,11 +199,12 @@ mod tests {
             challenge_hex,
             &hex_encode(&signature.to_bytes()),
         )
+        .await
         .expect("valid websocket challenge signature verifies");
     }
 
-    #[test]
-    fn websocket_challenge_verification_rejects_wrong_challenge() {
+    #[tokio::test]
+    async fn websocket_challenge_verification_rejects_wrong_challenge() {
         let (state, vault_id, device_id, signing_key) = signed_test_state();
         let path = format!("/ws?vault_id={vault_id}&device_id={device_id}");
         let signature = signing_key.sign(format!("WS\n{path}\n0011").as_bytes());
@@ -198,6 +218,7 @@ mod tests {
                 "2233",
                 &hex_encode(&signature.to_bytes()),
             )
+            .await
             .is_err()
         );
     }

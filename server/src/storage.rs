@@ -508,17 +508,20 @@ impl Storage {
         let read = self.db.begin_read().context("begin read")?;
         let table = read.open_table(OPLOG).context("open oplog")?;
         let prefix = format!("{vault_id}:");
+        let start = op_key(vault_id, after_seq.saturating_add(1));
+        let end = format!("{vault_id};");
         let mut out = Vec::new();
-        for item in table.iter().context("iterate oplog")? {
+        for item in table
+            .range(start.as_str()..end.as_str())
+            .context("range oplog")?
+        {
             let (key, value) = item.context("read op row")?;
             if !key.value().starts_with(&prefix) {
-                continue;
+                break;
             }
             let op: EncryptedOpRecord =
                 serde_json::from_slice(value.value()).context("decode op row")?;
-            if op.server_seq > after_seq {
-                out.push(op);
-            }
+            out.push(op);
             if u64::try_from(out.len()).unwrap_or(u64::MAX) >= limit {
                 break;
             }

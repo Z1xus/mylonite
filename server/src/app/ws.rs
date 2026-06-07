@@ -10,7 +10,10 @@ use mylonite_protocol::{ClientMsgKind, Frame, ServerMsgKind};
 use rand::RngCore;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::time::{Duration, timeout};
+use tokio::{
+    task,
+    time::{Duration, timeout},
+};
 use tracing::warn;
 
 use super::{ApiError, AppState, auth::verify_ws_challenge_signature, validation};
@@ -82,7 +85,7 @@ async fn handle_socket(state: AppState, vault_id: String, device_id: String, soc
                         }
                     }
                     Ok(frame) if frame.kind == ClientMsgKind::OpPush as u8 => {
-                        if let Err(error) = append_pushed_op(&state, &vault_id, &device_id, &frame.payload) {
+                        if let Err(error) = append_pushed_op(&state, &vault_id, &device_id, &frame.payload).await {
                             warn!(?error, "websocket op push rejected");
                         }
                     }
@@ -102,21 +105,21 @@ async fn handle_socket(state: AppState, vault_id: String, device_id: String, soc
     }
 }
 
-fn append_pushed_op(
+async fn append_pushed_op(
     state: &AppState,
     vault_id: &str,
     authenticated_device_id: &str,
     payload: &[u8],
 ) -> Result<(), ApiError> {
     if payload.len() > state.max_op_json_body_bytes {
-        return Err(ApiError(anyhow::anyhow!(
+        return Err(ApiError::payload_too_large(anyhow::anyhow!(
             "request body exceeds configured JSON size limit"
         )));
     }
     let request: super::routes::AppendOpRequest = serde_json::from_slice(payload)?;
     validation::validate_op_request(&request, state.max_op_ciphertext_bytes)?;
     if request.device_id != authenticated_device_id {
-        return Err(ApiError(anyhow::anyhow!(
+        return Err(ApiError::bad_request(anyhow::anyhow!(
             "request body device id does not match websocket device"
         )));
     }
@@ -132,7 +135,12 @@ fn append_pushed_op(
         ciphertext_hex: request.ciphertext_hex,
         accepted_at_unix: 0,
     };
-    let append = state.storage.append_op(op.clone())?;
+    let storage = state.storage.clone();
+    let append_op = op.clone();
+    let append = task::spawn_blocking(move || storage.append_op(append_op))
+        .await
+        .map_err(|error| ApiError::internal(anyhow::anyhow!("storage task failed: {error}")))?
+        .map_err(ApiError::from_storage)?;
     op.server_seq = append.server_seq;
     if append.inserted {
         let _ = state.op_broadcast.send(op);
@@ -188,6 +196,7 @@ async fn authenticate_socket(
         &challenge_hex,
         &hello.signature,
     )
+    .await
     .is_err()
     {
         return false;

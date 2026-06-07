@@ -6,6 +6,7 @@ mod ws;
 
 use std::{
     collections::HashMap,
+    fmt,
     net::SocketAddr,
     path::Path,
     sync::{Arc, Mutex},
@@ -20,7 +21,7 @@ use axum::{
 };
 use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::info;
+use tracing::{error, info};
 
 use crate::{
     config::{LimitsConfig, SnapshotConfig, TlsConfig},
@@ -145,12 +146,7 @@ fn build_router(
     max_blob_size_bytes: usize,
     max_snapshot_json_body_bytes: usize,
 ) -> Router {
-    Router::new()
-        .route("/health", get(routes::health))
-        .route("/pair", get(routes::pair_invite_page))
-        .route("/p", get(routes::pair_invite_page))
-        .route("/p/{code}", get(routes::pair_invite_page_with_code))
-        .route("/P/{code}", get(routes::pair_invite_page_with_code))
+    let admin_routes = Router::new()
         .route(
             "/api/v1/admin/vaults",
             get(routes::admin_list_vaults)
@@ -169,7 +165,9 @@ fn build_router(
             "/api/v1/admin/vaults/{vault_id}/devices/{device_id}/revoke",
             post(routes::admin_revoke_device),
         )
-        .route("/api/v1/admin/stats", get(routes::admin_stats))
+        .route("/api/v1/admin/stats", get(routes::admin_stats));
+
+    let api_routes = Router::new()
         .route(
             "/api/v1/pair/first-device",
             post(routes::pair_first_device).layer(DefaultBodyLimit::max(max_json_body_bytes)),
@@ -225,7 +223,16 @@ fn build_router(
                 .layer(DefaultBodyLimit::max(max_snapshot_json_body_bytes)),
         )
         .route("/ws", get(ws::ws_handler))
-        .layer(api_cors_layer())
+        .layer(api_cors_layer());
+
+    Router::new()
+        .route("/health", get(routes::health))
+        .route("/pair", get(routes::pair_invite_page))
+        .route("/p", get(routes::pair_invite_page))
+        .route("/p/{code}", get(routes::pair_invite_page_with_code))
+        .route("/P/{code}", get(routes::pair_invite_page_with_code))
+        .merge(admin_routes)
+        .merge(api_routes)
         .with_state(state)
 }
 
@@ -247,19 +254,96 @@ fn api_cors_layer() -> CorsLayer {
 }
 
 #[derive(Debug)]
-struct ApiError(anyhow::Error);
+struct ApiError {
+    status: StatusCode,
+    public_message: &'static str,
+    source: anyhow::Error,
+}
+
+impl ApiError {
+    fn bad_request(error: impl Into<anyhow::Error>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "bad request", error)
+    }
+
+    fn unauthorized(error: impl Into<anyhow::Error>) -> Self {
+        Self::new(StatusCode::UNAUTHORIZED, "unauthorized", error)
+    }
+
+    fn forbidden(error: impl Into<anyhow::Error>) -> Self {
+        Self::new(StatusCode::FORBIDDEN, "forbidden", error)
+    }
+
+    fn not_found(error: impl Into<anyhow::Error>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, "not found", error)
+    }
+
+    fn conflict(error: impl Into<anyhow::Error>) -> Self {
+        Self::new(StatusCode::CONFLICT, "conflict", error)
+    }
+
+    fn payload_too_large(error: impl Into<anyhow::Error>) -> Self {
+        Self::new(StatusCode::PAYLOAD_TOO_LARGE, "payload too large", error)
+    }
+
+    fn internal(error: impl Into<anyhow::Error>) -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal server error",
+            error,
+        )
+    }
+
+    fn from_storage(error: anyhow::Error) -> Self {
+        let message = error.to_string();
+        match message.as_str() {
+            "vault name is required" | "vault name is too long" => Self::bad_request(error),
+            "vault not found" | "pairing token not found" | "device not found" => {
+                Self::not_found(error)
+            }
+            "vault name already exists"
+            | "pairing token already consumed"
+            | "pairing token expired"
+            | "device revoked" => Self::conflict(error),
+            "vault device limit reached" | "vault exceeds configured size limit" => {
+                Self::payload_too_large(error)
+            }
+            _ => Self::internal(error),
+        }
+    }
+
+    fn new(
+        status: StatusCode,
+        public_message: &'static str,
+        error: impl Into<anyhow::Error>,
+    ) -> Self {
+        Self {
+            status,
+            public_message,
+            source: error.into(),
+        }
+    }
+}
 
 impl<E> From<E> for ApiError
 where
     E: Into<anyhow::Error>,
 {
     fn from(error: E) -> Self {
-        Self(error.into())
+        Self::bad_request(error)
+    }
+}
+
+impl fmt::Display for ApiError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.public_message)
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (StatusCode::BAD_REQUEST, self.0.to_string()).into_response()
+        if self.status.is_server_error() {
+            error!(error = %self.source, "request failed");
+        }
+        (self.status, self.public_message).into_response()
     }
 }

@@ -104,6 +104,35 @@ describe("markdown debounce", () => {
 
     expect(pushMarkdownUpdate).not.toHaveBeenCalled();
   });
+
+  it("flushes pending markdown updates sequentially", async () => {
+    const engine = new SyncEngine(testHost());
+    let releaseFirst: () => void = () => undefined;
+    const firstPush = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const pushMarkdownUpdate = vi
+      .fn()
+      .mockReturnValueOnce(firstPush)
+      .mockResolvedValue(undefined);
+    (engine as unknown as { pushMarkdownUpdate: typeof pushMarkdownUpdate }).pushMarkdownUpdate = pushMarkdownUpdate;
+    const first = testFile("Notes/a.md", "md");
+    const second = testFile("Notes/b.md", "md");
+
+    callPrivate(engine, "scheduleMarkdownUpdate", first);
+    callPrivate(engine, "scheduleMarkdownUpdate", second);
+    const flush = callPrivate<Promise<void>>(engine, "flushScheduledMarkdownUpdates");
+    await Promise.resolve();
+
+    expect(pushMarkdownUpdate).toHaveBeenCalledTimes(1);
+    expect(pushMarkdownUpdate).toHaveBeenCalledWith(first);
+
+    releaseFirst();
+    await flush;
+
+    expect(pushMarkdownUpdate).toHaveBeenCalledTimes(2);
+    expect(pushMarkdownUpdate).toHaveBeenNthCalledWith(2, second);
+  });
 });
 
 describe("websocket reconnect", () => {
@@ -610,7 +639,10 @@ describe("markdown recovery log", () => {
     const file = testFile("Notes/a.md", "md");
 
     callPrivate(engine, "scheduleMarkdownUpdate", file);
-    await engine.syncNow();
+    const sync = engine.syncNow();
+    await Promise.resolve();
+    await vi.runAllTimersAsync();
+    await sync;
 
     expect(pushMarkdownUpdate).toHaveBeenCalledTimes(1);
     expect(pushMarkdownUpdate).toHaveBeenCalledWith(file);

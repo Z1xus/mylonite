@@ -833,12 +833,11 @@ export class SyncEngine {
   private async flushScheduledMarkdownUpdates(): Promise<void> {
     const pending = Array.from(this.modifyTimers.entries());
     this.modifyTimers.clear();
-    const pushes: Promise<void>[] = [];
     for (const [, { file, timer }] of pending) {
       window.clearTimeout(timer);
-      pushes.push(this.pushMarkdownUpdate(file));
+      await this.pushMarkdownUpdate(file);
+      await yieldToObsidian();
     }
-    await Promise.all(pushes);
   }
 
   private dropScheduledMarkdownUpdates(): void {
