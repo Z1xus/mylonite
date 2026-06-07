@@ -375,9 +375,9 @@ export default class MylonitePlugin extends Plugin {
     if (this.pairingPollTimer !== null || !this.hasPairingStateToPoll()) {
       return;
     }
-    this.pairingPollTimer = window.setInterval(() => {
+    this.pairingPollTimer = this.registerInterval(window.setInterval(() => {
       void this.pollPairingState(false);
-    }, 3000);
+    }, 3000));
     void this.pollPairingState(false);
   }
 
