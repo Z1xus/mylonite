@@ -68,10 +68,6 @@ class ButtonComponent {
     return this;
   }
 
-  setDestructive(): this {
-    return this;
-  }
-
   onClick(): this {
     return this;
   }

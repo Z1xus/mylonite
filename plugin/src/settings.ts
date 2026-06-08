@@ -164,7 +164,6 @@ export class MyloniteSettingTab extends PluginSettingTab {
       .setDesc("Removes local credentials and stops syncing this vault.")
       .addButton((button) => button
         .setButtonText("Unpair")
-        .setDestructive()
         .onClick(async () => {
           await this.host.unpairDevice();
           this.render();
