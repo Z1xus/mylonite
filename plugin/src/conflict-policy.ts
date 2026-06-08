@@ -12,14 +12,6 @@ export function decideRemoteV2Apply(index: VaultStateIndex, payload: RemoteV2Pay
   if (payload.kind === "file-delete" && localDirtyFileIds.has(payload.fileId)) {
     return { action: "prompt", reason: "remote delete overlaps local edits" };
   }
-  if (payload.fileKind === "markdown" && localDirtyFileIds.has(payload.fileId)) {
-    if (payload.kind === "file-rename") {
-      return { action: "conflict-path", path: conflictPath(payload.newPath, payload.fileId), reason: "remote markdown rename overlaps local edits" };
-    }
-    if (payload.kind === "file-update") {
-      return { action: "conflict-path", path: conflictPath(payload.path, payload.fileId), reason: "remote markdown update overlaps local edits" };
-    }
-  }
   if (payload.kind === "file-rename") {
     const occupant = index.byPath(payload.newPath);
     if (!occupant || occupant.fileId === payload.fileId) {

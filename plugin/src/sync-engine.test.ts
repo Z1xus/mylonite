@@ -540,7 +540,7 @@ describe("durable local dirty state", () => {
     expect(noticeMessages().filter((message) => message.startsWith("Mylonite needs input"))).toHaveLength(1);
   });
 
-  it("keeps local markdown and writes remote markdown to a conflict path while local work is unconfirmed", async () => {
+  it("merges a remote markdown update into the same file even while a local edit is queued", async () => {
     const path = "Notes/a.md";
     const fileId = "f" + "a".repeat(32);
     const localDoc = new Y.Doc();
@@ -580,58 +580,13 @@ describe("durable local dirty state", () => {
       contentHash: "remote",
     }), 9);
 
-    expect(vault.readText(path)).toBe("local text");
-    expect(vault.readText("Notes/a conflict-faaaaaaa.md")).toBe("remote text");
-    expect(noticeMessages().filter((message) => message.startsWith("Mylonite kept both versions"))).toHaveLength(1);
-  });
-
-  it("rehydrates pending recovery entries before remote markdown conflict decisions", async () => {
-    const path = "Notes/a.md";
-    const fileId = "f" + "a".repeat(32);
-    const clientOpId = "c".repeat(64);
-    const localDoc = new Y.Doc();
-    const localTree = localDoc.getMap<Y.Map<unknown>>("tree");
-    const updateHex = encodeMarkdownUpsertUpdate(localDoc, localTree, path, "remote text");
-    const vault = new MemoryVault([[path, "local text"]]);
-    const host = testHost(vault);
-    host.settings.pendingOps = [testOp(clientOpId)];
-    host.settings.recoveryLog = [{
-      recoveryId: "r" + "1".repeat(32),
-      path,
-      fileId,
-      contentHash: "local2",
-      beforeContent: "local",
-      afterContent: "local text",
-      observedAtMs: 2,
-      clientOpId,
-    }];
-    host.settings.durableSyncState.index.files = [{
-      fileId,
-      path,
-      kind: "markdown",
-      contentHash: "local",
-      tombstone: false,
-      lastLocalSeq: 0,
-      lastRemoteSeq: 0,
-      updatedAtMs: 1,
-    }];
-    const engine = new SyncEngine(host);
-
-    await callPrivate(engine, "applyRemoteV2Payload", v2Payload({
-      kind: "file-update",
-      fileId,
-      path,
-      fileKind: "markdown",
-      updateHex,
-      contentHash: "remote",
-    }), 10);
-
-    expect(vault.readText(path)).toBe("local text");
-    expect(vault.readText("Notes/a conflict-faaaaaaa.md")).toBe("remote text");
+    expect(vault.readText(path)).toBe("remote text");
+    expect(vault.readText("Notes/a conflict-faaaaaaa.md")).toBeUndefined();
+    expect(noticeMessages().filter((message) => message.startsWith("Mylonite kept both versions"))).toHaveLength(0);
   });
 });
 
-describe("markdown recovery log", () => {
+describe("sync status and manual sync", () => {
   beforeEach(() => {
     vi.stubGlobal("window", globalThis);
     noticeMessages().length = 0;
@@ -641,24 +596,6 @@ describe("markdown recovery log", () => {
     vi.useRealTimers();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
-  });
-
-  it("records recovery data when a markdown update is queued", async () => {
-    const path = "Notes/a.md";
-    const vault = new MemoryVault([[path, "local text"]]);
-    const host = testHost(vault);
-    host.loadVaultKeys = vi.fn().mockResolvedValue(keys);
-    const engine = new SyncEngine(host);
-
-    await callPrivate(engine, "pushMarkdownUpdate", testFile(path, "md"));
-
-    expect(host.settings.recoveryLog).toHaveLength(1);
-    expect(host.settings.recoveryLog[0]).toMatchObject({
-      path,
-      beforeContent: "",
-      afterContent: "local text",
-    });
-    expect(host.settings.recoveryLog[0].clientOpId).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it("syncNow flushes scheduled markdown updates before catch-up", async () => {
@@ -678,56 +615,11 @@ describe("markdown recovery log", () => {
     expect(pushMarkdownUpdate).toHaveBeenCalledWith(file);
   });
 
-  it("restores the newest recovery entry and queues it as a normal markdown update", async () => {
-    const path = "Notes/a.md";
-    const fileId = "f" + "a".repeat(32);
-    const vault = new MemoryVault([[path, "bad text"]]);
-    const host = testHost(vault);
-    host.loadVaultKeys = vi.fn().mockResolvedValue(keys);
-    host.settings.recoveryLog = [{
-      recoveryId: "r" + "1".repeat(32),
-      path,
-      fileId,
-      contentHash: "good",
-      beforeContent: "start",
-      afterContent: "good text",
-      observedAtMs: 2,
-      clientOpId: "c".repeat(64),
-    }];
-    host.settings.durableSyncState.index.files = [{
-      fileId,
-      path,
-      kind: "markdown",
-      contentHash: "bad",
-      tombstone: false,
-      lastLocalSeq: 0,
-      lastRemoteSeq: 0,
-      updatedAtMs: 1,
-    }];
-    const engine = new SyncEngine(host);
-
-    await expect(engine.restoreLatestRecoveryForPath(path)).resolves.toBe(true);
-
-    expect(vault.readText(path)).toBe("good text");
-    expect(host.settings.recoveryLog.at(-1)?.afterContent).toBe("good text");
-    expect(host.settings.durableSyncState.journal.at(-1)?.status).toBe("queued");
-  });
-
   it("reports detailed sync status", () => {
     const host = testHost();
     host.settings.lastServerSeq = 12;
     host.settings.pendingBlobs = [{ blobId: "a".repeat(64), envelopeHex: "00" }];
     host.settings.pendingOps = [testOp("b".repeat(64))];
-    host.settings.recoveryLog = [{
-      recoveryId: "r" + "1".repeat(32),
-      path: "Notes/a.md",
-      fileId: "f" + "a".repeat(32),
-      contentHash: "abcd",
-      beforeContent: "",
-      afterContent: "text",
-      observedAtMs: 1,
-      clientOpId: "b".repeat(64),
-    }];
     host.settings.durableSyncState.journal = [{
       transitionId: "x" + "1".repeat(32),
       status: "queued",
@@ -745,7 +637,6 @@ describe("markdown recovery log", () => {
     expect(engine.syncStatusSummary()).toContain("1 pending blobs");
     expect(engine.syncStatusSummary()).toContain("1 pending ops");
     expect(engine.syncStatusSummary()).toContain("1 queued local changes");
-    expect(engine.syncStatusSummary()).toContain("1 recovery records");
   });
 });
 
@@ -886,7 +777,6 @@ function testHost(vault: MemoryVault | null = null) {
       lamport: 0,
       pendingBlobs: [],
       pendingOps: [],
-      recoveryLog: [],
       durableSyncState: {
         version: 1,
         index: { version: 1, files: [], tombstones: [] },
