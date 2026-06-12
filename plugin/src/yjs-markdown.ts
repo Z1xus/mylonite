@@ -16,14 +16,17 @@ export function getMarkdownText(tree: MarkdownTree, path: string): Y.Text | null
 }
 
 export function encodeMarkdownUpsertUpdate(doc: Y.Doc, tree: MarkdownTree, path: string, content: string): string {
+  const beforeVector = Y.encodeStateVector(doc);
+  let createdEntry = false;
   doc.transact(() => {
+    createdEntry = !tree.has(path);
     const entry = ensureMarkdownEntry(tree, path);
     const text = ensureMarkdownContent(entry);
     entry.set(UPDATED_AT_KEY, Date.now());
     text.delete(0, text.length);
     text.insert(0, content);
   }, "local-vault");
-  return bytesToHex(Y.encodeStateAsUpdate(doc));
+  return bytesToHex(createdEntry ? Y.encodeStateAsUpdate(doc, beforeVector) : Y.encodeStateAsUpdate(doc));
 }
 
 export function encodeMarkdownDeleteUpdate(doc: Y.Doc, tree: MarkdownTree, path: string): string {
@@ -70,6 +73,17 @@ function ensureMarkdownContent(entry: MarkdownEntry): Y.Text {
 
 export function applyMarkdownUpdate(doc: Y.Doc, updateHex: string): void {
   Y.applyUpdate(doc, hexToBytes(updateHex), "remote-server");
+}
+
+export function decodeIsolatedMarkdownContent(updateHex: string, path: string): string | null {
+  const doc = new Y.Doc();
+  try {
+    Y.applyUpdate(doc, hexToBytes(updateHex), "isolated-remote");
+    const text = getMarkdownText(doc.getMap<MarkdownEntry>("tree"), path);
+    return text ? text.toString() : null;
+  } finally {
+    doc.destroy();
+  }
 }
 
 export function bytesToHex(bytes: Uint8Array): string {

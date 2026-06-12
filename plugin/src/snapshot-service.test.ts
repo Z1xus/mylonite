@@ -90,6 +90,38 @@ describe("snapshot restore", () => {
     expect(files.has("local-only.md")).toBe(false);
   });
 
+  it("leaves locally dirty paths untouched when skip paths are provided", async () => {
+    const { files, fileManager, vault } = fakeVault([
+      { path: "dirty.md", extension: "md", content: "local edits" },
+      { path: "clean.md", extension: "md", content: "old" },
+      { path: "dirty-local-only.md", extension: "md", content: "queued local file" },
+    ]);
+    const snapshot = snapshotRecord({
+      version: 1,
+      entries: [
+        { kind: "markdown", path: "dirty.md", content: "snapshot version" },
+        { kind: "markdown", path: "clean.md", content: "new" },
+      ],
+    });
+
+    await restoreEncryptedSnapshot(
+      vault as never,
+      fileManager as never,
+      new Set(),
+      keys,
+      "vault-a",
+      snapshot,
+      async () => new Uint8Array(),
+      true,
+      undefined,
+      new Set(["dirty.md", "dirty-local-only.md"]),
+    );
+
+    expect(files.get("dirty.md")?.content).toBe("local edits");
+    expect(files.get("clean.md")?.content).toBe("new");
+    expect(files.has("dirty-local-only.md")).toBe(true);
+  });
+
   it("rejects binary snapshot entries whose decrypted blob size differs from metadata", async () => {
     const { fileManager, vault } = fakeVault([]);
     const snapshot = snapshotRecord({

@@ -108,6 +108,7 @@ export async function restoreEncryptedSnapshot(
   loadBlob: (entry: SnapshotBinaryEntry) => Promise<Uint8Array>,
   deleteMissing = false,
   debug?: (message: string) => void,
+  skipPaths: ReadonlySet<string> = new Set(),
 ): Promise<SnapshotPayload> {
   const payload = decryptSnapshot<SnapshotPayload>(
     keys,
@@ -124,6 +125,9 @@ export async function restoreEncryptedSnapshot(
       await yieldToObsidian();
     }
     const started = performance.now();
+    if (skipPaths.has(normalizeVaultPath(entry.path, "invalid snapshot path"))) {
+      continue;
+    }
     if (entry.kind === "markdown") {
       await applyMarkdownUpsert(vault, suppressedPaths, entry.path, entry.content);
       logSlowSnapshotFile("snapshot restore markdown", entry.path, started, debug);
@@ -145,7 +149,7 @@ export async function restoreEncryptedSnapshot(
       await yieldToObsidian();
     }
     const path = normalizeVaultPath(file.path, "invalid snapshot path");
-    if (!snapshotPaths.has(path)) {
+    if (!snapshotPaths.has(path) && !skipPaths.has(path)) {
       suppressedPaths.add(path);
       await fileManager.trashFile(file);
     }

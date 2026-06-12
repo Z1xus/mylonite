@@ -16,6 +16,7 @@ export interface FileObservation {
   content: string | Uint8Array;
   blobId?: string;
   size?: number;
+  mtimeMs?: number;
 }
 
 export class LocalEventClassifier {
@@ -107,14 +108,15 @@ function observationHash(observation: FileObservation): string {
   return typeof observation.content === "string" ? hashText(observation.content) : hashBytes(observation.content);
 }
 
-function withObservedContentRef<T extends { kind: FileKind; blobId?: string; size?: number }>(file: T, observation: FileObservation): T {
+function withObservedContentRef<T extends { kind: FileKind; blobId?: string; size?: number; mtimeMs?: number }>(file: T, observation: FileObservation): T {
   if (observation.kind !== "binary") {
-    return { ...file, blobId: undefined, size: undefined };
+    return { ...file, blobId: undefined, size: undefined, mtimeMs: observation.mtimeMs };
   }
   return {
     ...file,
     blobId: observation.blobId,
     size: observation.size,
+    mtimeMs: observation.mtimeMs,
   };
 }
 

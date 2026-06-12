@@ -5,6 +5,7 @@ import {
   MARKDOWN_DEBOUNCE_MS,
   SyncEngine,
   parseWebSocketChallenge,
+  pruneJournal,
   racedPaths,
   retainUnflushedPendingOps,
   validateRemoteOpRecord,
@@ -14,9 +15,11 @@ import {
 } from "./sync-engine";
 import { PendingEncryptedOp } from "./sync-types";
 import { ServerMsgKind, encodeFrame } from "./protocol";
-import { encodeMarkdownRenameUpdate, encodeMarkdownUpsertUpdate, hexToBytes } from "./yjs-markdown";
+import { encodeMarkdownDeleteUpdate, encodeMarkdownRenameUpdate, encodeMarkdownUpsertUpdate, getMarkdownText, hexToBytes } from "./yjs-markdown";
 import { VaultKeys } from "./crypto";
 import { encryptBlob } from "./sync-codec";
+import { ApiError } from "./api";
+import { SyncJournalEntry, SyncTransitionStatus, hashText } from "./sync-state";
 
 const keys: VaultKeys = {
   opKey: new Uint8Array(32).fill(1),
@@ -280,9 +283,9 @@ describe("sync task scheduling", () => {
     const engine = new SyncEngine(host);
 
     const first = engine.catchUp();
-    await Promise.resolve();
+    await drainMicrotasks();
     const second = engine.catchUp();
-    await Promise.resolve();
+    await drainMicrotasks();
 
     expect(listOps).toHaveBeenCalledTimes(1);
 
@@ -536,8 +539,8 @@ describe("durable local dirty state", () => {
       tombstoneId: "t" + "b".repeat(32),
     }), 8);
 
-    expect(host.updateStatus).toHaveBeenCalledWith("conflict needs input");
-    expect(noticeMessages().filter((message) => message.startsWith("Mylonite needs input"))).toHaveLength(1);
+    expect(host.updateStatus).toHaveBeenCalledWith("kept local version");
+    expect(noticeMessages().filter((message) => message.startsWith("Mylonite kept your local version"))).toHaveLength(1);
   });
 
   it("merges a remote markdown update into the same file even while a local edit is queued", async () => {
@@ -640,6 +643,337 @@ describe("sync status and manual sync", () => {
   });
 });
 
+describe("rename echo suppression", () => {
+  it("consumes both suppressed paths for a remote rename echo", async () => {
+    const vault = new MemoryVault([["Notes/b.md", "x"]]);
+    const host = testHost(vault);
+    const engine = new SyncEngine(host);
+    const suppressed = (engine as unknown as { suppressedPaths: Set<string> }).suppressedPaths;
+    suppressed.add("Notes/a.md");
+    suppressed.add("Notes/b.md");
+
+    await callPrivate(engine, "pushFileRename", "Notes/a.md", testFile("Notes/b.md", "md"));
+
+    expect(suppressed.size).toBe(0);
+    expect(host.settings.pendingOps).toHaveLength(0);
+    expect(host.settings.durableSyncState.journal).toHaveLength(0);
+  });
+});
+
+describe("websocket push queueing", () => {
+  beforeEach(() => {
+    vi.stubGlobal("WebSocket", class {
+      static readonly OPEN = 1;
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("queues an op exactly once when the websocket send fails", async () => {
+    const vault = new MemoryVault([["Notes/a.md", "hello"]]);
+    const host = testHost(vault);
+    host.loadVaultKeys = vi.fn().mockResolvedValue(keys);
+    const engine = new SyncEngine(host);
+    (engine as unknown as { socketLive: boolean }).socketLive = true;
+    (engine as unknown as { socket: unknown }).socket = {
+      readyState: 1,
+      send: () => {
+        throw new Error("socket gone");
+      },
+    };
+
+    await callPrivate(engine, "pushMarkdownUpdate", testFile("Notes/a.md", "md"));
+
+    expect(host.settings.pendingOps).toHaveLength(1);
+  });
+});
+
+describe("catch-up recovery", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("acknowledges own ops seen during catch-up after a lost acknowledgement", async () => {
+    const host = testHost(new MemoryVault());
+    const clientOpId = "c".repeat(64);
+    const ownOp = { ...testBroadcastOp(), device_id: host.settings.deviceId, client_op_id: clientOpId };
+    host.settings.pendingOps = [testOp(clientOpId)];
+    host.settings.durableSyncState.journal = [journalEntry("queued", { clientOpId })];
+    const listOps = vi.fn().mockResolvedValueOnce([ownOp]).mockResolvedValue([]);
+    host.createApiClient = () => ({
+      websocketUrl: () => "wss://example.test/ws",
+      listOps,
+      putBlob: vi.fn().mockResolvedValue(undefined),
+      appendOp: vi.fn().mockRejectedValue(new Error("offline")),
+    }) as never;
+    const engine = new SyncEngine(host);
+
+    await engine.catchUp();
+
+    expect(host.settings.pendingOps).toHaveLength(0);
+    expect(host.settings.durableSyncState.journal[0].status).toBe("acknowledged");
+  });
+
+  it("triggers a catch-up when the websocket authenticates", async () => {
+    const engine = new SyncEngine(testHost());
+    const catchUp = vi.fn().mockResolvedValue(undefined);
+    (engine as unknown as { catchUp: typeof catchUp }).catchUp = catchUp;
+
+    await callPrivate(engine, "handleSocketMessage", emptyFrame(ServerMsgKind.HelloAck));
+
+    expect(catchUp).toHaveBeenCalledTimes(1);
+  });
+
+  it("aborts catch-up when the server repeats already-applied ops", async () => {
+    const host = testHost();
+    host.settings.lastServerSeq = 5;
+    const listOps = vi.fn().mockResolvedValue([{ ...testBroadcastOp(), server_seq: 5 }]);
+    host.createApiClient = () => ({
+      websocketUrl: () => "wss://example.test/ws",
+      listOps,
+      putBlob: vi.fn().mockResolvedValue(undefined),
+      appendOp: vi.fn().mockResolvedValue(undefined),
+    }) as never;
+    const engine = new SyncEngine(host);
+    const applyRemoteOp = vi.fn().mockResolvedValue(undefined);
+    (engine as unknown as { applyRemoteOp: typeof applyRemoteOp }).applyRemoteOp = applyRemoteOp;
+
+    await expect(engine.catchUp()).rejects.toThrow("without advancing");
+    expect(listOps).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("offline reconcile", () => {
+  it("pushes offline creations, modifications, and deletions at startup", async () => {
+    const vault = new MemoryVault([
+      ["Notes/changed.md", "new content"],
+      ["Notes/new.md", "created offline"],
+      ["Notes/same.md", "unchanged"],
+    ]);
+    const host = testHost(vault);
+    host.loadVaultKeys = vi.fn().mockResolvedValue(keys);
+    const appendOp = vi.fn().mockResolvedValue(undefined);
+    host.createApiClient = () => ({
+      websocketUrl: () => "wss://example.test/ws",
+      listOps: vi.fn().mockResolvedValue([]),
+      putBlob: vi.fn().mockResolvedValue(undefined),
+      appendOp,
+    }) as never;
+    host.settings.durableSyncState.index.files = [
+      fileState("Notes/changed.md", hashText("old content"), "f" + "1".repeat(32)),
+      fileState("Notes/same.md", hashText("unchanged"), "f" + "2".repeat(32)),
+      fileState("Notes/deleted.md", hashText("gone"), "f" + "3".repeat(32)),
+    ];
+    const engine = new SyncEngine(host);
+
+    await callPrivate(engine, "reconcileOfflineChanges");
+
+    expect(appendOp).toHaveBeenCalledTimes(3);
+    expect(vault.readText("Notes/same.md")).toBe("unchanged");
+  });
+});
+
+describe("rename-aware remote application", () => {
+  it("applies a remote markdown update at the file's renamed local path", async () => {
+    const fileId = "f" + "a".repeat(32);
+    const senderDoc = new Y.Doc();
+    const senderTree = senderDoc.getMap<Y.Map<unknown>>("tree");
+    encodeMarkdownUpsertUpdate(senderDoc, senderTree, "Notes/a.md", "hello");
+    const updateHex = encodeMarkdownUpsertUpdate(senderDoc, senderTree, "Notes/a.md", "hello world");
+    const vault = new MemoryVault([["Moved/a.md", "hello"]]);
+    const host = testHost(vault);
+    host.settings.durableSyncState.index.files = [fileState("Moved/a.md", hashText("hello"), fileId)];
+    const engine = new SyncEngine(host);
+
+    await callPrivate(engine, "applyRemoteV2Payload", v2Payload({
+      kind: "file-update",
+      fileId,
+      path: "Notes/a.md",
+      updateHex,
+      contentHash: hashText("hello world"),
+    }), 3);
+
+    expect(vault.readText("Moved/a.md")).toBe("hello world");
+    expect(vault.readText("Notes/a.md")).toBeUndefined();
+  });
+
+  it("applies a remote delete at the file's renamed local path", async () => {
+    const fileId = "f" + "a".repeat(32);
+    const senderDoc = new Y.Doc();
+    const senderTree = senderDoc.getMap<Y.Map<unknown>>("tree");
+    encodeMarkdownUpsertUpdate(senderDoc, senderTree, "Notes/a.md", "hello");
+    const updateHex = encodeMarkdownDeleteUpdate(senderDoc, senderTree, "Notes/a.md");
+    const vault = new MemoryVault([["Moved/a.md", "hello"]]);
+    const host = testHost(vault);
+    host.settings.durableSyncState.index.files = [fileState("Moved/a.md", hashText("hello"), fileId)];
+    const engine = new SyncEngine(host);
+
+    await callPrivate(engine, "applyRemoteV2Payload", v2Payload({
+      kind: "file-delete",
+      fileId,
+      path: "Notes/a.md",
+      updateHex,
+      tombstoneId: "t" + "b".repeat(32),
+    }), 4);
+
+    expect(vault.readText("Moved/a.md")).toBeUndefined();
+  });
+});
+
+describe("markdown content recovery", () => {
+  it("recovers the sender's content when the merged tree keeps a stale entry", async () => {
+    const path = "Notes/a.md";
+    const fileId = "f" + "a".repeat(32);
+    const vault = new MemoryVault([[path, "stale"]]);
+    const host = testHost(vault);
+    host.settings.durableSyncState.index.files = [fileState(path, hashText("stale"), fileId)];
+    const engine = new SyncEngine(host);
+    callPrivate(engine, "updateMarkdownYjs", path, "stale");
+    const senderDoc = new Y.Doc();
+    const senderTree = senderDoc.getMap<Y.Map<unknown>>("tree");
+    const updateHex = encodeMarkdownUpsertUpdate(senderDoc, senderTree, path, "fresh from sender");
+
+    await callPrivate(engine, "applyRemoteV2Payload", v2Payload({
+      kind: "file-update",
+      fileId,
+      path,
+      updateHex,
+      contentHash: hashText("fresh from sender"),
+    }), 5);
+
+    expect(vault.readText(path)).toBe("fresh from sender");
+  });
+});
+
+describe("pending op supersession", () => {
+  it("supersedes older queued markdown updates for the same file", async () => {
+    const vault = new MemoryVault([["Notes/a.md", "v1"]]);
+    const host = testHost(vault);
+    host.loadVaultKeys = vi.fn().mockResolvedValue(keys);
+    host.createApiClient = () => ({
+      websocketUrl: () => "wss://example.test/ws",
+      listOps: vi.fn().mockResolvedValue([]),
+      putBlob: vi.fn().mockResolvedValue(undefined),
+      appendOp: vi.fn().mockRejectedValue(new Error("offline")),
+    }) as never;
+    const engine = new SyncEngine(host);
+
+    await callPrivate(engine, "pushMarkdownUpdate", testFile("Notes/a.md", "md"));
+    vault.files.set("Notes/a.md", "v2");
+    await callPrivate(engine, "pushMarkdownUpdate", testFile("Notes/a.md", "md"));
+
+    expect(host.settings.pendingOps).toHaveLength(1);
+    expect(host.settings.durableSyncState.journal.map((entry) => entry.status)).toEqual(["superseded", "queued"]);
+  });
+});
+
+describe("journal pruning", () => {
+  it("retains queued entries when pruning the journal", () => {
+    const queued = journalEntry("queued");
+    const journal = [queued, ...Array.from({ length: 300 }, () => journalEntry("acknowledged"))];
+
+    const pruned = pruneJournal(journal, 100);
+
+    expect(pruned).toHaveLength(100);
+    expect(pruned[0]).toBe(queued);
+  });
+});
+
+describe("remote state resilience", () => {
+  beforeEach(() => {
+    noticeMessages().length = 0;
+  });
+
+  it("skips a remote binary change whose blob is missing instead of halting catch-up", async () => {
+    const vault = new MemoryVault();
+    const host = testHost(vault);
+    host.loadVaultKeys = vi.fn().mockResolvedValue(keys);
+    host.createApiClient = () => ({
+      websocketUrl: () => "wss://example.test/ws",
+      listOps: vi.fn().mockResolvedValue([]),
+      getBlob: vi.fn().mockResolvedValue(null),
+    }) as never;
+    const engine = new SyncEngine(host);
+
+    await callPrivate(engine, "applyRemoteV2Payload", v2Payload({
+      kind: "file-update",
+      path: "assets/a.png",
+      fileKind: "binary",
+      updateHex: undefined,
+      blobId: "c".repeat(64),
+      size: 4,
+    }), 9);
+
+    expect(noticeMessages().filter((message) => message.startsWith("Mylonite needs input"))).toHaveLength(1);
+    expect(vault.binaries.size).toBe(0);
+  });
+
+  it("drops queued blobs the server permanently rejects", async () => {
+    const host = testHost();
+    host.settings.pendingBlobs = [{ blobId: "a".repeat(64), envelopeHex: "00" }];
+    const putBlob = vi.fn().mockRejectedValue(new ApiError(413, "blob too large"));
+    host.createApiClient = () => ({
+      websocketUrl: () => "wss://example.test/ws",
+      listOps: vi.fn().mockResolvedValue([]),
+      putBlob,
+      appendOp: vi.fn().mockResolvedValue(undefined),
+    }) as never;
+    const engine = new SyncEngine(host);
+
+    const flushed = await callPrivate<Promise<boolean>>(engine, "flushPendingBlobs");
+
+    expect(flushed).toBe(true);
+    expect(host.settings.pendingBlobs).toEqual([]);
+  });
+
+  it("drops queued ops the server permanently rejects and marks them rejected", async () => {
+    const host = testHost();
+    const clientOpId = "d".repeat(64);
+    host.settings.pendingOps = [testOp(clientOpId)];
+    host.settings.durableSyncState.journal = [journalEntry("queued", { clientOpId })];
+    const appendOp = vi.fn().mockRejectedValue(new ApiError(400, "invalid op"));
+    host.createApiClient = () => ({
+      websocketUrl: () => "wss://example.test/ws",
+      listOps: vi.fn().mockResolvedValue([]),
+      putBlob: vi.fn().mockResolvedValue(undefined),
+      appendOp,
+    }) as never;
+    const engine = new SyncEngine(host);
+
+    await callPrivate(engine, "flushPendingOps");
+
+    expect(host.settings.pendingOps).toEqual([]);
+    expect(host.settings.durableSyncState.journal[0].status).toBe("rejected");
+  });
+});
+
+describe("doc persistence", () => {
+  it("persists the markdown doc and reloads it in a new engine", async () => {
+    const stored = new Map<string, ArrayBuffer>();
+    const vault = new MemoryVault();
+    (vault as unknown as { adapter: unknown }).adapter = {
+      exists: async (path: string) => stored.has(path),
+      readBinary: async (path: string) => stored.get(path) as ArrayBuffer,
+      writeBinary: async (path: string, data: ArrayBuffer) => {
+        stored.set(path, data);
+      },
+    };
+    const host = testHost(vault);
+    (host as unknown as { manifest: { dir: string } }).manifest = { dir: "plugins/mylonite" };
+    const first = new SyncEngine(host);
+    callPrivate(first, "updateMarkdownYjs", "Notes/a.md", "persisted text");
+    await callPrivate(first, "persistDocState");
+
+    const second = new SyncEngine(host);
+    await callPrivate(second, "loadPersistedDocState");
+
+    const tree = (second as unknown as { ytree: Parameters<typeof getMarkdownText>[0] }).ytree;
+    expect(getMarkdownText(tree, "Notes/a.md")?.toString()).toBe("persisted text");
+  });
+});
+
 describe("markdown state updates", () => {
   it("can bootstrap a receiver even if earlier updates were not applied", () => {
     const path = "Notes/a.md";
@@ -731,6 +1065,45 @@ function testSnapshot() {
     ciphertext_hex: "11".repeat(32),
     created_at_unix: 123,
   };
+}
+
+async function drainMicrotasks(count = 10): Promise<void> {
+  for (let index = 0; index < count; index += 1) {
+    await Promise.resolve();
+  }
+}
+
+function fileState(path: string, contentHash: string, fileId: string) {
+  return {
+    fileId,
+    path,
+    kind: "markdown" as const,
+    contentHash,
+    tombstone: false,
+    lastLocalSeq: 0,
+    lastRemoteSeq: 0,
+    updatedAtMs: 1,
+  };
+}
+
+function journalEntry(status: SyncTransitionStatus, overrides: Partial<SyncJournalEntry> = {}): SyncJournalEntry {
+  return {
+    transitionId: "x" + "1".repeat(32),
+    status,
+    kind: "file-update",
+    fileId: "f" + "a".repeat(32),
+    path: "Notes/a.md",
+    fileKind: "markdown",
+    contentHash: "abcd",
+    observedAtMs: 1,
+    affectedPaths: ["Notes/a.md"],
+    ...overrides,
+  };
+}
+
+function emptyFrame(kind: number): ArrayBuffer {
+  const encoded = encodeFrame({ kind, flags: 0, payload: new Uint8Array() });
+  return encoded.buffer.slice(encoded.byteOffset, encoded.byteOffset + encoded.byteLength) as ArrayBuffer;
 }
 
 function deferred<T>() {

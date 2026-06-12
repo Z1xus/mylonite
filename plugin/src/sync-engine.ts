@@ -1,7 +1,7 @@
 import { Notice, Plugin, TFile, normalizePath } from "obsidian";
 import * as Y from "yjs";
 
-import { EncryptedOpRecord, MyloniteApiClient, SnapshotRecord } from "./api";
+import { EncryptedOpRecord, MyloniteApiClient, SnapshotRecord, isPermanentApiRejection } from "./api";
 import { bytesToHex, hexToBytes, VaultKeys } from "./crypto";
 import { ClientMsgKind, OpKind, ServerMsgKind, decodeFrame, encodeFrame } from "./protocol";
 import { createEncryptedSnapshot, restoreEncryptedSnapshot } from "./snapshot-service";
@@ -19,10 +19,11 @@ import { confirmAction } from "./confirm-modal";
 import { decideRemoteV2Apply } from "./conflict-policy";
 import { LocalEventClassifier } from "./local-event-classifier";
 import { VaultStateIndex } from "./state-index";
-import { FileKind, hashBytes, SyncJournalEntry } from "./sync-state";
+import { FileKind, SyncJournalEntry, TERMINAL_TRANSITION_STATUSES, hashBytes, hashText } from "./sync-state";
 import { yieldToObsidian } from "./ui-yield";
 import {
   applyMarkdownUpdate,
+  decodeIsolatedMarkdownContent,
   encodeMarkdownDeleteUpdate,
   encodeMarkdownRenameUpdate,
   encodeMarkdownUpsertUpdate,
@@ -36,6 +37,9 @@ export const LIVE_POLL_INTERVAL_MS = 60_000;
 export const WEBSOCKET_RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 15_000] as const;
 const MAX_REPORTED_CONFLICTS = 256;
 const SLOW_SYNC_SPAN_MS = 50;
+const MAX_JOURNAL_ENTRIES = 2048;
+const DOC_PERSIST_DEBOUNCE_MS = 2_000;
+const RECONCILE_FILES_PER_UI_YIELD = 8;
 
 export interface SyncEngineHost extends Plugin {
   settings: MyloniteSettings;
@@ -57,8 +61,10 @@ export class SyncEngine {
   private stateIndex: VaultStateIndex;
   private classifier: LocalEventClassifier;
   private readonly modifyTimers = new Map<string, { file: TFile; timer: number }>();
-  private readonly ydoc = new Y.Doc();
-  private readonly ytree = this.ydoc.getMap<Y.Map<unknown>>("tree");
+  private ydoc = new Y.Doc();
+  private ytree = this.ydoc.getMap<Y.Map<unknown>>("tree");
+  private docPersistTimer: number | null = null;
+  private docLoaded = false;
   private socket: WebSocket | null = null;
   private reconnectTimer: number | null = null;
   private reconnectAttempt = 0;
@@ -82,6 +88,7 @@ export class SyncEngine {
     }
     this.stateIndex = VaultStateIndex.fromSnapshot(this.host.settings.durableSyncState?.index);
     this.classifier = new LocalEventClassifier(this.stateIndex);
+    this.attachDocPersistence();
     this.rehydratePendingLocalState();
   }
 
@@ -102,10 +109,70 @@ export class SyncEngine {
       this.started = true;
     }
     this.connectWebSocket();
-    void this.catchUp().catch((error) => {
+    void this.startUpSync().catch((error) => {
       this.host.updateStatus("catch-up error");
-      this.host.debug(`catch-up failed: ${String(error)}`);
+      this.host.debug(`startup sync failed: ${String(error)}`);
     });
+  }
+
+  private async startUpSync(): Promise<void> {
+    await this.loadPersistedDocState();
+    await this.runExclusiveSyncTask("reconcileOfflineChanges", async () => this.reconcileOfflineChanges());
+    await this.catchUp();
+  }
+
+  private async reconcileOfflineChanges(): Promise<void> {
+    if (!this.host.settings.vaultId || !this.host.settings.deviceId) {
+      return;
+    }
+    const files = this.host.app.vault.getFiles();
+    const seenPaths = new Set<string>();
+    let pushedCount = 0;
+    for (const [fileIndex, file] of files.entries()) {
+      if (this.manuallyClosed) {
+        return;
+      }
+      if (fileIndex > 0 && fileIndex % RECONCILE_FILES_PER_UI_YIELD === 0) {
+        await yieldToObsidian();
+      }
+      const path = normalizeVaultPath(file.path);
+      seenPaths.add(path);
+      const known = this.stateIndex.byPath(path);
+      const kind: FileKind = file.extension === "md" ? "markdown" : "binary";
+      if (known && known.kind === kind && known.mtimeMs !== undefined && known.mtimeMs === file.stat?.mtime) {
+        continue;
+      }
+      const contentHash = kind === "markdown"
+        ? hashText(await this.host.app.vault.read(file))
+        : hashBytes(new Uint8Array(await this.host.app.vault.readBinary(file)));
+      if (known && known.kind === kind && known.contentHash === contentHash) {
+        this.stateIndex.upsertFile({ ...known, mtimeMs: file.stat?.mtime });
+        continue;
+      }
+      if (!known) {
+        await this.pushFileCreate(file);
+      } else if (kind === "markdown") {
+        await this.pushMarkdownUpdate(file);
+      } else {
+        await this.pushBinaryUpdate(file);
+      }
+      pushedCount += 1;
+    }
+    for (const state of this.stateIndex.toSnapshot().files) {
+      if (this.manuallyClosed) {
+        return;
+      }
+      if (seenPaths.has(state.path) || this.host.app.vault.getFileByPath(state.path)) {
+        continue;
+      }
+      await this.pushFileDelete(state.path, state.kind === "markdown");
+      pushedCount += 1;
+    }
+    this.persistSyncState();
+    await this.host.saveSettings();
+    if (pushedCount > 0) {
+      this.host.debug(`reconciled ${pushedCount} offline changes`);
+    }
   }
 
   close(options: { flushScheduledUpdates?: boolean } = {}): void {
@@ -118,6 +185,13 @@ export class SyncEngine {
     } else {
       this.dropScheduledMarkdownUpdates();
     }
+    if (this.docPersistTimer !== null) {
+      window.clearTimeout(this.docPersistTimer);
+      this.docPersistTimer = null;
+    }
+    void this.persistDocState().catch((error) => {
+      this.host.debug(`doc persist on close failed: ${String(error)}`);
+    });
     this.clearReconnectTimer();
     this.socketLive = false;
     this.socket?.close();
@@ -132,13 +206,84 @@ export class SyncEngine {
     this.pendingOpPaths.clear();
     this.pendingOpFileIds.clear();
     this.suppressedPaths.clear();
+    this.resetDocState();
     this.rehydratePendingLocalState();
+  }
+
+  private resetDocState(): void {
+    if (this.docPersistTimer !== null) {
+      window.clearTimeout(this.docPersistTimer);
+      this.docPersistTimer = null;
+    }
+    this.ydoc.destroy();
+    this.ydoc = new Y.Doc();
+    this.ytree = this.ydoc.getMap<Y.Map<unknown>>("tree");
+    this.docLoaded = false;
+    this.attachDocPersistence();
+  }
+
+  private attachDocPersistence(): void {
+    this.ydoc.on("update", () => this.scheduleDocPersist());
+  }
+
+  private scheduleDocPersist(): void {
+    if (this.docPersistTimer !== null || !this.docStatePath()) {
+      return;
+    }
+    this.docPersistTimer = window.setTimeout(() => {
+      this.docPersistTimer = null;
+      void this.persistDocState().catch((error) => {
+        this.host.debug(`doc persist failed: ${String(error)}`);
+      });
+    }, DOC_PERSIST_DEBOUNCE_MS);
+  }
+
+  private docStatePath(): string | null {
+    const dir = this.host.manifest?.dir;
+    if (!dir || !this.host.settings.vaultId) {
+      return null;
+    }
+    return `${dir}/doc-${this.host.settings.vaultId}.bin`;
+  }
+
+  private async persistDocState(): Promise<void> {
+    const path = this.docStatePath();
+    const adapter = this.host.app.vault.adapter;
+    if (!path || typeof adapter?.writeBinary !== "function") {
+      return;
+    }
+    const update = Y.encodeStateAsUpdate(this.ydoc);
+    const buffer = update.buffer.slice(update.byteOffset, update.byteOffset + update.byteLength) as ArrayBuffer;
+    await adapter.writeBinary(path, buffer);
+  }
+
+  private async loadPersistedDocState(): Promise<void> {
+    if (this.docLoaded) {
+      return;
+    }
+    this.docLoaded = true;
+    const path = this.docStatePath();
+    const adapter = this.host.app.vault.adapter;
+    if (!path || typeof adapter?.readBinary !== "function" || typeof adapter?.exists !== "function") {
+      return;
+    }
+    try {
+      if (!(await adapter.exists(path))) {
+        return;
+      }
+      const bytes = new Uint8Array(await adapter.readBinary(path));
+      if (bytes.byteLength > 0) {
+        Y.applyUpdate(this.ydoc, bytes, "persisted-doc");
+      }
+    } catch (error) {
+      this.host.debug(`doc state load failed: ${String(error)}`);
+    }
   }
 
   private rehydratePendingLocalState(): void {
     const journal = this.host.settings.durableSyncState?.journal ?? [];
     for (const entry of journal) {
-      if (entry.status === "acknowledged" || entry.status === "applied") {
+      if (TERMINAL_TRANSITION_STATUSES.has(entry.status)) {
         continue;
       }
       const paths = entry.affectedPaths.map((path) => normalizeVaultPath(path));
@@ -200,11 +345,13 @@ export class SyncEngine {
     if (!this.host.settings.vaultId || !this.host.settings.deviceId) {
       return;
     }
+    await this.flushScheduledMarkdownUpdates();
     if (await this.flushPendingBlobs()) {
       await this.flushPendingOps();
     }
     let appliedCount = 0;
     for (;;) {
+      const seqBeforePage = this.host.settings.lastServerSeq;
       const ops = await this.host.createApiClient().listOps(this.host.settings.vaultId, this.host.settings.lastServerSeq, OP_PAGE_SIZE);
       if (ops.length === 0) {
         break;
@@ -216,7 +363,13 @@ export class SyncEngine {
         await this.measure(`applyRemoteOp seq=${op.server_seq} kind=${op.kind}`, () => this.applyRemoteOp(op));
         this.host.settings.lastServerSeq = Math.max(this.host.settings.lastServerSeq, op.server_seq);
         this.host.settings.lamport = Math.max(this.host.settings.lamport, op.lamport);
+        this.clearDirtyPathsForOp(op.client_op_id);
+        this.removePendingOp(op.client_op_id);
+        this.acknowledgeTransitionByClientOp(op.client_op_id);
         appliedCount += 1;
+      }
+      if (this.host.settings.lastServerSeq <= seqBeforePage) {
+        throw new Error("server returned ops without advancing the sequence");
       }
     }
     if (appliedCount > 0) {
@@ -261,14 +414,22 @@ export class SyncEngine {
   }
 
   async restoreLatestSnapshot(options: { deleteMissing?: boolean; silent?: boolean; requireSnapshot?: boolean } = {}): Promise<void> {
-    await this.runExclusiveSyncTask("restoreLatestSnapshot", async () => this.restoreLatestSnapshotInner(options));
-  }
-
-  private async restoreLatestSnapshotInner(options: { deleteMissing?: boolean; silent?: boolean; requireSnapshot?: boolean }): Promise<void> {
     if (!this.host.settings.vaultId || !this.host.settings.deviceId) {
       if (!options.silent) {
         new Notice("Device is not paired. Pair it before restoring a snapshot.");
       }
+      return;
+    }
+    const deleteMissing = options.deleteMissing ?? await confirmAction(this.host.app, {
+      title: "Restore snapshot",
+      message: "Delete files missing from the snapshot? This removes local files that are not in the latest snapshot.",
+      confirmText: "Delete missing files",
+    });
+    await this.runExclusiveSyncTask("restoreLatestSnapshot", async () => this.restoreLatestSnapshotInner({ ...options, deleteMissing }));
+  }
+
+  private async restoreLatestSnapshotInner(options: { deleteMissing: boolean; silent?: boolean; requireSnapshot?: boolean }): Promise<void> {
+    if (!this.host.settings.vaultId || !this.host.settings.deviceId) {
       return;
     }
     const snapshots = await this.host.createApiClient().listSnapshots(this.host.settings.vaultId);
@@ -280,12 +441,8 @@ export class SyncEngine {
       return;
     }
     validateSnapshotRecord(latest, this.host.settings.vaultId);
-    const deleteMissing = options.deleteMissing ?? await confirmAction(this.host.app, {
-      title: "Restore snapshot",
-      message: "Delete files missing from the snapshot? This removes local files that are not in the latest snapshot.",
-      confirmText: "Delete missing files",
-    });
-    await this.restoreSnapshot(latest, deleteMissing);
+    await this.flushScheduledMarkdownUpdates();
+    await this.restoreSnapshot(latest, options.deleteMissing);
     this.host.settings.lastServerSeq = Math.max(this.host.settings.lastServerSeq, latest.covers_through_seq);
     await this.host.saveSettings();
     this.host.updateStatus("snapshot restored");
@@ -351,7 +508,7 @@ export class SyncEngine {
     }
     this.locallyDirtyPaths.add(normalizedPath);
     const content = await this.host.app.vault.read(file);
-    const transition = this.classifier.classifyModify({ path: normalizedPath, kind: "markdown", content });
+    const transition = this.classifier.classifyModify({ path: normalizedPath, kind: "markdown", content, mtimeMs: file.stat?.mtime });
     this.queueTransition(transition);
     const updateHex = this.updateMarkdownYjs(normalizedPath, content);
     await this.pushEncryptedOp(OpKind.FileUpdate, [normalizedPath], {
@@ -385,7 +542,7 @@ export class SyncEngine {
     const plaintext = new Uint8Array(await this.host.app.vault.readBinary(file));
     await yieldToObsidian();
     const { blobId, envelope } = encryptBlob(keys, this.host.settings.vaultId, plaintext);
-    const transition = this.classifier.classifyModify({ path: normalizedPath, kind: "binary", content: plaintext, blobId, size: plaintext.byteLength });
+    const transition = this.classifier.classifyModify({ path: normalizedPath, kind: "binary", content: plaintext, blobId, size: plaintext.byteLength, mtimeMs: file.stat?.mtime });
     this.queueTransition(transition);
     const blobUploaded = await this.putBlobOrQueue(blobId, envelope);
     await this.pushEncryptedOp(OpKind.FileUpdate, [normalizedPath], {
@@ -449,7 +606,9 @@ export class SyncEngine {
     for (const path of [normalizedOldPath, normalizedNewPath]) {
       this.clearScheduledMarkdownUpdate(path);
     }
-    if (this.suppressedPaths.delete(normalizedNewPath) || this.suppressedPaths.delete(normalizedOldPath)) {
+    const suppressedNewPath = this.suppressedPaths.delete(normalizedNewPath);
+    const suppressedOldPath = this.suppressedPaths.delete(normalizedOldPath);
+    if (suppressedNewPath || suppressedOldPath) {
       this.host.debug(`suppressed remote rename echo ${normalizedOldPath} -> ${normalizedNewPath}`);
       return;
     }
@@ -457,7 +616,7 @@ export class SyncEngine {
     this.locallyDirtyPaths.add(normalizedNewPath);
     if (file.extension === "md") {
       const content = await this.host.app.vault.read(file);
-      const transition = this.classifier.classifyRename(normalizedOldPath, { path: normalizedNewPath, kind: "markdown", content });
+      const transition = this.classifier.classifyRename(normalizedOldPath, { path: normalizedNewPath, kind: "markdown", content, mtimeMs: file.stat?.mtime });
       this.queueTransition(transition);
       const updateHex = this.renameMarkdownYjs(normalizedOldPath, normalizedNewPath, content);
       await this.pushEncryptedOp(OpKind.FileRename, [normalizedOldPath, normalizedNewPath], {
@@ -487,7 +646,7 @@ export class SyncEngine {
     if (!blobId) {
       throw new Error("missing binary rename blob id");
     }
-    const transition = this.classifier.classifyRename(normalizedOldPath, { path: normalizedNewPath, kind: "binary", content: bytes, blobId, size: bytes.byteLength });
+    const transition = this.classifier.classifyRename(normalizedOldPath, { path: normalizedNewPath, kind: "binary", content: bytes, blobId, size: bytes.byteLength, mtimeMs: file.stat?.mtime });
     this.queueTransition(transition);
     const blobUploaded = encrypted ? await this.putBlobOrQueue(blobId, encrypted.envelope) : true;
     await this.pushEncryptedOp(OpKind.FileRename, [normalizedOldPath, normalizedNewPath], {
@@ -520,6 +679,9 @@ export class SyncEngine {
     this.pendingOpPaths.set(op.client_op_id, normalizedChangedPaths);
     this.pendingOpFileIds.set(op.client_op_id, changedFileIds);
     this.attachOpToTransition(transitionId, op.client_op_id);
+    if (kind === OpKind.FileUpdate && changedFileIds.length === 1 && (payloadObject as { fileKind?: string }).fileKind === "markdown") {
+      this.dropSupersededUpdateOps(changedFileIds[0], op.client_op_id);
+    }
     try {
       if (options.forceQueue) {
         this.queuePendingOp(op);
@@ -533,7 +695,7 @@ export class SyncEngine {
         this.acknowledgeTransition(transitionId);
       }
     } catch (error) {
-      this.host.settings.pendingOps.push(op);
+      this.queuePendingOp(op);
       this.host.debug(`queued op ${op.client_op_id}: ${String(error)}`);
       this.host.updateStatus("queued offline");
     }
@@ -551,9 +713,10 @@ export class SyncEngine {
       this.host.debug(`suppressed remote create echo ${normalizedPath}`);
       return;
     }
+    this.locallyDirtyPaths.add(normalizedPath);
     if (file.extension === "md") {
       const content = await this.host.app.vault.read(file);
-      const transition = this.classifier.classifyCreate({ path: normalizedPath, kind: "markdown", content });
+      const transition = this.classifier.classifyCreate({ path: normalizedPath, kind: "markdown", content, mtimeMs: file.stat?.mtime });
       this.queueTransition(transition);
       const updateHex = this.updateMarkdownYjs(normalizedPath, content);
       await this.pushEncryptedOp(transition.kind === "file-copy" ? OpKind.FileCopy : OpKind.FileCreate, [normalizedPath], {
@@ -573,7 +736,7 @@ export class SyncEngine {
     const plaintext = new Uint8Array(await this.host.app.vault.readBinary(file));
     await yieldToObsidian();
     const { blobId, envelope } = encryptBlob(keys, this.host.settings.vaultId, plaintext);
-    const transition = this.classifier.classifyCreate({ path: normalizedPath, kind: "binary", content: plaintext, blobId, size: plaintext.byteLength });
+    const transition = this.classifier.classifyCreate({ path: normalizedPath, kind: "binary", content: plaintext, blobId, size: plaintext.byteLength, mtimeMs: file.stat?.mtime });
     this.queueTransition(transition);
     const blobUploaded = await this.putBlobOrQueue(blobId, envelope);
     await this.pushEncryptedOp(transition.kind === "file-copy" ? OpKind.FileCopy : OpKind.FileCreate, [normalizedPath], {
@@ -624,6 +787,12 @@ export class SyncEngine {
       try {
         await client.putBlob(this.host.settings.vaultId, blob.blobId, hexToBytes(blob.envelopeHex));
       } catch (error) {
+        if (isPermanentApiRejection(error)) {
+          this.host.debug(`dropped rejected blob ${blob.blobId}: ${String(error)}`);
+          this.host.updateStatus("upload rejected");
+          new Notice(`Mylonite: the server rejected a queued upload. ${String(error)}`);
+          continue;
+        }
         remaining.push(...this.host.settings.pendingBlobs.slice(index));
         this.host.debug(`pending blob flush stopped: ${String(error)}`);
         break;
@@ -648,6 +817,14 @@ export class SyncEngine {
         this.clearDirtyPathsForOp(op.client_op_id);
         this.acknowledgeTransitionByClientOp(op.client_op_id);
       } catch (error) {
+        if (isPermanentApiRejection(error)) {
+          this.host.debug(`dropped rejected op ${op.client_op_id}: ${String(error)}`);
+          this.host.updateStatus("change rejected");
+          new Notice(`Mylonite: the server rejected a queued change. ${String(error)}`);
+          this.rejectTransitionByClientOp(op.client_op_id);
+          this.clearDirtyPathsForOp(op.client_op_id);
+          continue;
+        }
         remaining.push(...retainUnflushedPendingOps(this.host.settings.pendingOps, index));
         this.host.debug(`pending op flush stopped: ${String(error)}`);
         break;
@@ -702,6 +879,10 @@ export class SyncEngine {
       this.reconnectAttempt = 0;
       this.socketLive = true;
       this.host.updateStatus("live");
+      void this.catchUp().catch((error) => {
+        this.host.updateStatus("catch-up error");
+        this.host.debug(`catch-up after reconnect failed: ${String(error)}`);
+      });
       return;
     }
     if (frame.kind !== ServerMsgKind.OpBroadcast) {
@@ -725,6 +906,7 @@ export class SyncEngine {
     this.host.settings.lamport = Math.max(this.host.settings.lamport, op.lamport);
     this.clearDirtyPathsForOp(op.client_op_id);
     this.removePendingOp(op.client_op_id);
+    this.acknowledgeTransitionByClientOp(op.client_op_id);
     await this.measure("saveSettings after websocket op", () => this.host.saveSettings());
   }
 
@@ -899,13 +1081,42 @@ export class SyncEngine {
     }
   }
 
+  private rejectTransitionByClientOp(clientOpId: string): void {
+    const entry = this.host.settings.durableSyncState.journal.find((candidate) => candidate.clientOpId === clientOpId);
+    if (entry) {
+      entry.status = "rejected";
+    }
+  }
+
+  private dropSupersededUpdateOps(fileId: string, newClientOpId: string): void {
+    const journal = this.host.settings.durableSyncState.journal;
+    for (const [index, entry] of journal.entries()) {
+      if (entry.fileId !== fileId || entry.kind !== "file-update" || entry.fileKind !== "markdown" || entry.status !== "queued") {
+        continue;
+      }
+      if (!entry.clientOpId || entry.clientOpId === newClientOpId) {
+        continue;
+      }
+      if (!this.host.settings.pendingOps.some((op) => op.client_op_id === entry.clientOpId)) {
+        continue;
+      }
+      if (journal.slice(index + 1).some((later) => later.fileId === fileId && later.kind !== "file-update")) {
+        continue;
+      }
+      this.removePendingOp(entry.clientOpId);
+      this.pendingOpPaths.delete(entry.clientOpId);
+      this.pendingOpFileIds.delete(entry.clientOpId);
+      entry.status = "superseded";
+    }
+  }
+
   private persistSyncState(): void {
     this.host.settings.durableSyncState.index = this.stateIndex.toSnapshot();
-    this.host.settings.durableSyncState.journal = this.host.settings.durableSyncState.journal.slice(-2048);
+    this.host.settings.durableSyncState.journal = pruneJournal(this.host.settings.durableSyncState.journal, MAX_JOURNAL_ENTRIES);
   }
 
   private queuedLocalChangeCount(): number {
-    return this.host.settings.durableSyncState.journal.filter((entry) => entry.status !== "acknowledged" && entry.status !== "applied").length;
+    return this.host.settings.durableSyncState.journal.filter((entry) => !TERMINAL_TRANSITION_STATUSES.has(entry.status)).length;
   }
 
   private removePendingOp(clientOpId: string): void {
@@ -926,19 +1137,17 @@ export class SyncEngine {
 
   private async applyRemoteV2Payload(payload: RemoteV2Payload, serverSeq: number): Promise<void> {
     const decision = decideRemoteV2Apply(this.stateIndex, payload, this.locallyDirtyFileIds);
-    if (decision.action === "prompt") {
-      this.reportConflictOnce("needs-input", decision.reason, remotePayloadPaths(payload), payload.fileId);
-      return;
-    }
-    if (decision.action === "noop") {
+    if (decision.action === "skip-local-wins") {
+      this.reportConflictOnce("kept-local", decision.reason, remotePayloadPaths(payload), payload.fileId);
       return;
     }
     if (payload.kind === "file-rename") {
       if (payload.fileKind === "markdown") {
         applyMarkdownUpdate(this.ydoc, requiredMarkdownUpdateHex(payload));
       }
-      const targetPath = decision.action === "conflict-path" ? decision.path : payload.newPath;
-      const result = await applyFileRenameWithCollision(this.host.app.vault, this.suppressedPaths, payload.oldPath, targetPath, payload.fileId);
+      const targetPath = decision.path;
+      const localOldPath = this.stateIndex.byFileId(payload.fileId)?.path ?? payload.oldPath;
+      const result = await applyFileRenameWithCollision(this.host.app.vault, this.suppressedPaths, localOldPath, targetPath, payload.fileId);
       const finalPath = result.status === "missing-local-file"
         ? await this.materializeMissingRenamedFile(payload, targetPath)
         : result.path;
@@ -956,6 +1165,7 @@ export class SyncEngine {
         contentHash: payload.contentHash ?? current?.contentHash ?? "",
         blobId: payload.fileKind === "binary" ? payload.blobId ?? current?.blobId : undefined,
         size: payload.fileKind === "binary" ? payload.size ?? current?.size : undefined,
+        mtimeMs: this.statMtime(finalPath),
         tombstone: false,
         lastLocalSeq: current?.lastLocalSeq ?? 0,
         lastRemoteSeq: serverSeq,
@@ -967,56 +1177,57 @@ export class SyncEngine {
       if (payload.fileKind === "markdown") {
         applyMarkdownUpdate(this.ydoc, requiredMarkdownUpdateHex(payload));
       }
-      await applyFileDelete(this.host.app.vault, this.host.app.fileManager, this.suppressedPaths, payload.path);
-      this.stateIndex.deleteFile(payload.fileId, payload.path, Date.now(), payload.tombstoneId);
+      await applyFileDelete(this.host.app.vault, this.host.app.fileManager, this.suppressedPaths, decision.path);
+      this.stateIndex.deleteFile(payload.fileId, decision.path, Date.now(), payload.tombstoneId);
       return;
     }
-    if (payload.kind === "file-create" || payload.kind === "file-copy") {
-      const fileId = payload.kind === "file-copy" ? payload.newFileId : payload.fileId;
-      const path = decision.action === "conflict-path" ? decision.path : payload.path;
-      await this.applyRemoteV2Content({ ...payload, fileId }, path, false, serverSeq);
-      if (decision.action === "conflict-path") {
-        this.reportConflictOnce("kept-both", decision.reason, [payload.path, path], fileId);
-      }
-      return;
-    }
-    if (payload.kind === "file-update") {
-      const path = decision.action === "conflict-path" ? decision.path : payload.path;
-      await this.applyRemoteV2Content(payload, path, decision.action !== "conflict-path", serverSeq);
-      if (decision.action === "conflict-path") {
-        this.reportConflictOnce("kept-both", decision.reason, [payload.path, path], payload.fileId);
-      }
+    const fileId = payload.kind === "file-copy" ? payload.newFileId : payload.fileId;
+    const allowOverwrite = decision.action === "apply"
+      && (payload.kind === "file-update"
+        || !this.locallyDirtyPaths.has(decision.path)
+        || this.stateIndex.byPath(decision.path)?.contentHash === payload.contentHash);
+    await this.applyRemoteV2Content({ ...payload, fileId }, decision.path, allowOverwrite, serverSeq);
+    if (decision.action === "conflict-path") {
+      this.reportConflictOnce("kept-both", decision.reason, [payload.path, decision.path], fileId);
     }
   }
 
-  private async applyRemoteV2Content(payload: RemoteV2Payload & { fileId: string }, targetPath: string, allowOverwrite: boolean, serverSeq: number): Promise<void> {
-    if ((payload.kind === "file-create" || payload.kind === "file-copy") && payload.fileKind === "markdown") {
-      applyMarkdownUpdate(this.ydoc, requiredMarkdownUpdateHex(payload));
-      const content = getMarkdownText(this.ytree, markdownContentPath(payload))?.toString() ?? "";
+  private async applyRemoteV2Content(payload: Extract<RemoteV2Payload, { kind: "file-create" | "file-copy" | "file-update" }> & { fileId: string }, targetPath: string, allowOverwrite: boolean, serverSeq: number): Promise<void> {
+    if (payload.fileKind === "markdown") {
+      const updateHex = requiredMarkdownUpdateHex(payload);
+      applyMarkdownUpdate(this.ydoc, updateHex);
+      const content = this.resolveRemoteMarkdownContent(payload.fileId, updateHex, normalizeVaultPath(payload.path), payload.contentHash);
       const result = await this.measure(`applyMarkdownUpsert ${targetPath}`, () => applyMarkdownUpsertWithCollision(this.host.app.vault, this.suppressedPaths, targetPath, content, payload.fileId, allowOverwrite));
       this.recordRemoteFile(payload.fileId, result.path, "markdown", payload.contentHash, serverSeq);
       return;
     }
-    if (payload.kind === "file-update" && payload.fileKind === "markdown") {
-      applyMarkdownUpdate(this.ydoc, requiredMarkdownUpdateHex(payload));
-      const content = getMarkdownText(this.ytree, markdownContentPath(payload))?.toString() ?? "";
-      const result = await this.measure(`applyMarkdownUpsert ${targetPath}`, () => applyMarkdownUpsertWithCollision(this.host.app.vault, this.suppressedPaths, targetPath, content, payload.fileId, allowOverwrite));
-      this.recordRemoteFile(payload.fileId, result.path, "markdown", payload.contentHash, serverSeq);
+    if (!payload.blobId) {
+      throw new Error("missing v2 binary blob id");
+    }
+    const plaintext = await this.measure(`loadRemoteBinaryBlob ${payload.blobId}`, () => this.loadRemoteBinaryBlob(payload.blobId));
+    if (!plaintext) {
+      this.reportConflictOnce("needs-input", "remote binary content is missing on the server", [targetPath], payload.fileId);
       return;
     }
-    if ((payload.kind === "file-create" || payload.kind === "file-copy" || payload.kind === "file-update") && payload.fileKind === "binary") {
-      if (!payload.blobId) {
-        throw new Error("missing v2 binary blob id");
-      }
-      const plaintext = await this.measure(`loadRemoteBinaryBlob ${payload.blobId}`, () => this.loadRemoteBinaryBlob(payload.blobId));
-      const result = await this.measure(`applyBinaryUpsert ${targetPath}`, () => applyBinaryUpsertWithCollision(this.host.app.vault, this.suppressedPaths, targetPath, plaintext, payload.fileId, allowOverwrite));
-      this.recordRemoteFile(payload.fileId, result.path, "binary", payload.contentHash, serverSeq, { blobId: payload.blobId, size: payload.size });
+    const result = await this.measure(`applyBinaryUpsert ${targetPath}`, () => applyBinaryUpsertWithCollision(this.host.app.vault, this.suppressedPaths, targetPath, plaintext, payload.fileId, allowOverwrite));
+    this.recordRemoteFile(payload.fileId, result.path, "binary", payload.contentHash, serverSeq, { blobId: payload.blobId, size: payload.size });
+  }
+
+  private resolveRemoteMarkdownContent(fileId: string, updateHex: string, contentKey: string, expectedHash: string | undefined): string {
+    const merged = getMarkdownText(this.ytree, contentKey)?.toString() ?? "";
+    if (this.locallyDirtyFileIds.has(fileId)) {
+      return merged;
     }
+    if (expectedHash === undefined || hashText(merged) === expectedHash) {
+      return merged;
+    }
+    const isolated = this.measureSync(`decodeIsolatedMarkdownContent ${contentKey}`, () => decodeIsolatedMarkdownContent(updateHex, contentKey));
+    return isolated ?? merged;
   }
 
   private async materializeMissingRenamedFile(payload: Extract<RemoteV2Payload, { kind: "file-rename" }>, targetPath: string): Promise<string | null> {
     if (payload.fileKind === "markdown") {
-      const content = getMarkdownText(this.ytree, normalizeVaultPath(payload.newPath))?.toString() ?? "";
+      const content = this.resolveRemoteMarkdownContent(payload.fileId, requiredMarkdownUpdateHex(payload), normalizeVaultPath(payload.newPath), payload.contentHash);
       const result = await applyMarkdownUpsertWithCollision(this.host.app.vault, this.suppressedPaths, targetPath, content, payload.fileId, false);
       return result.path;
     }
@@ -1032,20 +1243,28 @@ export class SyncEngine {
       return null;
     }
     const plaintext = await this.measure(`loadRemoteBinaryBlob ${blobId}`, () => this.loadRemoteBinaryBlob(blobId));
+    if (!plaintext) {
+      this.reportConflictOnce("needs-input", "remote binary content is missing on the server", [payload.oldPath, payload.newPath], payload.fileId);
+      return null;
+    }
     const result = await this.measure(`applyBinaryUpsert ${targetPath}`, () => applyBinaryUpsertWithCollision(this.host.app.vault, this.suppressedPaths, targetPath, plaintext, payload.fileId, false));
     return result.path;
   }
 
-  private async loadRemoteBinaryBlob(blobId: string): Promise<Uint8Array> {
+  private async loadRemoteBinaryBlob(blobId: string): Promise<Uint8Array | null> {
     const keys = await this.host.loadVaultKeys();
     const blobBytes = await this.host.createApiClient().getBlob(this.host.settings.vaultId, blobId);
     if (!blobBytes) {
-      throw new Error(`missing blob ${blobId}`);
+      return null;
     }
     return decryptBlobEnvelope(keys, this.host.settings.vaultId, blobId, blobBytes);
   }
 
-  private reportConflictOnce(kind: "kept-both" | "needs-input", reason: string, paths: string[], fileId?: string): void {
+  private statMtime(path: string): number | undefined {
+    return this.host.app.vault.getFileByPath(path)?.stat?.mtime;
+  }
+
+  private reportConflictOnce(kind: "kept-both" | "kept-local" | "needs-input", reason: string, paths: string[], fileId?: string): void {
     const normalizedPaths = Array.from(new Set(paths.map((path) => normalizeVaultPath(path))));
     const key = [kind, reason, fileId ?? "", ...normalizedPaths].join("\0");
     if (this.reportedConflictKeys.has(key)) {
@@ -1067,6 +1286,12 @@ export class SyncEngine {
       new Notice(`Mylonite needs input: ${reason}. Check ${summary}.`);
       return;
     }
+    if (kind === "kept-local") {
+      this.host.updateStatus("kept local version");
+      this.host.debug(`remote change skipped in favor of local edits: ${reason}; ${summary}`);
+      new Notice(`Mylonite kept your local version: ${reason}. Check ${summary}.`);
+      return;
+    }
     this.host.updateStatus(`kept both: ${summary}`);
     this.host.debug(`remote change kept alongside local file: ${reason}; ${summary}`);
     new Notice(`Mylonite kept both versions: ${reason}. Check ${summary}.`);
@@ -1081,6 +1306,7 @@ export class SyncEngine {
       contentHash,
       blobId: kind === "binary" ? contentRef.blobId ?? current?.blobId : undefined,
       size: kind === "binary" ? contentRef.size ?? current?.size : undefined,
+      mtimeMs: this.statMtime(path),
       tombstone: false,
       lastLocalSeq: current?.lastLocalSeq ?? 0,
       lastRemoteSeq: serverSeq,
@@ -1088,7 +1314,7 @@ export class SyncEngine {
     });
   }
 
-  private async restoreSnapshot(snapshot: SnapshotRecord, deleteMissing: boolean): Promise<void> {
+  private async restoreSnapshot(snapshot: SnapshotRecord, deleteMissing: boolean, skipPaths: ReadonlySet<string> = new Set()): Promise<void> {
     const keys = await this.host.loadVaultKeys();
     const payload = await this.measure(`restoreSnapshot ${snapshot.snapshot_id}`, () => restoreEncryptedSnapshot(
       this.host.app.vault,
@@ -1100,6 +1326,7 @@ export class SyncEngine {
       (entry) => this.loadSnapshotBinary(entry),
       deleteMissing,
       (message) => this.host.debug(message),
+      skipPaths,
     ));
     if (payload.state) {
       this.host.settings.durableSyncState.index = payload.state;
@@ -1118,7 +1345,8 @@ export class SyncEngine {
     if (latest.covers_through_seq <= this.host.settings.lastServerSeq) {
       return false;
     }
-    await this.measure(`restoreSnapshotForCatchUp ${latest.snapshot_id}`, () => this.restoreSnapshot(latest, false));
+    await this.flushScheduledMarkdownUpdates();
+    await this.measure(`restoreSnapshotForCatchUp ${latest.snapshot_id}`, () => this.restoreSnapshot(latest, false, new Set(this.locallyDirtyPaths)));
     this.host.settings.lastServerSeq = latest.covers_through_seq;
     await this.measure("saveSettings after snapshot catch-up", () => this.host.saveSettings());
     this.host.updateStatus("snapshot restored");
@@ -1187,6 +1415,17 @@ export function retainUnflushedPendingOps(pendingOps: PendingEncryptedOp[], firs
   return pendingOps.slice(firstFailedIndex);
 }
 
+export function pruneJournal(journal: SyncJournalEntry[], max: number): SyncJournalEntry[] {
+  if (journal.length <= max) {
+    return journal;
+  }
+  const open = journal.filter((entry) => !TERMINAL_TRANSITION_STATUSES.has(entry.status));
+  const closedBudget = Math.max(max - open.length, 0);
+  const closed = journal.filter((entry) => TERMINAL_TRANSITION_STATUSES.has(entry.status)).slice(-closedBudget);
+  const keep = new Set<SyncJournalEntry>([...open, ...closed]);
+  return journal.filter((entry) => keep.has(entry));
+}
+
 export function racedPaths(remotePaths: string[], localPaths: ReadonlySet<string>): string[] {
   return remotePaths.map((path) => normalizeVaultPath(path)).filter((path) => localPaths.has(path));
 }
@@ -1253,13 +1492,6 @@ function remotePayloadPaths(payload: RemotePayload): string[] {
     return [payload.oldPath, payload.newPath];
   }
   return [payload.path];
-}
-
-function markdownContentPath(payload: RemoteV2Payload & { path: string }): string {
-  if (payload.kind === "file-rename") {
-    return normalizeVaultPath(payload.newPath);
-  }
-  return normalizeVaultPath(payload.path);
 }
 
 function requiredMarkdownUpdateHex(payload: RemoteV2Payload): string {

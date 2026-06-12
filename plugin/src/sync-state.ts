@@ -1,7 +1,9 @@
 import { bytesToHex, randomHex } from "./crypto";
 
 export type FileKind = "markdown" | "binary";
-export type SyncTransitionStatus = "observed" | "classified" | "queued" | "acknowledged" | "applied";
+export type SyncTransitionStatus = "observed" | "classified" | "queued" | "acknowledged" | "applied" | "superseded" | "rejected";
+
+export const TERMINAL_TRANSITION_STATUSES: ReadonlySet<SyncTransitionStatus> = new Set(["acknowledged", "applied", "superseded", "rejected"]);
 export type SyncTransitionKind = "file-create" | "file-update" | "file-rename" | "file-delete" | "file-copy";
 
 export interface VaultFileState {
@@ -11,6 +13,7 @@ export interface VaultFileState {
   contentHash: string;
   blobId?: string;
   size?: number;
+  mtimeMs?: number;
   tombstone: boolean;
   lastLocalSeq: number;
   lastRemoteSeq: number;

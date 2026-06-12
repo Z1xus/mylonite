@@ -31,13 +31,18 @@ export async function applyMarkdownUpsert(
 ): Promise<void> {
   const normalizedPath = normalizeVaultPath(path);
   suppressedPaths.add(normalizedPath);
-  const existing = vault.getFileByPath(normalizedPath);
-  if (existing) {
-    await vault.modify(existing, content);
-    return;
+  try {
+    const existing = vault.getFileByPath(normalizedPath);
+    if (existing) {
+      await vault.modify(existing, content);
+      return;
+    }
+    await ensureParentFolder(vault, normalizedPath);
+    await vault.create(normalizedPath, content);
+  } catch (error) {
+    suppressedPaths.delete(normalizedPath);
+    throw error;
   }
-  await ensureParentFolder(vault, normalizedPath);
-  await vault.create(normalizedPath, content);
 }
 
 export async function applyFileDelete(
@@ -52,7 +57,12 @@ export async function applyFileDelete(
     return;
   }
   suppressedPaths.add(normalizedPath);
-  await fileManager.trashFile(existing);
+  try {
+    await fileManager.trashFile(existing);
+  } catch (error) {
+    suppressedPaths.delete(normalizedPath);
+    throw error;
+  }
 }
 
 export async function applyFileRenameWithCollision(
@@ -68,12 +78,21 @@ export async function applyFileRenameWithCollision(
   if (!existing) {
     return { status: "missing-local-file", path: normalizedOldPath };
   }
+  if (normalizedOldPath === normalizedNewPath) {
+    return { status: "noop", path: normalizedNewPath };
+  }
   const target = vault.getFileByPath(normalizedNewPath);
-  const finalPath = target && target !== existing ? collisionPath(normalizedNewPath, fileId) : normalizedNewPath;
+  const finalPath = target && target !== existing ? conflictPath(normalizedNewPath, fileId) : normalizedNewPath;
   suppressedPaths.add(normalizedOldPath);
   suppressedPaths.add(finalPath);
-  await ensureParentFolder(vault, finalPath);
-  await vault.rename(existing, finalPath);
+  try {
+    await ensureParentFolder(vault, finalPath);
+    await vault.rename(existing, finalPath);
+  } catch (error) {
+    suppressedPaths.delete(normalizedOldPath);
+    suppressedPaths.delete(finalPath);
+    throw error;
+  }
   return finalPath === normalizedNewPath
     ? { status: "applied", path: finalPath }
     : { status: "conflict-created", path: finalPath, originalPath: normalizedNewPath };
@@ -87,14 +106,19 @@ export async function applyBinaryUpsert(
 ): Promise<void> {
   const normalizedPath = normalizeVaultPath(path);
   suppressedPaths.add(normalizedPath);
-  const existing = vault.getFileByPath(normalizedPath);
-  const binary = new Uint8Array(bytes).buffer;
-  if (existing) {
-    await vault.modifyBinary(existing, binary);
-    return;
+  try {
+    const existing = vault.getFileByPath(normalizedPath);
+    const binary = new Uint8Array(bytes).buffer;
+    if (existing) {
+      await vault.modifyBinary(existing, binary);
+      return;
+    }
+    await ensureParentFolder(vault, normalizedPath);
+    await vault.createBinary(normalizedPath, binary);
+  } catch (error) {
+    suppressedPaths.delete(normalizedPath);
+    throw error;
   }
-  await ensureParentFolder(vault, normalizedPath);
-  await vault.createBinary(normalizedPath, binary);
 }
 
 export async function applyMarkdownUpsertWithCollision(
@@ -107,10 +131,10 @@ export async function applyMarkdownUpsertWithCollision(
 ): Promise<VaultApplyResult> {
   const normalizedPath = normalizeVaultPath(path);
   const existing = vault.getFileByPath(normalizedPath);
-  const finalPath = existing && !allowOverwrite ? collisionPath(normalizedPath, fileId) : normalizedPath;
+  const finalPath = existing && !allowOverwrite ? conflictPath(normalizedPath, fileId) : normalizedPath;
   await applyMarkdownUpsert(vault, suppressedPaths, finalPath, content);
   return finalPath === normalizedPath
-    ? { status: existing ? "applied" : "applied", path: finalPath }
+    ? { status: "applied", path: finalPath }
     : { status: "conflict-created", path: finalPath, originalPath: normalizedPath };
 }
 
@@ -124,7 +148,7 @@ export async function applyBinaryUpsertWithCollision(
 ): Promise<VaultApplyResult> {
   const normalizedPath = normalizeVaultPath(path);
   const existing = vault.getFileByPath(normalizedPath);
-  const finalPath = existing && !allowOverwrite ? collisionPath(normalizedPath, fileId) : normalizedPath;
+  const finalPath = existing && !allowOverwrite ? conflictPath(normalizedPath, fileId) : normalizedPath;
   await applyBinaryUpsert(vault, suppressedPaths, finalPath, bytes);
   return finalPath === normalizedPath
     ? { status: "applied", path: finalPath }
@@ -142,7 +166,7 @@ async function ensureParentFolder(vault: Vault, path: string): Promise<void> {
   }
 }
 
-function collisionPath(path: string, suffix: string): string {
+export function conflictPath(path: string, suffix: string): string {
   const normalized = normalizeVaultPath(path);
   const dot = normalized.lastIndexOf(".");
   const tag = ` conflict-${suffix.slice(0, 8)}`;

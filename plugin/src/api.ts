@@ -121,6 +121,19 @@ type ApiResponse = {
   text(): Promise<string>;
 };
 
+export class ApiError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+const RETRIABLE_CLIENT_STATUSES = new Set([401, 403, 408, 425, 429]);
+
+export function isPermanentApiRejection(error: unknown): boolean {
+  return error instanceof ApiError && error.status >= 400 && error.status < 500 && !RETRIABLE_CLIENT_STATUSES.has(error.status);
+}
+
 export class MyloniteApiClient {
   constructor(private readonly serverUrl: string, private readonly auth?: DeviceAuth) {}
 
@@ -338,7 +351,7 @@ export class MyloniteApiClient {
       throw: false,
     });
     if (response.status < 200 || (response.status >= 300 && response.status !== 404)) {
-      throw new Error(response.text);
+      throw new ApiError(response.status, response.text);
     }
     return {
       status: response.status,
