@@ -1,7 +1,7 @@
 # Mylonite
 
 ![Latest release](https://img.shields.io/github/v/release/z1xus/mylonite)
-![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)
+![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange.svg)
 ![Bun](https://img.shields.io/badge/runtime-bun-black.svg)
 ![Obsidian](https://img.shields.io/badge/obsidian-desktop%20%2B%20mobile-7c3aed.svg)
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
@@ -147,7 +147,7 @@ mylonite vault create "My Vault"
 
 Requirements:
 
-- Rust 1.85+
+- Rust 1.89+
 - Bun 1.2+
 
 Run locally:
