@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::{fs, path::Path};
 
 use anyhow::{Context, bail};
@@ -96,7 +97,7 @@ fn generate_self_signed_cert(config: &TlsConfig, cert: &Path, key: &Path) -> any
     }
     fs::write(cert, certified_key.cert.pem())
         .with_context(|| format!("write {}", cert.display()))?;
-    fs::write(key, certified_key.key_pair.serialize_pem())
+    fs::write(key, certified_key.signing_key.serialize_pem())
         .with_context(|| format!("write {}", key.display()))?;
     Ok(())
 }
@@ -107,7 +108,7 @@ pub async fn shutdown_signal() {
     }
 }
 
-pub async fn shutdown_server(handle: Handle) {
+pub async fn shutdown_server(handle: Handle<SocketAddr>) {
     shutdown_signal().await;
     handle.graceful_shutdown(None);
 }

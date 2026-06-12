@@ -147,7 +147,10 @@ pub(super) fn validate_nonce_hex(nonce_hex: &str) -> Result<(), ApiError> {
 }
 
 pub(super) fn validate_ciphertext_hex(ciphertext_hex: &str) -> Result<(), ApiError> {
-    if ciphertext_hex.is_empty() || ciphertext_hex.len() % 2 != 0 || !is_lower_hex(ciphertext_hex) {
+    if ciphertext_hex.is_empty()
+        || !ciphertext_hex.len().is_multiple_of(2)
+        || !is_lower_hex(ciphertext_hex)
+    {
         return Err(ApiError::bad_request(anyhow::anyhow!(
             "invalid ciphertext hex"
         )));
@@ -183,7 +186,7 @@ fn validate_hex_field(name: &str, value: &str, len: usize) -> Result<(), ApiErro
 }
 
 fn validate_hex_payload_size(name: &str, value: &str, max_bytes: usize) -> Result<(), ApiError> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err(ApiError::bad_request(anyhow::anyhow!(
             "invalid {name} hex length"
         )));

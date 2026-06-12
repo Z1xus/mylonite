@@ -92,7 +92,7 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, ApiErro
 }
 
 fn hex_decode(value: &str) -> Result<Vec<u8>, ApiError> {
-    if value.len() % 2 != 0 || !is_lower_hex(value) {
+    if !value.len().is_multiple_of(2) || !is_lower_hex(value) {
         return Err(ApiError::bad_request(anyhow::anyhow!("invalid hex")));
     }
     let mut out = Vec::with_capacity(value.len() / 2);

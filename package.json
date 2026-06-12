@@ -9,13 +9,13 @@
     "@noble/ciphers": "^2.2.0",
     "@noble/curves": "^2.2.0",
     "@noble/hashes": "^2.2.0",
-    "@types/node": "^25.8.0",
-    "esbuild": "^0.28.0",
-    "obsidian": "^1.13.0",
+    "@types/node": "^25.9.3",
+    "esbuild": "^0.28.1",
+    "obsidian": "^1.13.1",
     "qrcode-generator": "^2.0.4",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.6",
-    "yjs": "^13.6.30"
+    "vitest": "^4.1.8",
+    "yjs": "^13.6.31"
   },
   "scripts": {
     "build": "bun run build:plugin && node scripts/copy-plugin-main.mjs",

@@ -6,8 +6,8 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use rand::RngCore;
-use redb::{Database, ReadTransaction, ReadableTable, TableDefinition};
+use rand::Rng;
+use redb::{Database, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 const VAULTS: TableDefinition<&str, &[u8]> = TableDefinition::new("vaults");
@@ -146,7 +146,15 @@ impl Storage {
         fs::create_dir_all(data_dir).with_context(|| format!("create {}", data_dir.display()))?;
         fs::create_dir_all(data_dir.join("blobs"))
             .with_context(|| format!("create {}", data_dir.join("blobs").display()))?;
-        let db = Database::create(data_dir.join("mylonite.redb")).context("open redb database")?;
+        let db_path = data_dir.join("mylonite.redb");
+        let db = match Database::create(&db_path) {
+            Ok(db) => db,
+            Err(redb::DatabaseError::UpgradeRequired(_)) => {
+                upgrade_v2_database(&db_path)?;
+                Database::create(&db_path).context("open redb database after format upgrade")?
+            }
+            Err(error) => return Err(error).context("open redb database"),
+        };
         let storage = Self {
             db: Arc::new(db),
             data_dir: Arc::new(data_dir.to_path_buf()),
@@ -722,6 +730,14 @@ impl Storage {
     }
 }
 
+fn upgrade_v2_database(db_path: &Path) -> anyhow::Result<()> {
+    let mut db = redb2::Database::open(db_path)
+        .with_context(|| format!("open {} for format upgrade", db_path.display()))?;
+    db.upgrade()
+        .with_context(|| format!("upgrade {} to the v3 file format", db_path.display()))?;
+    Ok(())
+}
+
 fn now_unix() -> anyhow::Result<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1279,6 +1295,44 @@ mod tests {
                 .is_err(),
             "old pairing tokens for the deleted vault must no longer resolve"
         );
+    }
+
+    #[test]
+    fn open_upgrades_v2_format_database_in_place() {
+        let dir = unique_temp_dir();
+        let db_path = dir.join("mylonite.redb");
+        {
+            let vaults: redb2::TableDefinition<'_, &str, &[u8]> =
+                redb2::TableDefinition::new("vaults");
+            let record = super::VaultRecord {
+                id: "v-legacy".to_string(),
+                name: "legacy vault".to_string(),
+                created_at_unix: 0,
+                revoked_at_unix: None,
+                current_seq: 0,
+            };
+            let db = redb2::Database::create(&db_path).expect("create v2 database");
+            let write = db.begin_write().expect("begin v2 write");
+            {
+                let mut table = write.open_table(vaults).expect("open v2 vaults table");
+                table
+                    .insert(
+                        "v-legacy",
+                        serde_json::to_vec(&record)
+                            .expect("encode vault")
+                            .as_slice(),
+                    )
+                    .expect("insert v2 vault row");
+            }
+            write.commit().expect("commit v2 write");
+        }
+
+        let storage = Storage::open(&dir).expect("open storage over v2 database");
+        let vaults = storage.list_vaults().expect("list vaults");
+
+        assert_eq!(vaults.len(), 1);
+        assert_eq!(vaults[0].id, "v-legacy");
+        assert_eq!(vaults[0].name, "legacy vault");
     }
 
     fn test_storage() -> Storage {

@@ -298,10 +298,10 @@ fn prompt_index(label: &str, len: usize) -> anyhow::Result<usize> {
         let mut input = String::new();
         io::stdin().read_line(&mut input).context("read prompt")?;
         let input = input.trim();
-        if let Ok(value) = input.parse::<usize>() {
-            if (1..=len).contains(&value) {
-                return Ok(value - 1);
-            }
+        if let Ok(value) = input.parse::<usize>()
+            && (1..=len).contains(&value)
+        {
+            return Ok(value - 1);
         }
         eprintln!("enter a number from 1 to {len}");
     }

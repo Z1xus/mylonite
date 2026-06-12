@@ -9,6 +9,7 @@
     "moduleResolution": "Bundler",
     "noImplicitAny": true,
     "outDir": "dist",
+    "skipLibCheck": true,
     "strict": true,
     "target": "ES2022"
   },

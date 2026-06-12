@@ -7,7 +7,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 use mylonite_protocol::{ClientMsgKind, Frame, ServerMsgKind};
-use rand::RngCore;
+use rand::Rng;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::{
