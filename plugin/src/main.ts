@@ -275,7 +275,6 @@ export default class MylonitePlugin extends Plugin {
         await this.pollPairingState(true);
         return;
       }
-      await this.syncEngine.createSnapshot({ silent: true });
       const registered = await client.registerDevice(
         this.settings.vaultId,
         request.label || "Obsidian device",
@@ -308,6 +307,12 @@ export default class MylonitePlugin extends Plugin {
       new Notice("Device approved. The new device will finish automatically.");
     } catch (error) {
       new Notice(`Authorization failed. Check the request and try again. ${String(error)}`);
+      return;
+    }
+    try {
+      await this.syncEngine.createSnapshot({ silent: true });
+    } catch (error) {
+      this.debug(`post-approval snapshot failed: ${String(error)}`);
     }
   }
 
@@ -482,10 +487,14 @@ export default class MylonitePlugin extends Plugin {
       const client = new MyloniteApiClient(this.settings.serverUrl);
       const response = await client.getPairingSessionGrant(this.settings.devicePairingSessionId);
       if (response.status === "expired") {
+        clearDevicePairingPrivateKey(this.app, this.settings);
+        this.settings.devicePairingSessionId = "";
+        this.settings.devicePairingRequest = "";
+        this.settings.devicePairingResponse = "";
+        await this.saveSettings();
         this.stopPairingPolling();
-        if (showNotice) {
-          new Notice("Invite expired. Enter a new one.");
-        }
+        this.refreshSettingsTab();
+        new Notice("Invite expired. Enter a new one.");
         return;
       }
       if (response.status === "pending") {

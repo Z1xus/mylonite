@@ -463,6 +463,7 @@ pub(super) async fn submit_pairing_session_request(
         verifying_key: request.request.verifying_key,
         x25519_public_key: request.request.x25519_public_key,
     });
+    session.expires_at_unix = now.saturating_add(PAIRING_SESSION_TTL_SECS);
     Ok(Json(SubmitPairingSessionResponse {
         session_id: session_id.clone(),
         expires_at_unix: session.expires_at_unix,
@@ -556,6 +557,7 @@ pub(super) async fn put_pairing_session_grant(
         nonce_hex: request.grant.nonce_hex,
         ciphertext_hex: request.grant.ciphertext_hex,
     });
+    session.expires_at_unix = now.saturating_add(PAIRING_SESSION_TTL_SECS);
     Ok(StatusCode::NO_CONTENT)
 }
 
