@@ -1,7 +1,5 @@
 {
   "compilerOptions": {
-    "baseUrl": ".",
-    "ignoreDeprecations": "6.0",
     "inlineSourceMap": true,
     "inlineSources": true,
     "lib": ["DOM", "ES2022"],

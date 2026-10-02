@@ -82,7 +82,7 @@ jobs:
           path: |
             ~/.bun/install/cache
             plugin/node_modules
-          key: bun-${{ runner.os }}-${{ hashFiles('plugin/bun.lock') }}
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
           restore-keys: |
             bun-${{ runner.os }}-
 

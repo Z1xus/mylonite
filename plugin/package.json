@@ -10,17 +10,17 @@
     "test": "vitest run"
   },
   "devDependencies": {
-    "@types/node": "^25.9.3",
-    "esbuild": "^0.28.1",
+    "@types/node": "^26.6.4",
+    "esbuild": "^0.28.2",
     "obsidian": "^1.13.1",
-    "typescript": "^6.0.3",
-    "vitest": "^4.1.8"
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3"
   },
   "dependencies": {
-    "@noble/ciphers": "^2.2.0",
-    "@noble/curves": "^2.2.0",
-    "@noble/hashes": "^2.2.0",
+    "@noble/ciphers": "^2.4.0",
+    "@noble/curves": "^2.4.0",
+    "@noble/hashes": "^2.4.0",
     "qrcode-generator": "^2.0.4",
-    "yjs": "^13.6.31"
+    "yjs": "^13.6.33"
   }
 }
