@@ -57,7 +57,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Format
-        run: cargo fmt --check
+        run: cargo fmt --all --check
 
       - name: Clippy
         run: cargo clippy -p mylonite --all-targets -- -D warnings

@@ -143,6 +143,17 @@ mylonite vault create "My Vault"
 # pair the new device with the freshly printed token
 ```
 
+## Upgrading from 0.1.x
+
+The sync format changed. Update in this order:
+
+1. Update the server and restart it. Existing data stays as it is.
+2. Update the plugin on each device. The first updated device upgrades the vault. The other devices join it when you update them.
+
+Devices with the old plugin stop syncing when the vault is upgraded. Edits made on them are not lost. They sync when you update the plugin on that device.
+
+If the same file changed on two devices and Mylonite can't merge the changes, it keeps both versions. The extra copy has `conflict` in its name. The old sync state is saved in `.obsidian/plugins/mylonite/sync-v2-backup.json`.
+
 ## Develop
 
 Requirements:
@@ -168,7 +179,7 @@ bun run build
 Run checks:
 
 ```bash
-cargo fmt --check
+cargo fmt --all --check
 cargo clippy -p mylonite --all-targets -- -D warnings
 cargo test -p mylonite
 cd plugin
