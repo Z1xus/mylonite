@@ -559,8 +559,8 @@ export default class MylonitePlugin extends Plugin {
 
   async resync(): Promise<void> {
     const confirmed = await confirmAction(this.app, {
-      title: "Resync this device",
-      message: "Mylonite downloads the vault again and compares it with your files. Files that differ are kept as conflict copies. Nothing is deleted.",
+      title: "Resync this device?",
+      message: "Files that differ are kept as copies. Nothing is deleted.",
       confirmText: "Resync",
     });
     if (confirmed) {

@@ -315,7 +315,7 @@ impl ApiError {
         match message.as_str() {
             storage::PLUGIN_UPDATE_REQUIRED => Self::new(
                 StatusCode::CONFLICT,
-                "This vault needs a newer Mylonite plugin. Update the plugin on this device.",
+                "Update the Mylonite plugin to keep syncing this vault.",
                 error,
             ),
             storage::VAULT_UPGRADE_REQUIRED => {

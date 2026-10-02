@@ -149,11 +149,11 @@ export class SyncEngine {
 
   statusSummary(): string {
     if (!this.paired) {
-      return "This device is not paired.";
+      return "Not paired.";
     }
     const session = this.session;
     if (!session) {
-      return "Sync is stopped.";
+      return "Sync stopped.";
     }
     const waiting = session.replica.outbox.length;
     return [
@@ -549,7 +549,7 @@ export class SyncEngine {
         }
         const skipped = ready.filter((entry) => entry.op.t === "blob" && entry.op.blob === blobId).map((entry) => entry.opId);
         replica.ack(new Set(skipped));
-        this.notices.push("A file is larger than the server allows, so it was not synced.");
+        this.notices.push("A file is too large for the server and wasn't synced.");
       }
     }
   }
@@ -578,11 +578,11 @@ export class SyncEngine {
   private handleError(label: string, error: unknown): void {
     this.host.debug(`${label} failed: ${String(error)}`);
     if (error instanceof ServerTooOldError) {
-      this.host.updateStatus("Server update needed");
+      this.host.updateStatus("Update server to sync");
       return;
     }
     const waiting = this.session?.replica.outbox.length ?? 0;
-    this.host.updateStatus(waiting > 0 ? `Not synced, ${waiting} waiting` : "Not synced");
+    this.host.updateStatus(waiting > 0 ? `Can't sync, ${waiting} waiting` : "Can't sync");
     this.scheduleRetry();
   }
 
@@ -604,11 +604,7 @@ export class SyncEngine {
       return;
     }
     const waiting = session.replica.outbox.length;
-    if (waiting > 0) {
-      this.host.updateStatus(`${waiting} waiting`);
-    } else {
-      this.host.updateStatus(this.live ? "Synced" : "Synced, not live");
-    }
+    this.host.updateStatus(waiting > 0 ? `${waiting} waiting` : "Synced");
   }
 
   private showNotices(): void {
@@ -616,7 +612,7 @@ export class SyncEngine {
     if (notices.length === 1) {
       new Notice(`Mylonite: ${notices[0]}`);
     } else if (notices.length > 1) {
-      new Notice(`Mylonite: kept both versions of ${notices.length} files. Look for files with "conflict" in the name.`);
+      new Notice(`Mylonite: kept both versions of ${notices.length} files, marked "conflict".`);
     }
   }
 

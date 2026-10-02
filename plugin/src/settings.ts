@@ -125,7 +125,7 @@ export class MyloniteSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Resync")
-      .setDesc("Downloads the vault again and compares it with your files. Use this if sync looks stuck.")
+      .setDesc("Downloads the vault again and compares it with your files.")
       .addButton((button) => button
         .setButtonText("Resync")
         .onClick(async () => {

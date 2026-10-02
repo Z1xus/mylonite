@@ -381,7 +381,7 @@ export class Replica {
       const aside = this.freePath(conflictPath(record.path, op.blob));
       await io.writeBytes(aside, bytes);
       this.dirty.add(aside);
-      this.deps.notify(`Kept both versions of ${record.path}.`);
+      this.deps.notify(`kept both versions of "${record.path}".`);
       if (unsent) {
         this.put({ ...record, hash: op.blob, mtime: 0 });
         this.dirty.add(record.path);
@@ -441,7 +441,7 @@ export class Replica {
     }
     if (changedHere) {
       this.dirty.add(record.path);
-      this.deps.notify(`Kept ${record.path}. It was deleted on another device but changed here.`);
+      this.deps.notify(`kept "${record.path}". It changed here after another device deleted it.`);
       return;
     }
     await this.deps.io.trash(record.path);
@@ -569,7 +569,7 @@ export class Replica {
     const aside = this.freePath(conflictPath(path, newFileId()));
     await this.deps.io.move(path, aside);
     this.dirty.add(aside);
-    this.deps.notify(`Kept both versions of ${path}.`);
+    this.deps.notify(`kept both versions of "${path}".`);
   }
 
   private async diskDiffers(record: FileRecord, stat: FileStat): Promise<boolean> {
