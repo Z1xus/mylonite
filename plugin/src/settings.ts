@@ -11,7 +11,6 @@ import {
   validatePairingRequestShape,
 } from "./pairing";
 import { qrSvgDataUrl } from "./qr";
-import { DurableSyncState, PendingEncryptedBlob, PendingEncryptedOp } from "./sync-types";
 
 export interface MyloniteSettings {
   serverUrl: string;
@@ -19,11 +18,6 @@ export interface MyloniteSettings {
   vaultSaltHex: string;
   passphraseStorage: "none" | "secret-storage" | "plugin-data";
   passphraseDevelopmentFallback: string;
-  lamport: number;
-  lastServerSeq: number;
-  pendingBlobs: PendingEncryptedBlob[];
-  pendingOps: PendingEncryptedOp[];
-  durableSyncState: DurableSyncState;
   deviceId: string;
   devicePrivateKeyHex: string;
   devicePublicKeyHex: string;
@@ -44,15 +38,6 @@ export const DEFAULT_SETTINGS: MyloniteSettings = {
   vaultSaltHex: "",
   passphraseStorage: "none",
   passphraseDevelopmentFallback: "",
-  lamport: 0,
-  lastServerSeq: 0,
-  pendingBlobs: [],
-  pendingOps: [],
-  durableSyncState: {
-    version: 1,
-    index: { version: 1, files: [], tombstones: [] },
-    journal: [],
-  },
   deviceId: "",
   devicePrivateKeyHex: "",
   devicePublicKeyHex: "",
@@ -74,8 +59,7 @@ type MyloniteSettingsHost = {
   createDevicePairingInvite(): Promise<void>;
   submitDevicePairingInvite(inviteInput: string): Promise<void>;
   authorizeDevicePairingRequest(): Promise<void>;
-  createSnapshot(): Promise<void>;
-  restoreLatestSnapshot(): Promise<void>;
+  resync(): Promise<void>;
   unpairDevice(): Promise<void>;
 };
 
@@ -140,21 +124,12 @@ export class MyloniteSettingTab extends PluginSettingTab {
       .setDesc(`Vault ${this.host.settings.vaultId}, device ${this.host.settings.deviceId}.`);
 
     new Setting(containerEl)
-      .setName("Encrypted snapshot")
-      .setDesc("Uploads this vault so new devices can start faster.")
+      .setName("Resync")
+      .setDesc("Downloads the vault again and compares it with your files. Use this if sync looks stuck.")
       .addButton((button) => button
-        .setButtonText("Create")
+        .setButtonText("Resync")
         .onClick(async () => {
-          await this.host.createSnapshot();
-        }));
-
-    new Setting(containerEl)
-      .setName("Latest snapshot")
-      .setDesc("Restores the newest snapshot from the server.")
-      .addButton((button) => button
-        .setButtonText("Restore")
-        .onClick(async () => {
-          await this.host.restoreLatestSnapshot();
+          await this.host.resync();
         }));
 
     new Setting(containerEl)

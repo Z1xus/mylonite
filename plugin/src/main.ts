@@ -41,6 +41,7 @@ import {
   validateDevicePairingSecret,
   validatePairingRequestShape,
 } from "./pairing";
+import { LEGACY_SETTING_KEYS, LegacyState, readLegacyState } from "./migrate";
 import { SyncEngine } from "./sync-engine";
 
 export default class MylonitePlugin extends Plugin {
@@ -50,6 +51,8 @@ export default class MylonitePlugin extends Plugin {
   private syncEngine = new SyncEngine(this);
   private pairingPollTimer: number | null = null;
   private settingTab: MyloniteSettingTab | null = null;
+  private legacyState: LegacyState | null = null;
+  private legacyData: Record<string, unknown> | null = null;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -57,22 +60,12 @@ export default class MylonitePlugin extends Plugin {
     this.addCommand({
       id: "show-sync-status",
       name: "show sync status",
-      callback: () => new Notice(this.syncEngine.syncStatusSummary()),
+      callback: () => new Notice(this.syncEngine.statusSummary()),
     });
     this.addCommand({
       id: "sync-now",
       name: "sync now",
-      callback: () => void this.syncEngine.syncNow().catch((error) => new Notice(`Sync failed. Check the server URL and try again. ${String(error)}`)),
-    });
-    this.addCommand({
-      id: "create-snapshot",
-      name: "create snapshot",
-      callback: () => void this.syncEngine.createSnapshot().catch((error) => new Notice(`Snapshot failed. Check the server connection and try again. ${String(error)}`)),
-    });
-    this.addCommand({
-      id: "restore-latest-snapshot",
-      name: "restore snapshot",
-      callback: () => void this.syncEngine.restoreLatestSnapshot().catch((error) => new Notice(`Restore failed. Check the server connection and try again. ${String(error)}`)),
+      callback: () => void this.syncEngine.syncNow().catch((error: unknown) => new Notice(`Couldn't sync. Check the server URL and connection. ${String(error)}`)),
     });
 
     this.registerObsidianProtocolHandler("mylonite-pair", (params) => {
@@ -93,18 +86,43 @@ export default class MylonitePlugin extends Plugin {
 
   onunload(): void {
     this.stopPairingPolling();
-    this.syncEngine.close();
+    void this.syncEngine.close();
     this.status?.remove();
     this.status = null;
   }
 
   async loadSettings(): Promise<void> {
     const storedData = await this.loadData() as unknown;
-    this.settings = {
-      ...DEFAULT_SETTINGS,
-      ...(isRecord(storedData) ? storedData : {}),
-    };
-    this.syncEngine.reloadDurableState();
+    const stored: Record<string, unknown> = isRecord(storedData) ? { ...storedData } : {};
+    if (LEGACY_SETTING_KEYS.some((key) => key in stored)) {
+      this.legacyData = Object.fromEntries(LEGACY_SETTING_KEYS.map((key) => [key, stored[key]]));
+      this.legacyState = stored.vaultId ? readLegacyState(stored) : null;
+      for (const key of LEGACY_SETTING_KEYS) {
+        delete stored[key];
+      }
+    }
+    this.settings = { ...DEFAULT_SETTINGS, ...stored };
+  }
+
+  takeLegacyState(): LegacyState | null {
+    const state = this.legacyState;
+    this.legacyState = null;
+    return state;
+  }
+
+  /** Keeps a backup of the old sync state, then removes it from data.json. */
+  async retireLegacyState(): Promise<void> {
+    const dir = this.manifest.dir;
+    const adapter = this.app.vault.adapter;
+    if (dir && this.legacyData) {
+      await adapter.write(`${dir}/sync-v2-backup.json`, JSON.stringify(this.legacyData));
+      const docPath = `${dir}/doc-${this.settings.vaultId}.bin`;
+      if (await adapter.exists(docPath)) {
+        await adapter.remove(docPath);
+      }
+    }
+    this.legacyData = null;
+    await this.saveSettings();
   }
 
   async saveSettings(): Promise<void> {
@@ -144,8 +162,6 @@ export default class MylonitePlugin extends Plugin {
       this.settings.deviceId = response.device_id;
       this.settings.devicePublicKeyHex = keypair.publicKeyHex;
       this.settings.pairingToken = "";
-      this.settings.pendingBlobs = [];
-      this.settings.pendingOps = [];
       storeDevicePrivateKey(this.app, this.settings, keypair.privateKeyHex);
       storePassphrase(this.app, this.settings, randomHex(32));
       this.vaultKeys = null;
@@ -310,7 +326,7 @@ export default class MylonitePlugin extends Plugin {
       return;
     }
     try {
-      await this.syncEngine.createSnapshot({ silent: true });
+      await this.syncEngine.createSnapshot();
     } catch (error) {
       this.debug(`post-approval snapshot failed: ${String(error)}`);
     }
@@ -340,10 +356,6 @@ export default class MylonitePlugin extends Plugin {
       this.settings.vaultId = secret.vault_id;
       this.settings.vaultSaltHex = secret.vault_salt_hex;
       this.settings.deviceId = secret.device_id;
-      this.settings.lastServerSeq = secret.last_server_seq;
-      this.settings.lamport = 0;
-      this.settings.pendingBlobs = [];
-      this.settings.pendingOps = [];
       clearDevicePairingPrivateKey(this.app, this.settings);
       this.settings.devicePairingInvite = "";
       this.settings.devicePairingSessionId = "";
@@ -354,13 +366,7 @@ export default class MylonitePlugin extends Plugin {
       this.vaultKeys = null;
       await this.saveSettings();
       this.stopPairingPolling();
-      this.updateStatus("paired");
-      try {
-        await this.syncEngine.restoreLatestSnapshot({ deleteMissing: false, silent: true, requireSnapshot: false });
-      } catch (error) {
-        this.debug(`automatic snapshot restore failed: ${String(error)}`);
-        new Notice("Device paired. Snapshot restore failed, so normal sync will catch up instead.");
-      }
+      this.updateStatus("Paired");
       this.syncEngine.start();
       this.refreshSettingsTab();
       new Notice("Device paired.");
@@ -552,12 +558,15 @@ export default class MylonitePlugin extends Plugin {
       : undefined);
   }
 
-  async createSnapshot(): Promise<void> {
-    await this.syncEngine.createSnapshot();
-  }
-
-  async restoreLatestSnapshot(): Promise<void> {
-    await this.syncEngine.restoreLatestSnapshot();
+  async resync(): Promise<void> {
+    const confirmed = await confirmAction(this.app, {
+      title: "Resync this device",
+      message: "Mylonite downloads the vault again and compares it with your files. Files that differ are kept as conflict copies. Nothing is deleted.",
+      confirmText: "Resync",
+    });
+    if (confirmed) {
+      await this.syncEngine.resync();
+    }
   }
 
   async unpairDevice(): Promise<void> {
@@ -570,7 +579,7 @@ export default class MylonitePlugin extends Plugin {
       return;
     }
     this.stopPairingPolling();
-    this.syncEngine.close({ flushScheduledUpdates: false });
+    await this.syncEngine.destroy();
     clearDevicePrivateKey(this.app, this.settings);
     clearDevicePairingPrivateKey(this.app, this.settings);
     clearPassphrase(this.app, this.settings);
@@ -583,17 +592,7 @@ export default class MylonitePlugin extends Plugin {
     this.settings.devicePairingSessionId = "";
     this.settings.devicePairingRequest = "";
     this.settings.devicePairingResponse = "";
-    this.settings.lamport = 0;
-    this.settings.lastServerSeq = 0;
-    this.settings.pendingBlobs = [];
-    this.settings.pendingOps = [];
-    this.settings.durableSyncState = {
-      version: 1,
-      index: { version: 1, files: [], tombstones: [] },
-      journal: [],
-    };
     this.vaultKeys = null;
-    this.syncEngine.reloadDurableState();
     await this.saveSettings();
     this.updateStatus("unpaired");
     new Notice("Device unpaired.");

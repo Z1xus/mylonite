@@ -51,7 +51,7 @@ describe("MyloniteApiClient id validation", () => {
   it("rejects invalid vault ids before building signed endpoints", async () => {
     const client = new MyloniteApiClient("http://localhost");
 
-    await expect(client.listSnapshots("bad/id")).rejects.toThrow("invalid vault id");
+    await expect(client.latestSnapshot("bad/id")).rejects.toThrow("invalid vault id");
     await expect(client.listOps("bad/id", 0)).rejects.toThrow("invalid vault id");
   });
 
@@ -124,7 +124,7 @@ describe("MyloniteApiClient id validation", () => {
     const requestUrlMock = mockRequestUrl(200, []);
     const client = new MyloniteApiClient("http://localhost", { deviceId: "device-a", privateKeyHex: "00".repeat(32) });
 
-    await expect(client.listSnapshots("vault-a")).rejects.toThrow("invalid device id");
+    await expect(client.latestSnapshot("vault-a")).rejects.toThrow("invalid device id");
     expect(requestUrlMock).not.toHaveBeenCalled();
   });
 
@@ -141,8 +141,8 @@ describe("MyloniteApiClient id validation", () => {
       ciphertext_hex: "abc",
     };
 
-    await expect(client.appendOp("vault-a", op)).rejects.toThrow("invalid ciphertext");
-    await expect(client.appendOp("vault-a", { ...op, ciphertext_hex: "cc", device_id: "d" + "2".repeat(32) })).rejects.toThrow("request device id does not match authenticated device");
+    await expect(client.appendOps("vault-a", [op])).rejects.toThrow("invalid ciphertext");
+    await expect(client.appendOps("vault-a", [{ ...op, ciphertext_hex: "cc", device_id: "d" + "2".repeat(32) }])).rejects.toThrow("request device id does not match authenticated device");
     expect(requestUrlMock).not.toHaveBeenCalled();
   });
 
@@ -212,21 +212,15 @@ describe("MyloniteApiClient id validation", () => {
     }));
   });
 
-  it("requires auth for device listing", async () => {
+  it("requires auth for vault info", async () => {
     const client = new MyloniteApiClient("http://localhost");
 
-    await expect(client.listDevices("vault-a")).rejects.toThrow("device authentication is required");
+    await expect(client.vaultInfo("vault-a")).rejects.toThrow("device authentication is required");
   });
 
   it("builds websocket URLs without query signatures", () => {
     const client = new MyloniteApiClient("http://localhost", { deviceId: "d" + "1".repeat(32), privateKeyHex: "00".repeat(32) });
 
     expect(client.websocketUrl("vault-a")).toBe("ws://localhost/ws?vault_id=vault-a&device_id=d11111111111111111111111111111111");
-  });
-
-  it("rejects invalid device ids before revocation requests", async () => {
-    const client = new MyloniteApiClient("http://localhost", { deviceId: "d" + "1".repeat(32), privateKeyHex: "00".repeat(32) });
-
-    await expect(client.revokeDevice("vault-a", "bad/device")).rejects.toThrow("invalid device id");
   });
 });

@@ -1,150 +1,48 @@
-import { SyncJournalEntry, VaultStateSnapshot } from "./sync-state";
+export type FileKind = "text" | "blob";
 
-export interface PendingEncryptedOp {
-  client_op_id: string;
-  device_id: string;
-  lamport: number;
-  kind: number;
-  key_version: number;
-  nonce_hex: string;
-  ciphertext_hex: string;
-}
-
-export interface PendingEncryptedBlob {
-  blobId: string;
-  envelopeHex: string;
-}
-
-export type RemotePayload = RemoteV2Payload;
-
-export type RemoteV2Payload =
-  | RemoteV2FileCreate
-  | RemoteV2FileUpdate
-  | RemoteV2FileRename
-  | RemoteV2FileDelete
-  | RemoteV2FileCopy;
-
-export interface RemoteV2Base {
-  version: 2;
-  fileId: string;
+export interface FileRecord {
+  id: string;
+  /** Path on this device. Differs from `cpath` while a local move is pending. */
   path: string;
-  fileKind: "markdown" | "binary";
-}
-
-export interface RemoteV2MarkdownBase extends RemoteV2Base {
-  fileKind: "markdown";
-  updateHex: string;
-}
-
-export interface RemoteV2BinaryBase extends RemoteV2Base {
-  fileKind: "binary";
-}
-
-export type RemoteV2FileCreate = RemoteV2MarkdownFileCreate | RemoteV2BinaryFileCreate;
-
-export interface RemoteV2MarkdownFileCreate extends RemoteV2MarkdownBase {
-  kind: "file-create";
-  contentHash: string;
-}
-
-export interface RemoteV2BinaryFileCreate extends RemoteV2BinaryBase {
-  kind: "file-create";
-  blobId: string;
+  /** Path the server log gives this file. Unset until the creating op is in the log. */
+  cpath?: string;
+  kind: FileKind;
+  /** Last content synced with the disk: a text hash or a blob id. */
+  hash: string;
   size: number;
-  contentHash: string;
+  mtime: number;
+  /** Content hash of the op that created the file, as recorded in the log. */
+  initHash?: string;
+  /** Device that sent the create op. */
+  initDevice?: string;
+  /** Content hash of this device's create op while it waits for the log. */
+  pendingInitHash?: string;
+  /** The text doc has remote edits that are not yet written to disk. */
+  ahead?: boolean;
+  /** Deleted here. Kept until the delete op is in the log, so path decisions match other devices. */
+  deleted?: boolean;
 }
 
-export type RemoteV2FileUpdate = RemoteV2MarkdownFileUpdate | RemoteV2BinaryFileUpdate;
+/**
+ * Sync ops, version 3. A `path` on a text or blob op marks the op that creates the file.
+ * Server order decides paths and binary content, text content merges.
+ */
+export type SyncOp =
+  | { v: 3; t: "text"; id: string; path?: string; hash?: string; update: Uint8Array }
+  | { v: 3; t: "blob"; id: string; path?: string; blob?: string; size?: number }
+  | { v: 3; t: "move"; id: string; path: string }
+  | { v: 3; t: "delete"; id: string };
 
-export interface RemoteV2MarkdownFileUpdate extends RemoteV2MarkdownBase {
-  kind: "file-update";
-  baseHash?: string;
-  contentHash: string;
+export interface OutboxEntry {
+  key: number;
+  opId: string;
+  op: SyncOp;
 }
 
-export interface RemoteV2BinaryFileUpdate extends RemoteV2BinaryBase {
-  kind: "file-update";
-  blobId: string;
-  size: number;
-  baseHash?: string;
-  contentHash: string;
-}
-
-export type RemoteV2FileRename = RemoteV2MarkdownFileRename | RemoteV2BinaryFileRename;
-
-export interface RemoteV2MarkdownFileRename extends RemoteV2MarkdownBase {
-  kind: "file-rename";
-  oldPath: string;
-  newPath: string;
-  contentHash?: string;
-}
-
-export interface RemoteV2BinaryFileRename extends RemoteV2BinaryBase {
-  kind: "file-rename";
-  oldPath: string;
-  newPath: string;
-  contentHash?: string;
+/** What the v2 plugin knew was synced, used once to resolve differences after the upgrade. */
+export interface LegacyHint {
+  hash: string;
   blobId?: string;
   size?: number;
-}
-
-export type RemoteV2FileDelete = RemoteV2MarkdownFileDelete | RemoteV2BinaryFileDelete;
-
-export interface RemoteV2MarkdownFileDelete extends RemoteV2MarkdownBase {
-  kind: "file-delete";
-  tombstoneId: string;
-}
-
-export interface RemoteV2BinaryFileDelete extends RemoteV2BinaryBase {
-  kind: "file-delete";
-  tombstoneId: string;
-}
-
-export type RemoteV2FileCopy = RemoteV2MarkdownFileCopy | RemoteV2BinaryFileCopy;
-
-export interface RemoteV2MarkdownFileCopy extends RemoteV2MarkdownBase {
-  kind: "file-copy";
-  sourceFileId: string;
-  newFileId: string;
-  contentHash: string;
-}
-
-export interface RemoteV2BinaryFileCopy extends RemoteV2BinaryBase {
-  kind: "file-copy";
-  sourceFileId: string;
-  newFileId: string;
-  blobId: string;
-  size: number;
-  contentHash: string;
-}
-
-export type SnapshotEntry = SnapshotMarkdownEntry | SnapshotBinaryEntry;
-
-export interface SnapshotPayload {
-  version: number;
-  entries: SnapshotEntry[];
-  state?: VaultStateSnapshot;
-}
-
-export interface SnapshotMarkdownEntry {
-  kind: "markdown";
-  path: string;
-  fileId?: string;
-  contentHash?: string;
-  content: string;
-}
-
-export interface SnapshotBinaryEntry {
-  kind: "binary";
-  path: string;
-  fileId?: string;
-  contentHash?: string;
-  blobId: string;
-  size: number;
-}
-
-export interface DurableSyncState {
-  version: 1;
-  index: VaultStateSnapshot;
-  journal: SyncJournalEntry[];
+  mtime?: number;
 }

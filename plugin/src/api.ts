@@ -65,23 +65,19 @@ export interface AppendOpRequest {
   ciphertext_hex: string;
 }
 
-export interface AppendOpResponse {
-  server_seq: number;
+export interface VaultInfo {
+  format: number;
+  head_seq: number;
+  upgrade_seq: number;
+  upgrade_base: number;
 }
+
+/** Op format of this plugin version. The server rejects other formats once a vault uses it. */
+export const OP_FORMAT = 3;
 
 export interface DeviceAuth {
   deviceId: string;
   privateKeyHex: string;
-}
-
-export interface DeviceRecord {
-  vault_id: string;
-  device_id: string;
-  label: string;
-  verifying_key: string;
-  created_at_unix: number;
-  revoked_at_unix: number | null;
-  last_seen_at_unix: number | null;
 }
 
 export interface RegisterDeviceResponse {
@@ -233,17 +229,59 @@ export class MyloniteApiClient {
     });
   }
 
-  async appendOp(vaultId: string, op: AppendOpRequest): Promise<AppendOpResponse> {
+  async appendOps(vaultId: string, ops: AppendOpRequest[]): Promise<number[]> {
     validateOpaqueId("vault id", vaultId);
-    validateAppendOpRequest(op);
-    this.validateAuthenticatedDevice(op.device_id);
-    const path = `/api/v1/vaults/${encodeURIComponent(vaultId)}/ops`;
-    const body = new TextEncoder().encode(JSON.stringify(op));
-    return this.requestJson(path, {
+    for (const op of ops) {
+      validateAppendOpRequest(op);
+      this.validateAuthenticatedDevice(op.device_id);
+    }
+    const path = `/api/v1/vaults/${encodeURIComponent(vaultId)}/ops/batch`;
+    const body = new TextEncoder().encode(JSON.stringify({ format: OP_FORMAT, ops }));
+    const response = await this.requestJson<{ server_seqs: number[] }>(path, {
       method: "POST",
       headers: this.signedHeaders("POST", path, body, { "content-type": "application/json" }),
       body,
     });
+    return response.server_seqs;
+  }
+
+  async vaultInfo(vaultId: string): Promise<VaultInfo | null> {
+    validateOpaqueId("vault id", vaultId);
+    const path = `/api/v1/vaults/${encodeURIComponent(vaultId)}`;
+    const response = await this.request(path, { headers: this.signedHeaders("GET", path, new Uint8Array()) });
+    return response.status === 404 ? null : validateVaultInfo(await response.json());
+  }
+
+  async upgradeVault(vaultId: string, base: number): Promise<VaultInfo> {
+    validateOpaqueId("vault id", vaultId);
+    validateSequence("upgrade base", base);
+    const path = `/api/v1/vaults/${encodeURIComponent(vaultId)}/upgrade`;
+    const body = new TextEncoder().encode(JSON.stringify({ base }));
+    return validateVaultInfo(await this.requestJson(path, {
+      method: "POST",
+      headers: this.signedHeaders("POST", path, body, { "content-type": "application/json" }),
+      body,
+    }));
+  }
+
+  async missingBlobs(vaultId: string, blobIds: string[]): Promise<Set<string>> {
+    validateOpaqueId("vault id", vaultId);
+    blobIds.forEach(validateBlobId);
+    const path = `/api/v1/vaults/${encodeURIComponent(vaultId)}/blobs/missing`;
+    const body = new TextEncoder().encode(JSON.stringify({ blob_ids: blobIds }));
+    const response = await this.requestJson<{ missing: string[] }>(path, {
+      method: "POST",
+      headers: this.signedHeaders("POST", path, body, { "content-type": "application/json" }),
+      body,
+    });
+    return new Set(response.missing);
+  }
+
+  async latestSnapshot(vaultId: string): Promise<SnapshotRecord | null> {
+    validateOpaqueId("vault id", vaultId);
+    const path = `/api/v1/vaults/${encodeURIComponent(vaultId)}/snapshots/latest`;
+    const response = await this.request(path, { headers: this.signedHeaders("GET", path, new Uint8Array()) });
+    return response.status === 404 ? null : await response.json() as SnapshotRecord;
   }
 
   async putBlob(vaultId: string, blobId: string, ciphertext: Uint8Array): Promise<void> {
@@ -284,22 +322,6 @@ export class MyloniteApiClient {
     });
   }
 
-  async listSnapshots(vaultId: string): Promise<SnapshotRecord[]> {
-    validateOpaqueId("vault id", vaultId);
-    const path = `/api/v1/vaults/${encodeURIComponent(vaultId)}/snapshots`;
-    return this.requestJson(path, {
-      headers: this.signedHeaders("GET", path, new Uint8Array()),
-    });
-  }
-
-  async listDevices(vaultId: string): Promise<DeviceRecord[]> {
-    validateOpaqueId("vault id", vaultId);
-    const path = `/api/v1/vaults/${encodeURIComponent(vaultId)}/devices`;
-    return this.requestJson(path, {
-      headers: this.signedHeaders("GET", path, new Uint8Array()),
-    });
-  }
-
   async registerDevice(vaultId: string, label: string, verifyingKey: string): Promise<RegisterDeviceResponse> {
     validateOpaqueId("vault id", vaultId);
     validateDeviceLabel(label);
@@ -324,16 +346,6 @@ export class MyloniteApiClient {
       method: "POST",
       headers: this.signedHeaders("POST", path, body, { "content-type": "application/json" }),
       body,
-    });
-  }
-
-  async revokeDevice(vaultId: string, deviceId: string): Promise<void> {
-    validateOpaqueId("vault id", vaultId);
-    validateDeviceId(deviceId);
-    const path = `/api/v1/vaults/${encodeURIComponent(vaultId)}/devices/${encodeURIComponent(deviceId)}`;
-    await this.request(path, {
-      method: "POST",
-      headers: this.signedHeaders("POST", path, new Uint8Array()),
     });
   }
 
@@ -533,6 +545,18 @@ function validatePairingGrantPayload(grant: PairingGrantPayload): void {
   validateX25519PublicKey(grant.x25519_public_key);
   validateHexField("nonce", grant.nonce_hex, 48);
   validateHexPayload("ciphertext", grant.ciphertext_hex);
+}
+
+function validateVaultInfo(value: unknown): VaultInfo {
+  const info = value as VaultInfo;
+  if (typeof value !== "object" || value === null) {
+    throw new Error("invalid vault info");
+  }
+  validateSequence("vault format", info.format);
+  validateSequence("head seq", info.head_seq);
+  validateSequence("upgrade seq", info.upgrade_seq);
+  validateSequence("upgrade base", info.upgrade_base);
+  return info;
 }
 
 function validateKeyVersion(value: number): void {

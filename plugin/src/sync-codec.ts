@@ -1,72 +1,78 @@
-import { VaultKeys, decryptPayload, encryptPayload, keyedBlobId, randomHex } from "./crypto";
-import { PendingEncryptedOp } from "./sync-types";
+import { VaultKeys, bytesToHex, decryptPayload, encryptPayload, hexToBytes, keyedBlobId } from "./crypto";
 
-export function encodeEncryptedOp(
-  keys: VaultKeys,
-  vaultId: string,
-  deviceId: string,
-  lamport: number,
-  kind: number,
-  payloadObject: object,
-): PendingEncryptedOp {
-  const clientOpId = randomHex(32);
-  const payload = new TextEncoder().encode(JSON.stringify(payloadObject));
-  const aad = new TextEncoder().encode([
-    "mylonite-op-v1",
-    vaultId,
-    clientOpId,
-    deviceId,
-    String(lamport),
-    String(kind),
-    "1",
-  ].join("|"));
-  const encrypted = encryptPayload(keys.opKey, payload, aad);
-  return {
-    client_op_id: clientOpId,
-    device_id: deviceId,
-    lamport,
-    kind,
-    key_version: 1,
-    nonce_hex: encrypted.nonceHex,
-    ciphertext_hex: encrypted.ciphertextHex,
-  };
+export interface EncryptedOp {
+  client_op_id: string;
+  device_id: string;
+  lamport: number;
+  kind: number;
+  key_version: number;
+  nonce_hex: string;
+  ciphertext_hex: string;
 }
 
-export function decodeEncryptedOpPayload(keys: VaultKeys, vaultId: string, op: PendingEncryptedOp): unknown {
-  const aad = new TextEncoder().encode([
-    "mylonite-op-v1",
-    vaultId,
-    op.client_op_id,
-    op.device_id,
-    String(op.lamport),
-    String(op.kind),
-    String(op.key_version),
-  ].join("|"));
-  const plaintext = decryptPayload(keys.opKey, op.nonce_hex, op.ciphertext_hex, aad);
-  return JSON.parse(new TextDecoder().decode(plaintext)) as unknown;
+/** Server op kinds. Format 3 ops are opaque, so they all use the update kind. */
+const OPAQUE_OP_KIND = 2;
+/** Binary blob envelope: version byte, 24 byte nonce, ciphertext. */
+const BLOB_ENVELOPE_V2 = 2;
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
+export function encryptOp(keys: VaultKeys, vaultId: string, deviceId: string, opId: string, payload: object): EncryptedOp {
+  const op = { client_op_id: opId, device_id: deviceId, lamport: 0, kind: OPAQUE_OP_KIND, key_version: 1 };
+  const encrypted = encryptPayload(keys.opKey, encoder.encode(JSON.stringify(payload)), opAad(vaultId, op));
+  return { ...op, nonce_hex: encrypted.nonceHex, ciphertext_hex: encrypted.ciphertextHex };
+}
+
+export function decryptOp(keys: VaultKeys, vaultId: string, op: EncryptedOp): unknown {
+  const plaintext = decryptPayload(keys.opKey, op.nonce_hex, op.ciphertext_hex, opAad(vaultId, op));
+  return JSON.parse(decoder.decode(plaintext)) as unknown;
+}
+
+function opAad(vaultId: string, op: Pick<EncryptedOp, "client_op_id" | "device_id" | "lamport" | "kind" | "key_version">): Uint8Array {
+  return encoder.encode(["mylonite-op-v1", vaultId, op.client_op_id, op.device_id, op.lamport, op.kind, op.key_version].join("|"));
+}
+
+export function blobIdOf(keys: VaultKeys, vaultId: string, plaintext: Uint8Array): string {
+  return keyedBlobId(keys.blobIdKey, vaultId, plaintext);
 }
 
 export function encryptBlob(keys: VaultKeys, vaultId: string, plaintext: Uint8Array): { blobId: string; envelope: Uint8Array } {
-  const blobId = keyedBlobId(keys.blobIdKey, vaultId, plaintext);
-  const aad = new TextEncoder().encode(`mylonite-blob-v1|${vaultId}|${blobId}`);
-  const encrypted = encryptPayload(keys.blobKey, plaintext, aad);
-  return { blobId, envelope: new TextEncoder().encode(JSON.stringify(encrypted)) };
+  const blobId = blobIdOf(keys, vaultId, plaintext);
+  const encrypted = encryptPayload(keys.blobKey, plaintext, blobAad(vaultId, blobId));
+  const nonce = hexToBytes(encrypted.nonceHex);
+  const ciphertext = hexToBytes(encrypted.ciphertextHex);
+  const envelope = new Uint8Array(1 + nonce.byteLength + ciphertext.byteLength);
+  envelope[0] = BLOB_ENVELOPE_V2;
+  envelope.set(nonce, 1);
+  envelope.set(ciphertext, 1 + nonce.byteLength);
+  return { blobId, envelope };
 }
 
-export function decryptBlobEnvelope(keys: VaultKeys, vaultId: string, blobId: string, envelope: Uint8Array): Uint8Array {
-  const encrypted = JSON.parse(new TextDecoder().decode(envelope)) as { nonceHex: string; ciphertextHex: string };
-  const aad = new TextEncoder().encode(`mylonite-blob-v1|${vaultId}|${blobId}`);
-  return decryptPayload(keys.blobKey, encrypted.nonceHex, encrypted.ciphertextHex, aad);
+export function decryptBlob(keys: VaultKeys, vaultId: string, blobId: string, envelope: Uint8Array): Uint8Array {
+  const aad = blobAad(vaultId, blobId);
+  if (envelope[0] === BLOB_ENVELOPE_V2) {
+    return decryptPayload(keys.blobKey, bytesToHex(envelope.subarray(1, 25)), bytesToHex(envelope.subarray(25)), aad);
+  }
+  // blobs written by plugin 0.1.x are JSON with hex fields
+  const legacy = JSON.parse(decoder.decode(envelope)) as { nonceHex: string; ciphertextHex: string };
+  return decryptPayload(keys.blobKey, legacy.nonceHex, legacy.ciphertextHex, aad);
+}
+
+function blobAad(vaultId: string, blobId: string): Uint8Array {
+  return encoder.encode(`mylonite-blob-v1|${vaultId}|${blobId}`);
 }
 
 export function encryptSnapshot(keys: VaultKeys, vaultId: string, snapshotId: string, coversThroughSeq: number, payload: object): { nonceHex: string; ciphertextHex: string } {
-  const plaintext = new TextEncoder().encode(JSON.stringify(payload));
-  const aad = new TextEncoder().encode(`mylonite-snapshot-v1|${vaultId}|${snapshotId}|${coversThroughSeq}`);
-  return encryptPayload(keys.snapshotKey, plaintext, aad);
+  const plaintext = encoder.encode(JSON.stringify(payload));
+  return encryptPayload(keys.snapshotKey, plaintext, snapshotAad(vaultId, snapshotId, coversThroughSeq));
 }
 
-export function decryptSnapshot<T>(keys: VaultKeys, vaultId: string, snapshotId: string, coversThroughSeq: number, nonceHex: string, ciphertextHex: string): T {
-  const aad = new TextEncoder().encode(`mylonite-snapshot-v1|${vaultId}|${snapshotId}|${coversThroughSeq}`);
-  const plaintext = decryptPayload(keys.snapshotKey, nonceHex, ciphertextHex, aad);
-  return JSON.parse(new TextDecoder().decode(plaintext)) as T;
+export function decryptSnapshot(keys: VaultKeys, vaultId: string, snapshotId: string, coversThroughSeq: number, nonceHex: string, ciphertextHex: string): unknown {
+  const plaintext = decryptPayload(keys.snapshotKey, nonceHex, ciphertextHex, snapshotAad(vaultId, snapshotId, coversThroughSeq));
+  return JSON.parse(decoder.decode(plaintext)) as unknown;
 }
+
+function snapshotAad(vaultId: string, snapshotId: string, coversThroughSeq: number): Uint8Array {
+  return encoder.encode(`mylonite-snapshot-v1|${vaultId}|${snapshotId}|${coversThroughSeq}`);
+}
+
