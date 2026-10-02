@@ -9,7 +9,6 @@ export interface StoreSnapshot {
   meta: Map<string, unknown>;
 }
 
-/** Changes written in one atomic transaction. A null value deletes the key. */
 export class StoreTx {
   readonly files = new Map<string, FileRecord | null>();
   readonly docs = new Map<string, Uint8Array | null>();

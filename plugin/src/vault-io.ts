@@ -8,14 +8,12 @@ export interface FileStat {
   size: number;
 }
 
-/** The small part of the vault the sync engine uses. */
 export interface VaultIO {
   list(): FileStat[];
   stat(path: string): FileStat | null;
   readText(path: string): Promise<string>;
   readBytes(path: string): Promise<Uint8Array>;
   writeText(path: string, text: string): Promise<void>;
-  /** Atomic read, change, and write. Returns the written text. */
   processText(path: string, change: (current: string) => string): Promise<string>;
   writeBytes(path: string, bytes: Uint8Array): Promise<void>;
   move(from: string, to: string): Promise<void>;

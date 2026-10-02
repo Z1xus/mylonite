@@ -15,7 +15,6 @@ import { ObsidianVaultIO } from "./vault-io";
 const PAGE_SIZE = 512;
 const BATCH_OPS = 128;
 const BATCH_BYTES = 1_000_000;
-/** Text edits larger than this travel as a blob, so ops stay small. */
 const INLINE_UPDATE_BYTES = 256 * 1024;
 const LOCAL_DEBOUNCE_MS = 300;
 const TICK_MS = 15_000;
@@ -26,9 +25,7 @@ export interface SyncEngineHost extends Plugin {
   settings: MyloniteSettings;
   createApiClient(): MyloniteApiClient;
   loadVaultKeys(): Promise<VaultKeys>;
-  /** Old sync state from data.json, returned once. */
   takeLegacyState(): LegacyState | null;
-  /** Called after the old sync state is safely in the new store. */
   retireLegacyState(): Promise<void>;
   updateStatus(state: string): void;
   debug(message: string): void;
@@ -42,7 +39,6 @@ interface Session {
   legacy: LegacyState | undefined;
   hints: Record<string, LegacyHint>;
   pushedSeq: number;
-  /** Compare the whole vault on the first sync, to catch edits made while Obsidian was closed. */
   fullScan: boolean;
 }
 
@@ -60,6 +56,7 @@ export class SyncEngine {
   private live = false;
   private registered = false;
   private notices: string[] = [];
+  private blobKeys: VaultKeys | null = null;
 
   constructor(private readonly host: SyncEngineHost) {}
 
@@ -94,7 +91,6 @@ export class SyncEngine {
     this.live = false;
   }
 
-  /** Stops syncing and deletes the local sync state of this device. */
   async destroy(): Promise<void> {
     const name = this.storeName();
     await this.close();
@@ -103,7 +99,6 @@ export class SyncEngine {
     }
   }
 
-  /** Rebuilds the local sync state from the server. Local files are kept. */
   async resync(): Promise<void> {
     await this.run("flush before resync", async () => {
       if (this.session) {
@@ -121,7 +116,6 @@ export class SyncEngine {
     await this.run("sync now", async () => this.syncOnce(), true);
   }
 
-  /** Uploads a snapshot so new devices start from it instead of replaying the log. */
   async createSnapshot(): Promise<void> {
     await this.run("snapshot", async () => {
       const session = this.requireSession();
@@ -170,8 +164,6 @@ export class SyncEngine {
     ].join(", ");
   }
 
-  // ---- lifecycle ----
-
   private register(): void {
     if (this.registered) {
       return;
@@ -180,16 +172,21 @@ export class SyncEngine {
     const { vault } = this.host.app;
     const mark = (file: TAbstractFile) => {
       if (file instanceof TFile) {
-        this.markLocal(file.path);
+        this.pendingPaths.add(file.path);
+      } else if (this.session) {
+        this.session.fullScan = true;
       }
+      this.scheduleLocal();
     };
     this.host.registerEvent(vault.on("create", mark));
     this.host.registerEvent(vault.on("modify", mark));
-    this.host.registerEvent(vault.on("delete", (file) => this.markLocal(file.path)));
+    this.host.registerEvent(vault.on("delete", mark));
     this.host.registerEvent(vault.on("rename", (file, oldPath) => {
       if (file instanceof TFile) {
         this.pendingRenames.push([oldPath, file.path]);
         this.scheduleLocal();
+      } else {
+        mark(file);
       }
     }));
     this.host.registerInterval(window.setInterval(() => {
@@ -212,16 +209,14 @@ export class SyncEngine {
     }
     const io = new ObsidianVaultIO(this.host.app);
     this.blobKeys = await this.host.loadVaultKeys();
-    const session: Session = {
+    const session = {
       store,
-      replica: null as unknown as Replica,
-      socket: null as unknown as LiveSocket,
       cursor: numberOrUndefined(snapshot.meta.get("cursor")),
       legacy: snapshot.meta.get("legacy") as LegacyState | undefined,
       hints: (snapshot.meta.get("hints") as Record<string, LegacyHint> | undefined) ?? {},
       pushedSeq: 0,
       fullScan: true,
-    };
+    } as Session;
     session.replica = new Replica({
       io,
       deviceId: this.settings.deviceId,
@@ -242,7 +237,6 @@ export class SyncEngine {
     }
     await session.replica.commit();
     if (legacy && session.cursor !== undefined) {
-      // migrated in an earlier run
       await this.host.retireLegacyState();
     }
 
@@ -274,9 +268,6 @@ export class SyncEngine {
     return this.session;
   }
 
-  // ---- the sync loop ----
-
-  /** Runs tasks one at a time, so local scans and remote ops never interleave. */
   private run<T>(label: string, task: () => Promise<T>, rethrow = false): Promise<T | undefined> {
     const result = this.chain.then(task).then(
       (value) => {
@@ -308,18 +299,11 @@ export class SyncEngine {
       await this.bootstrap(session);
     }
     await this.catchUp(session);
-    if (session.fullScan) {
-      await session.replica.scanAll();
-      session.fullScan = false;
-      session.hints = {};
-      session.replica.setMeta("hints", null);
-    }
     await this.drainLocal(session);
     await this.flush(session);
     this.lastSyncAt = Date.now();
   }
 
-  /** First start with an empty store: pick the starting point and adopt files already on disk. */
   private async bootstrap(session: Session): Promise<void> {
     const client = this.host.createApiClient();
     const vaultId = this.settings.vaultId;
@@ -345,21 +329,13 @@ export class SyncEngine {
     session.replica.setMeta("legacy", null);
     await session.replica.commit();
     await this.catchUp(session);
-    await session.replica.scanAll();
-    session.fullScan = false;
-    session.hints = {};
-    session.replica.setMeta("hints", null);
-    await session.replica.commit();
+    await this.drainLocal(session);
     if (session.legacy) {
       session.legacy = undefined;
       await this.host.retireLegacyState();
     }
   }
 
-  /**
-   * Edits this device sent with the old plugin after the upgrading device's
-   * position never reached the new format. Those files count as changed here.
-   */
   private async markUnseenLegacyEdits(session: Session, after: number, through: number): Promise<void> {
     const keys = await this.host.loadVaultKeys();
     const client = this.host.createApiClient();
@@ -466,11 +442,6 @@ export class SyncEngine {
     return { ...rest, update };
   }
 
-  private markLocal(path: string): void {
-    this.pendingPaths.add(path);
-    this.scheduleLocal();
-  }
-
   private scheduleLocal(): void {
     if (this.localTimer !== null) {
       window.clearTimeout(this.localTimer);
@@ -495,6 +466,14 @@ export class SyncEngine {
     const paths = new Set([...this.pendingPaths, ...session.replica.dirty]);
     this.pendingPaths.clear();
     session.replica.dirty.clear();
+    if (session.fullScan) {
+      session.fullScan = false;
+      await session.replica.scanAll();
+      session.hints = {};
+      session.replica.setMeta("hints", null);
+      await session.replica.commit();
+      return;
+    }
     for (const [from, to] of renames) {
       await session.replica.rename(from, to);
       paths.delete(from);
@@ -506,7 +485,6 @@ export class SyncEngine {
     await session.replica.commit();
   }
 
-  /** Sends queued ops in order, in batches. Blobs are uploaded before the ops that use them. */
   private async flush(session: Session): Promise<void> {
     const client = this.host.createApiClient();
     const keys = await this.host.loadVaultKeys();
@@ -569,7 +547,6 @@ export class SyncEngine {
         if (!(error instanceof ApiError) || error.status !== 413) {
           throw error;
         }
-        // too large for this server: skip the file instead of blocking all sync
         const skipped = ready.filter((entry) => entry.op.t === "blob" && entry.op.blob === blobId).map((entry) => entry.opId);
         replica.ack(new Set(skipped));
         this.notices.push("A file is larger than the server allows, so it was not synced.");
@@ -586,8 +563,6 @@ export class SyncEngine {
     return toWire(op, blobId);
   }
 
-  private blobKeys: VaultKeys | null = null;
-
   private blobId(bytes: Uint8Array): string {
     if (!this.blobKeys) {
       throw new Error("vault keys are not loaded");
@@ -599,8 +574,6 @@ export class SyncEngine {
     const envelope = await this.host.createApiClient().getBlob(this.settings.vaultId, blobId);
     return envelope ? decryptBlob(await this.host.loadVaultKeys(), this.settings.vaultId, blobId, envelope) : null;
   }
-
-  // ---- status ----
 
   private handleError(label: string, error: unknown): void {
     this.host.debug(`${label} failed: ${String(error)}`);

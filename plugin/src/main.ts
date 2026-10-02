@@ -110,7 +110,6 @@ export default class MylonitePlugin extends Plugin {
     return state;
   }
 
-  /** Keeps a backup of the old sync state, then removes it from data.json. */
   async retireLegacyState(): Promise<void> {
     const dir = this.manifest.dir;
     const adapter = this.app.vault.adapter;

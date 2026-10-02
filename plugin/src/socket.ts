@@ -12,7 +12,6 @@ export interface LiveSocketOptions {
   debug(message: string): void;
 }
 
-/** Receives new ops as they are appended. Reconnects with backoff and detects silent drops. */
 export class LiveSocket {
   private socket: WebSocket | null = null;
   private reconnectTimer: number | null = null;

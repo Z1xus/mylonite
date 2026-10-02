@@ -797,7 +797,6 @@ pub(super) async fn append_ops_batch(
     Ok(Json(AppendOpsResponse { server_seqs }))
 }
 
-/// Validates, stores, and broadcasts ops pushed by one authenticated device.
 pub(super) async fn append_ops(
     app_state: &AppState,
     vault_id: &str,

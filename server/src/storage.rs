@@ -21,8 +21,6 @@ const CLIENT_OPS: TableDefinition<&str, u64> = TableDefinition::new("client_ops"
 const BLOB_INDEX: TableDefinition<&str, &[u8]> = TableDefinition::new("blob_index");
 const SNAPSHOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshots");
 
-/// Op format written by plugin 0.1.x. The server cannot read payloads, so the
-/// format is declared by the client and enforced per vault.
 pub const LEGACY_FORMAT: u8 = 2;
 pub const CURRENT_FORMAT: u8 = 3;
 
@@ -52,13 +50,10 @@ pub struct VaultRecord {
     pub current_seq: u64,
     #[serde(default = "legacy_format")]
     pub format: u8,
-    /// Last op of the legacy format. Ops after it use the current format.
     #[serde(default)]
     pub upgrade_seq: u64,
-    /// Sequence the upgrading device had applied when it upgraded the vault.
     #[serde(default)]
     pub upgrade_base: u64,
-    /// Total indexed blob bytes. `None` until first computed for older vaults.
     #[serde(default)]
     pub blob_bytes: Option<u64>,
 }
@@ -145,7 +140,6 @@ pub struct SnapshotRecord {
     pub created_at_unix: u64,
 }
 
-/// Reads only the sequence of a snapshot row, so the large ciphertext is skipped.
 #[derive(Deserialize)]
 struct SnapshotSeq {
     covers_through_seq: u64,
@@ -280,8 +274,6 @@ impl Storage {
         Ok(VaultInfo::from(&read_vault(&vaults, vault_id)?))
     }
 
-    /// Switches a vault to the current op format. The first caller wins, later
-    /// callers get the recorded upgrade point.
     pub fn upgrade_vault(&self, vault_id: &str, base: u64) -> anyhow::Result<VaultInfo> {
         let write = self.db.begin_write().context("begin write")?;
         let info = {
@@ -527,8 +519,6 @@ impl Storage {
         write.commit().context("commit device revoke")
     }
 
-    /// Appends ops in one transaction. Ops with a known client op id are not
-    /// stored again and keep their original sequence.
     pub fn append_ops(
         &self,
         vault_id: &str,
@@ -883,7 +873,7 @@ fn write_json<T: Serialize>(
     Ok(())
 }
 
-/// Keys of one vault are `"{vault_id}:..."`, so they sort between these bounds.
+// ';' is the byte after ':', so this range holds exactly the keys of one vault
 fn vault_range(vault_id: &str) -> (String, String) {
     (format!("{vault_id}:"), format!("{vault_id};"))
 }

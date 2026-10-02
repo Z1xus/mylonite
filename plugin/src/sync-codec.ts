@@ -10,9 +10,9 @@ export interface EncryptedOp {
   ciphertext_hex: string;
 }
 
-/** Server op kinds. Format 3 ops are opaque, so they all use the update kind. */
+// the server only checks the kind range, so v3 ops reuse the update kind
 const OPAQUE_OP_KIND = 2;
-/** Binary blob envelope: version byte, 24 byte nonce, ciphertext. */
+// version byte, 24 byte nonce, ciphertext. v1 envelopes are JSON and start with "{"
 const BLOB_ENVELOPE_V2 = 2;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -53,7 +53,6 @@ export function decryptBlob(keys: VaultKeys, vaultId: string, blobId: string, en
   if (envelope[0] === BLOB_ENVELOPE_V2) {
     return decryptPayload(keys.blobKey, bytesToHex(envelope.subarray(1, 25)), bytesToHex(envelope.subarray(25)), aad);
   }
-  // blobs written by plugin 0.1.x are JSON with hex fields
   const legacy = JSON.parse(decoder.decode(envelope)) as { nonceHex: string; ciphertextHex: string };
   return decryptPayload(keys.blobKey, legacy.nonceHex, legacy.ciphertextHex, aad);
 }

@@ -66,7 +66,6 @@ async fn handle_socket(state: AppState, vault_id: String, device_id: String, soc
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    // closing makes the client reconnect and catch up from its cursor
                     warn!(skipped, "websocket op broadcast receiver lagged");
                     break;
                 }

@@ -3,7 +3,6 @@ import { SyncOp } from "./sync-types";
 import { isValidVaultPath } from "./vault-io";
 
 export type TextRefOp = { v: 3; t: "text"; id: string; path?: string; hash?: string; ref: string };
-/** A remote op as decrypted. Large text updates arrive as a reference to a blob. */
 export type RemoteOp = SyncOp | TextRefOp;
 
 export function newFileId(): string {
@@ -22,7 +21,6 @@ export function toWire(op: SyncOp, ref?: string): Record<string, unknown> {
   return ref ? { ...rest, ref } : { ...rest, u: toBase64(update) };
 }
 
-/** Returns the op, or null for payloads of other formats and malformed ops. */
 export function parseWire(value: unknown): RemoteOp | null {
   if (!isRecord(value) || value.v !== 3 || !isFileId(value.id)) {
     return null;

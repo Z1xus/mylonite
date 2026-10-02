@@ -72,7 +72,6 @@ export interface VaultInfo {
   upgrade_base: number;
 }
 
-/** Op format of this plugin version. The server rejects other formats once a vault uses it. */
 export const OP_FORMAT = 3;
 
 export interface DeviceAuth {

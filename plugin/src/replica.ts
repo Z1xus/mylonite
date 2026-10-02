@@ -16,21 +16,13 @@ export interface ReplicaDeps {
   clientId: number;
   blobId(bytes: Uint8Array): string;
   fetchBlob(blobId: string): Promise<Uint8Array | null>;
-  /** The local content is the version the 0.1.x plugin synced, so replacing it loses nothing. */
   legacyClean(path: string, content: string | Uint8Array, stat: FileStat): boolean;
-  /** The incoming content is the version the local copy grew from under the 0.1.x plugin. */
   legacyAncestor(path: string, content: string | Uint8Array): boolean;
   notify(message: string): void;
 }
 
-/**
- * The local copy of the vault state. Local changes become ops in the outbox,
- * and ops from the server log are applied in log order. Paths follow the log:
- * a claim that is in the log first keeps the path, later claims move aside.
- */
 export class Replica {
   readonly outbox: OutboxEntry[];
-  /** Paths to scan again, for example after a write lost a race with the editor. */
   readonly dirty = new Set<string>();
   private readonly files = new Map<string, FileRecord>();
   private readonly byPath = new Map<string, string>();
@@ -61,7 +53,6 @@ export class Replica {
     await this.deps.store.commit(tx);
   }
 
-  /** Records in the log, for snapshots. Valid only when the outbox is empty. */
   async canonicalFiles(): Promise<Array<{ record: FileRecord; state?: Uint8Array }>> {
     const out: Array<{ record: FileRecord; state?: Uint8Array }> = [];
     for (const record of this.files.values()) {
@@ -84,9 +75,6 @@ export class Replica {
     }
   }
 
-  // ---- local changes ----
-
-  /** Brings one path in line with the disk. */
   async scan(path: string): Promise<void> {
     const { io } = this.deps;
     const stat = io.stat(path);
@@ -123,14 +111,12 @@ export class Replica {
     }
     const doc = await this.doc(record.id);
     if (record.ahead && hashText(content) === record.hash) {
-      // remote edits were applied but the write did not happen
       await this.writeAhead(record, doc, content);
       return;
     }
     this.ingest(record, doc, content, stat);
   }
 
-  /** Follows a rename from the vault so the file keeps its identity. */
   async rename(from: string, to: string): Promise<void> {
     const record = this.recordAt(from);
     if (record && !this.recordAt(to) && kindOf(to) === record.kind && this.deps.io.stat(to)) {
@@ -143,7 +129,6 @@ export class Replica {
     await this.scan(to);
   }
 
-  /** Compares the whole vault with the records. Finds renames made while sync was off. */
   async scanAll(): Promise<void> {
     const { io } = this.deps;
     const stats = io.list();
@@ -194,15 +179,11 @@ export class Replica {
       return;
     }
     this.put({ ...record, size: stat.size, mtime: stat.mtime });
-    if (!this.outbox.some((entry) => entry.op.id === record.id && entry.op.t === "blob")) {
+    if (!this.outbox.some((entry) => entry.op.id === record.id && entry.op.t === "blob" && entry.op.blob === undefined)) {
       this.enqueue({ v: 3, t: "blob", id: record.id });
     }
   }
 
-  /**
-   * Fills a blob op with the current file content before it is sent. Returns
-   * the bytes to upload, or null when the op is not needed anymore.
-   */
   async resolveBlob(entry: OutboxEntry): Promise<{ entry: OutboxEntry; bytes: Uint8Array } | null> {
     const op = entry.op;
     const record = this.files.get(op.id);
@@ -212,7 +193,6 @@ export class Replica {
     }
     const stat = this.deps.io.stat(record.path);
     if (!stat) {
-      // the file is gone: a delete op follows, or the file was never announced
       this.removeEntries((candidate) => candidate.key === entry.key);
       if (op.path !== undefined) {
         this.remove(record.id);
@@ -221,7 +201,10 @@ export class Replica {
     }
     const bytes = await this.deps.io.readBytes(record.path);
     const blob = this.deps.blobId(bytes);
-    if (op.path === undefined && blob === record.hash) {
+    if (op.blob === blob) {
+      return { entry, bytes };
+    }
+    if (op.path === undefined && op.blob === undefined && blob === record.hash) {
       this.removeEntries((candidate) => candidate.key === entry.key);
       return null;
     }
@@ -230,6 +213,7 @@ export class Replica {
     this.put({
       ...record,
       hash: blob,
+      sentHash: blob,
       size: stat.size,
       mtime: stat.mtime,
       pendingInitHash: op.path === undefined ? record.pendingInitHash : blob,
@@ -237,9 +221,6 @@ export class Replica {
     return { entry: resolved, bytes };
   }
 
-  // ---- remote ops ----
-
-  /** Applies an op from the log. `author` is the device that sent it. */
   async apply(op: SyncOp, opId: string, author: string): Promise<void> {
     this.removeEntries((entry) => entry.opId === opId);
     const ghost = this.files.get(op.id);
@@ -304,7 +285,6 @@ export class Replica {
     this.saveDoc(id, doc);
     const record = this.put({ id, path: target, cpath: target, kind: "text", hash: hashText(text), initHash, initDevice: created.author, ...this.statOf(target) });
     if (room === "keep") {
-      // the local file is a newer version of this one: send its changes as edits
       const stat = this.deps.io.stat(target);
       if (stat) {
         this.ingest(record, doc, await this.deps.io.readText(target), stat);
@@ -333,7 +313,6 @@ export class Replica {
     if (!stat || textOf(doc) === before) {
       return;
     }
-    // persist the doc first, so a crash before the write is repaired on the next scan
     this.put({ ...record, ahead: true });
     await this.commit();
     await this.writeAhead({ ...record, ahead: true }, doc, disk ?? before);
@@ -343,7 +322,6 @@ export class Replica {
     const text = textOf(doc);
     const written = await this.deps.io.processText(record.path, (current) => (current === expected || hashText(current) === record.hash ? text : current));
     if (written !== text) {
-      // the editor saved in between: scan again to merge that edit
       this.put({ ...record, ahead: false, mtime: 0 });
       this.dirty.add(record.path);
       return;
@@ -351,7 +329,6 @@ export class Replica {
     this.put({ ...record, ahead: false, hash: hashText(text), ...this.statOf(record.path) });
   }
 
-  /** Adds disk edits to the doc and queues them. */
   private ingest(record: FileRecord, doc: Y.Doc, content: string, stat: FileStat): FileRecord {
     const update = setText(doc, content);
     if (update) {
@@ -383,26 +360,32 @@ export class Replica {
       }
       record = confirmed;
     }
+    if (author === this.deps.deviceId && record.sentHash !== undefined) {
+      if (op.blob === record.sentHash) {
+        this.put({ ...record, sentHash: undefined });
+      }
+      return;
+    }
     if (op.blob === record.hash) {
       return;
     }
     const stat = io.stat(record.path);
-    const changedHere = this.outbox.some((entry) => entry.op.id === record.id && entry.op.t === "blob")
-      || (stat !== null && await this.diskDiffers(record, stat));
+    const ours = record.sentHash !== undefined || this.outbox.some((entry) => entry.op.id === record.id && entry.op.t === "blob" && entry.op.blob !== undefined);
+    const unsent = !ours && stat !== null && await this.diskDiffers(record, stat);
     const bytes = await this.deps.fetchBlob(op.blob);
     if (!bytes || !stat) {
-      // nothing to write: a zero mtime makes the next scan send the local version
       this.put({ ...record, hash: op.blob, mtime: 0 });
       return;
     }
-    if (changedHere) {
-      // the local version is sent after this op and wins; the remote one is kept as a copy
+    if (ours || unsent) {
       const aside = this.freePath(conflictPath(record.path, op.blob));
       await io.writeBytes(aside, bytes);
       this.dirty.add(aside);
-      this.dirty.add(record.path);
-      this.put({ ...record, hash: op.blob, mtime: 0 });
       this.deps.notify(`Kept both versions of ${record.path}.`);
+      if (unsent) {
+        this.put({ ...record, hash: op.blob, mtime: 0 });
+        this.dirty.add(record.path);
+      }
       return;
     }
     await io.writeBytes(record.path, bytes);
@@ -427,7 +410,6 @@ export class Replica {
     if (room === "write") {
       await this.deps.io.writeBytes(target, bytes);
     }
-    // a kept local version has a zero mtime, so the next scan sends it
     this.put({ id, path: target, cpath: target, kind: "blob", hash: blob, initHash: blob, initDevice: created.author, ...(room === "keep" ? { size: 0, mtime: 0 } : this.statOf(target)) });
     if (room === "keep") {
       this.dirty.add(target);
@@ -458,7 +440,6 @@ export class Replica {
       return;
     }
     if (changedHere) {
-      // the file stays and is synced again as a new file
       this.dirty.add(record.path);
       this.deps.notify(`Kept ${record.path}. It was deleted on another device but changed here.`);
       return;
@@ -466,7 +447,6 @@ export class Replica {
     await this.deps.io.trash(record.path);
   }
 
-  /** A file deleted here still follows the log's path decisions until its delete op arrives. */
   private applyToGhost(ghost: FileRecord, op: SyncOp, author: string): void {
     if (op.t === "delete") {
       this.remove(ghost.id);
@@ -486,10 +466,6 @@ export class Replica {
     }
   }
 
-  /**
-   * Our create op reached the log: take the path the log gives it. Returns null
-   * when the log merged it into an identical file, then the local file is synced as a new file.
-   */
   private async confirmCreate(record: FileRecord, path: string, created: Creation): Promise<FileRecord | null> {
     const target = this.claim(record.id, path, created);
     if (target === null) {
@@ -500,10 +476,6 @@ export class Replica {
     return await this.followLog(confirmed);
   }
 
-  /**
-   * The log merged our new file into an identical file from another device. Our
-   * copy goes away when it still matches, otherwise it syncs as a new file.
-   */
   private async mergeInto(record: FileRecord, holderId: string | undefined): Promise<void> {
     const { io } = this.deps;
     const holder = holderId === undefined ? undefined : this.files.get(holderId);
@@ -522,7 +494,6 @@ export class Replica {
     }
   }
 
-  /** Moves the file to its log path, unless a local move is still waiting to be sent. */
   private async followLog(record: FileRecord): Promise<FileRecord> {
     const target = record.cpath;
     if (target === undefined || record.path === target || this.outbox.some((entry) => entry.op.id === record.id && entry.op.t === "move")) {
@@ -531,18 +502,15 @@ export class Replica {
     const { io } = this.deps;
     await this.makeRoom(target, { id: record.id, matches: async () => false });
     if (!io.stat(record.path)) {
-      // deleted here and not scanned yet: the scan sends the delete
       this.dirty.add(target);
       return this.put({ ...record, path: target, mtime: 0 });
     }
     if (io.stat(target)) {
-      // an old copy the previous plugin version already synced
       await io.trash(target);
     }
     return await this.moveRecord(this.files.get(record.id) ?? record, target);
   }
 
-  /** Moves a tracked file. Edits not scanned yet stay visible to the next scan. */
   private async moveRecord(record: FileRecord, to: string): Promise<FileRecord> {
     const before = this.deps.io.stat(record.path);
     const inSync = before !== null && before.mtime === record.mtime && before.size === record.size;
@@ -553,10 +521,6 @@ export class Replica {
     return this.put({ ...record, path: to, ...(inSync ? this.statOf(to) : { mtime: 0 }) });
   }
 
-  /**
-   * Decides the log path for a file. Returns null when an identical file was
-   * created first at the same path, so this one merges into it.
-   */
   private claim(id: string, path: string, created?: Creation): string | null {
     let target = path;
     for (;;) {
@@ -572,11 +536,6 @@ export class Replica {
     }
   }
 
-  /**
-   * Frees a local path for a file from the log. Returns "same" when the content
-   * is already there, "keep" when the local file is a newer version of the
-   * incoming one, and "write" otherwise.
-   */
   private async makeRoom(
     target: string,
     incoming: { id: string; content?: string | Uint8Array; matches(path: string): Promise<boolean> },
@@ -584,7 +543,6 @@ export class Replica {
     const { io } = this.deps;
     const occupant = this.recordAt(target);
     if (occupant && occupant.id !== incoming.id) {
-      // a local claim that is not in the log yet gives way
       const aside = this.freePath(conflictPath(target, occupant.id));
       await this.moveRecord(occupant, aside);
       return "write";
@@ -596,7 +554,6 @@ export class Replica {
     if (await incoming.matches(target)) {
       return "same";
     }
-    // a file that sync does not track yet, for example after the upgrade from 0.1.x
     const content = kindOf(target) === "text" ? await io.readText(target) : await io.readBytes(target);
     if (this.deps.legacyClean(target, content, stat)) {
       return "write";
@@ -631,8 +588,6 @@ export class Replica {
     }
     return candidate;
   }
-
-  // ---- records, docs, and outbox ----
 
   private recordAt(path: string): FileRecord | undefined {
     const id = this.byPath.get(path);
@@ -730,7 +685,6 @@ export class Replica {
     this.tx.outbox.set(entry.key, entry);
   }
 
-  /** Merges text edits into the last queued edit of the same file. */
   private enqueueText(id: string, update: Uint8Array): void {
     let last: OutboxEntry | undefined;
     for (const entry of this.outbox) {
@@ -756,7 +710,6 @@ export class Replica {
   }
 }
 
-/** The create op of a file, as the log orders it. */
 interface Creation {
   kind: FileKind;
   hash: string;
