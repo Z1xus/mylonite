@@ -38,31 +38,55 @@ export function readLegacyState(stored: Record<string, unknown>): LegacyState | 
     }
   }
   for (const entry of durable?.journal ?? []) {
-    const value = entry as { status?: unknown; affectedPaths?: unknown };
-    if (!SETTLED.has(String(value.status)) && Array.isArray(value.affectedPaths)) {
-      for (const path of value.affectedPaths) {
-        delete hints[String(path)];
-      }
+    const value = entry as { status?: unknown };
+    if (!SETTLED.has(String(value.status))) {
+      markLegacyEdit(hints, entry);
     }
   }
   return { cursor: typeof cursor === "number" && Number.isSafeInteger(cursor) ? cursor : 0, hints };
 }
 
-/** Paths named by an old op payload. */
-export function legacyOpPaths(payload: unknown): string[] {
-  const value = payload as { path?: unknown; oldPath?: unknown; newPath?: unknown } | null;
-  return [value?.path, value?.oldPath, value?.newPath].filter((path): path is string => typeof path === "string");
+/**
+ * Records a local edit that other devices may not have. An update keeps the
+ * version it started from, so a matching remote version still counts as its
+ * ancestor. Other changes drop the hint.
+ */
+export function markLegacyEdit(hints: Record<string, LegacyHint>, change: unknown): void {
+  const value = change as { kind?: unknown; path?: unknown; oldPath?: unknown; newPath?: unknown; affectedPaths?: unknown; baseHash?: unknown } | null;
+  const paths = [value?.path, value?.oldPath, value?.newPath, ...(Array.isArray(value?.affectedPaths) ? value.affectedPaths : [])]
+    .filter((path): path is string => typeof path === "string");
+  for (const path of new Set(paths)) {
+    if (hints[path]?.dirty) {
+      continue;
+    }
+    if (value?.kind === "file-update" && typeof value.baseHash === "string") {
+      hints[path] = { hash: value.baseHash, dirty: true };
+    } else {
+      delete hints[path];
+    }
+  }
 }
 
+/** The local content is the version the old plugin synced, with no local edits since. */
 export function isLegacyClean(hints: Record<string, LegacyHint>, path: string, content: string | Uint8Array, stat: FileStat): boolean {
   const hint = hints[path];
-  if (!hint) {
+  if (!hint || hint.dirty) {
     return false;
   }
   if (typeof content !== "string" && hint.mtime === stat.mtime && hint.size === stat.size) {
     return true;
   }
-  return legacyHash(typeof content === "string" ? encoder.encode(content) : content) === hint.hash;
+  return legacyHash(toBytes(content)) === hint.hash;
+}
+
+/** The incoming content is the version the local copy grew from, so the local copy is newer. */
+export function isLegacyAncestor(hints: Record<string, LegacyHint>, path: string, content: string | Uint8Array): boolean {
+  const hint = hints[path];
+  return hint !== undefined && legacyHash(toBytes(content)) === hint.hash;
+}
+
+function toBytes(content: string | Uint8Array): Uint8Array {
+  return typeof content === "string" ? encoder.encode(content) : content;
 }
 
 /** The content hash of plugin 0.1.x. */

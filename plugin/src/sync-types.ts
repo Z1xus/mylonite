@@ -42,6 +42,8 @@ export interface OutboxEntry {
 /** What the v2 plugin knew was synced, used once to resolve differences after the upgrade. */
 export interface LegacyHint {
   hash: string;
+  /** This device changed the file after `hash`, and the change may not have reached other devices. */
+  dirty?: boolean;
   blobId?: string;
   size?: number;
   mtime?: number;

@@ -16,8 +16,10 @@ export interface ReplicaDeps {
   clientId: number;
   blobId(bytes: Uint8Array): string;
   fetchBlob(blobId: string): Promise<Uint8Array | null>;
-  /** True when the v2 plugin knew this exact content as synced. */
+  /** The local content is the version the 0.1.x plugin synced, so replacing it loses nothing. */
   legacyClean(path: string, content: string | Uint8Array, stat: FileStat): boolean;
+  /** The incoming content is the version the local copy grew from under the 0.1.x plugin. */
+  legacyAncestor(path: string, content: string | Uint8Array): boolean;
   notify(message: string): void;
 }
 
@@ -290,16 +292,24 @@ export class Replica {
     const initHash = created.hash;
     const doc = openDoc(this.deps.clientId, update);
     const text = textOf(doc);
-    const present = await this.makeRoom(target, {
+    const room = await this.makeRoom(target, {
       id,
+      content: text,
       matches: async (at) => await this.deps.io.readText(at) === text,
     });
-    if (!present) {
+    if (room === "write") {
       await this.deps.io.writeText(target, text);
     }
     this.cacheDoc(id, doc);
     this.saveDoc(id, doc);
-    this.put({ id, path: target, cpath: target, kind: "text", hash: hashText(text), initHash, initDevice: created.author, ...this.statOf(target) });
+    const record = this.put({ id, path: target, cpath: target, kind: "text", hash: hashText(text), initHash, initDevice: created.author, ...this.statOf(target) });
+    if (room === "keep") {
+      // the local file is a newer version of this one: send its changes as edits
+      const stat = this.deps.io.stat(target);
+      if (stat) {
+        this.ingest(record, doc, await this.deps.io.readText(target), stat);
+      }
+    }
   }
 
   private async applyTextUpdate(record: FileRecord, update: Uint8Array): Promise<void> {
@@ -409,14 +419,19 @@ export class Replica {
     if (!bytes) {
       return;
     }
-    const present = await this.makeRoom(target, {
+    const room = await this.makeRoom(target, {
       id,
+      content: bytes,
       matches: async (at) => this.deps.blobId(await this.deps.io.readBytes(at)) === blob,
     });
-    if (!present) {
+    if (room === "write") {
       await this.deps.io.writeBytes(target, bytes);
     }
-    this.put({ id, path: target, cpath: target, kind: "blob", hash: blob, initHash: blob, initDevice: created.author, ...this.statOf(target) });
+    // a kept local version has a zero mtime, so the next scan sends it
+    this.put({ id, path: target, cpath: target, kind: "blob", hash: blob, initHash: blob, initDevice: created.author, ...(room === "keep" ? { size: 0, mtime: 0 } : this.statOf(target)) });
+    if (room === "keep") {
+      this.dirty.add(target);
+    }
   }
 
   private async applyMove(id: string, path: string): Promise<void> {
@@ -558,34 +573,39 @@ export class Replica {
   }
 
   /**
-   * Frees a local path for a file from the log. Returns true when the same
-   * content is already there.
+   * Frees a local path for a file from the log. Returns "same" when the content
+   * is already there, "keep" when the local file is a newer version of the
+   * incoming one, and "write" otherwise.
    */
   private async makeRoom(
     target: string,
-    incoming: { id: string; matches(path: string): Promise<boolean> },
-  ): Promise<boolean> {
+    incoming: { id: string; content?: string | Uint8Array; matches(path: string): Promise<boolean> },
+  ): Promise<"same" | "keep" | "write"> {
     const { io } = this.deps;
     const occupant = this.recordAt(target);
     if (occupant && occupant.id !== incoming.id) {
       // a local claim that is not in the log yet gives way
       const aside = this.freePath(conflictPath(target, occupant.id));
       await this.moveRecord(occupant, aside);
-      return false;
+      return "write";
     }
     const stat = io.stat(target);
     if (!stat || occupant) {
-      return false;
+      return "write";
     }
     if (await incoming.matches(target)) {
-      return true;
+      return "same";
     }
+    // a file that sync does not track yet, for example after the upgrade from 0.1.x
     const content = kindOf(target) === "text" ? await io.readText(target) : await io.readBytes(target);
     if (this.deps.legacyClean(target, content, stat)) {
-      return false;
+      return "write";
+    }
+    if (incoming.content !== undefined && this.deps.legacyAncestor(target, incoming.content)) {
+      return "keep";
     }
     await this.moveAside(target);
-    return false;
+    return "write";
   }
 
   private async moveAside(path: string): Promise<void> {

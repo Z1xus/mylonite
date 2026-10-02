@@ -2,7 +2,7 @@ import { Notice, Plugin, TAbstractFile, TFile } from "obsidian";
 
 import { ApiError, EncryptedOpRecord, MyloniteApiClient } from "./api";
 import { VaultKeys, randomHex } from "./crypto";
-import { LegacyState, isLegacyClean, legacyOpPaths } from "./migrate";
+import { LegacyState, isLegacyAncestor, isLegacyClean, markLegacyEdit } from "./migrate";
 import { RemoteOp, parseWire, toBase64, toWire } from "./ops";
 import { Replica } from "./replica";
 import { MyloniteSettings } from "./settings";
@@ -42,6 +42,8 @@ interface Session {
   legacy: LegacyState | undefined;
   hints: Record<string, LegacyHint>;
   pushedSeq: number;
+  /** Compare the whole vault on the first sync, to catch edits made while Obsidian was closed. */
+  fullScan: boolean;
 }
 
 class ServerTooOldError extends Error {}
@@ -218,6 +220,7 @@ export class SyncEngine {
       legacy: snapshot.meta.get("legacy") as LegacyState | undefined,
       hints: (snapshot.meta.get("hints") as Record<string, LegacyHint> | undefined) ?? {},
       pushedSeq: 0,
+      fullScan: true,
     };
     session.replica = new Replica({
       io,
@@ -227,6 +230,7 @@ export class SyncEngine {
       blobId: (bytes) => this.blobId(bytes),
       fetchBlob: async (blobId) => this.fetchBlob(blobId),
       legacyClean: (path, content, stat) => isLegacyClean(session.hints, path, content, stat),
+      legacyAncestor: (path, content) => isLegacyAncestor(session.hints, path, content),
       notify: (message) => this.notices.push(message),
     }, snapshot.files, snapshot.outbox);
     session.replica.setMeta("clientId", clientId);
@@ -237,7 +241,8 @@ export class SyncEngine {
       session.replica.setMeta("legacy", legacy);
     }
     await session.replica.commit();
-    if (legacy) {
+    if (legacy && session.cursor !== undefined) {
+      // migrated in an earlier run
       await this.host.retireLegacyState();
     }
 
@@ -303,6 +308,12 @@ export class SyncEngine {
       await this.bootstrap(session);
     }
     await this.catchUp(session);
+    if (session.fullScan) {
+      await session.replica.scanAll();
+      session.fullScan = false;
+      session.hints = {};
+      session.replica.setMeta("hints", null);
+    }
     await this.drainLocal(session);
     await this.flush(session);
     this.lastSyncAt = Date.now();
@@ -321,7 +332,7 @@ export class SyncEngine {
     }
     if (session.legacy) {
       session.hints = { ...session.legacy.hints };
-      await this.forgetUnseenLegacyEdits(session, info.upgrade_base, info.upgrade_seq);
+      await this.markUnseenLegacyEdits(session, info.upgrade_base, info.upgrade_seq);
       session.replica.setMeta("hints", session.hints);
     }
     let cursor = info.upgrade_seq;
@@ -335,16 +346,21 @@ export class SyncEngine {
     await session.replica.commit();
     await this.catchUp(session);
     await session.replica.scanAll();
+    session.fullScan = false;
     session.hints = {};
     session.replica.setMeta("hints", null);
     await session.replica.commit();
+    if (session.legacy) {
+      session.legacy = undefined;
+      await this.host.retireLegacyState();
+    }
   }
 
   /**
    * Edits this device sent with the old plugin after the upgrading device's
-   * position never reached the new format. Those files are treated as changed here.
+   * position never reached the new format. Those files count as changed here.
    */
-  private async forgetUnseenLegacyEdits(session: Session, after: number, through: number): Promise<void> {
+  private async markUnseenLegacyEdits(session: Session, after: number, through: number): Promise<void> {
     const keys = await this.host.loadVaultKeys();
     const client = this.host.createApiClient();
     let cursor = after;
@@ -359,9 +375,7 @@ export class SyncEngine {
         }
         if (record.device_id === this.settings.deviceId) {
           try {
-            for (const path of legacyOpPaths(decryptOp(keys, this.settings.vaultId, record))) {
-              delete session.hints[path];
-            }
+            markLegacyEdit(session.hints, decryptOp(keys, this.settings.vaultId, record));
           } catch (error) {
             this.host.debug(`skipped unreadable legacy op ${record.server_seq}: ${String(error)}`);
           }
