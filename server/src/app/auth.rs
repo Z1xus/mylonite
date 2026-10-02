@@ -3,7 +3,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use tokio::task;
 
 use super::{ApiError, AppState};
-use crate::{app::validation::is_lower_hex, storage::DeviceRecord};
+use crate::{app::validation::is_lower_hex, storage::DeviceRecord, util::hex_encode};
 
 pub(super) async fn verify_device_signature(
     app_state: &AppState,
@@ -100,16 +100,6 @@ fn hex_decode(value: &str) -> Result<Vec<u8>, ApiError> {
         out.push(u8::from_str_radix(&value[index..index + 2], 16)?);
     }
     Ok(out)
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    out
 }
 
 #[cfg(test)]
@@ -238,6 +228,7 @@ mod tests {
             max_devices_per_vault: 16,
             max_json_body_bytes: 1024,
             max_op_json_body_bytes: 4096,
+            max_batch_json_body_bytes: 8192,
             max_op_ciphertext_bytes: 1024,
             max_ops_per_push: 512,
             max_snapshot_json_body_bytes: 4096,

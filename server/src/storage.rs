@@ -2,13 +2,16 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, bail};
-use rand::Rng;
-use redb::{Database, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    Database, ReadTransaction, ReadableDatabase, ReadableTable, ReadableTableMetadata, Table,
+    TableDefinition,
+};
 use serde::{Deserialize, Serialize};
+
+use crate::util::{now_unix, random_hex};
 
 const VAULTS: TableDefinition<&str, &[u8]> = TableDefinition::new("vaults");
 const DEVICES: TableDefinition<&str, &[u8]> = TableDefinition::new("devices");
@@ -17,6 +20,14 @@ const OPLOG: TableDefinition<&str, &[u8]> = TableDefinition::new("oplog");
 const CLIENT_OPS: TableDefinition<&str, u64> = TableDefinition::new("client_ops");
 const BLOB_INDEX: TableDefinition<&str, &[u8]> = TableDefinition::new("blob_index");
 const SNAPSHOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshots");
+
+/// Op format written by plugin 0.1.x. The server cannot read payloads, so the
+/// format is declared by the client and enforced per vault.
+pub const LEGACY_FORMAT: u8 = 2;
+pub const CURRENT_FORMAT: u8 = 3;
+
+pub const PLUGIN_UPDATE_REQUIRED: &str = "plugin update required";
+pub const VAULT_UPGRADE_REQUIRED: &str = "vault upgrade required";
 
 #[derive(Debug, Clone)]
 pub struct Storage {
@@ -39,6 +50,40 @@ pub struct VaultRecord {
     pub created_at_unix: u64,
     pub revoked_at_unix: Option<u64>,
     pub current_seq: u64,
+    #[serde(default = "legacy_format")]
+    pub format: u8,
+    /// Last op of the legacy format. Ops after it use the current format.
+    #[serde(default)]
+    pub upgrade_seq: u64,
+    /// Sequence the upgrading device had applied when it upgraded the vault.
+    #[serde(default)]
+    pub upgrade_base: u64,
+    /// Total indexed blob bytes. `None` until first computed for older vaults.
+    #[serde(default)]
+    pub blob_bytes: Option<u64>,
+}
+
+fn legacy_format() -> u8 {
+    LEGACY_FORMAT
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultInfo {
+    pub format: u8,
+    pub head_seq: u64,
+    pub upgrade_seq: u64,
+    pub upgrade_base: u64,
+}
+
+impl From<&VaultRecord> for VaultInfo {
+    fn from(vault: &VaultRecord) -> Self {
+        Self {
+            format: vault.format,
+            head_seq: vault.current_seq,
+            upgrade_seq: vault.upgrade_seq,
+            upgrade_base: vault.upgrade_base,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,9 +119,9 @@ pub struct EncryptedOpRecord {
     pub accepted_at_unix: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AppendOpResult {
-    pub server_seq: u64,
+#[derive(Debug, Clone)]
+pub struct AppendedOp {
+    pub op: EncryptedOpRecord,
     pub inserted: bool,
 }
 
@@ -98,6 +143,12 @@ pub struct SnapshotRecord {
     pub nonce_hex: String,
     pub ciphertext_hex: String,
     pub created_at_unix: u64,
+}
+
+/// Reads only the sequence of a snapshot row, so the large ciphertext is skipped.
+#[derive(Deserialize)]
+struct SnapshotSeq {
+    covers_through_seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,22 +219,20 @@ impl Storage {
         let now = now_unix()?;
         let id = format!("v{}", random_hex(16));
         let pairing_token = format!("p{}", random_hex(24));
-        let vault = CreatedVault {
+        let record = VaultRecord {
             id: id.clone(),
             name: name.clone(),
             created_at_unix: now,
-            pairing_token: pairing_token.clone(),
-        };
-        let record = VaultRecord {
-            id: id.clone(),
-            name,
-            created_at_unix: now,
             revoked_at_unix: None,
             current_seq: 0,
+            format: CURRENT_FORMAT,
+            upgrade_seq: 0,
+            upgrade_base: 0,
+            blob_bytes: Some(0),
         };
         let token = PairingTokenRecord {
             token: pairing_token.clone(),
-            vault_id: id,
+            vault_id: id.clone(),
             expires_at_unix: now + 15 * 60,
             consumed_at_unix: None,
         };
@@ -199,7 +248,12 @@ impl Storage {
             write_json(&mut tokens, token.token.as_str(), &token)?;
         }
         write.commit().context("commit vault")?;
-        Ok(vault)
+        Ok(CreatedVault {
+            id,
+            name,
+            created_at_unix: now,
+            pairing_token,
+        })
     }
 
     pub fn list_vaults(&self) -> anyhow::Result<Vec<CreatedVault>> {
@@ -220,57 +274,77 @@ impl Storage {
         Ok(vaults)
     }
 
-    pub fn delete_vault(&self, vault_id: &str) -> anyhow::Result<()> {
+    pub fn vault_info(&self, vault_id: &str) -> anyhow::Result<VaultInfo> {
         let read = self.db.begin_read().context("begin read")?;
-        {
-            let vaults = read.open_table(VAULTS).context("open vault table")?;
-            if vaults.get(vault_id).context("read vault")?.is_none() {
-                bail!("vault not found");
-            }
-        }
-        drop(read);
+        let vaults = read.open_table(VAULTS).context("open vault table")?;
+        Ok(VaultInfo::from(&read_vault(&vaults, vault_id)?))
+    }
 
-        let prefix = format!("{vault_id}:");
+    /// Switches a vault to the current op format. The first caller wins, later
+    /// callers get the recorded upgrade point.
+    pub fn upgrade_vault(&self, vault_id: &str, base: u64) -> anyhow::Result<VaultInfo> {
+        let write = self.db.begin_write().context("begin write")?;
+        let info = {
+            let mut vaults = write.open_table(VAULTS).context("open vault table")?;
+            let mut vault = read_vault(&vaults, vault_id)?;
+            if vault.format < CURRENT_FORMAT {
+                vault.format = CURRENT_FORMAT;
+                vault.upgrade_seq = vault.current_seq;
+                vault.upgrade_base = base.min(vault.current_seq);
+                write_json(&mut vaults, vault_id, &vault)?;
+            }
+            VaultInfo::from(&vault)
+        };
+        write.commit().context("commit vault upgrade")?;
+        Ok(info)
+    }
+
+    pub fn delete_vault(&self, vault_id: &str) -> anyhow::Result<()> {
         let write = self.db.begin_write().context("begin write")?;
         {
             let mut vaults = write.open_table(VAULTS).context("open vault table")?;
-            vaults.remove(vault_id).context("remove vault row")?;
-
-            remove_prefixed_keys(
+            if vaults
+                .remove(vault_id)
+                .context("remove vault row")?
+                .is_none()
+            {
+                bail!("vault not found");
+            }
+            remove_vault_rows(
                 &mut write.open_table(DEVICES).context("open device table")?,
-                &prefix,
+                vault_id,
             )?;
-            remove_prefixed_keys(&mut write.open_table(OPLOG).context("open oplog")?, &prefix)?;
-            remove_prefixed_keys(
+            remove_vault_rows(
+                &mut write.open_table(OPLOG).context("open oplog")?,
+                vault_id,
+            )?;
+            remove_vault_rows(
                 &mut write
                     .open_table(CLIENT_OPS)
                     .context("open client ops table")?,
-                &prefix,
+                vault_id,
             )?;
-            remove_prefixed_keys(
+            remove_vault_rows(
                 &mut write.open_table(BLOB_INDEX).context("open blob index")?,
-                &prefix,
+                vault_id,
             )?;
-            remove_prefixed_keys(
+            remove_vault_rows(
                 &mut write.open_table(SNAPSHOTS).context("open snapshots")?,
-                &prefix,
+                vault_id,
             )?;
 
             let mut tokens = write
                 .open_table(PAIRING_TOKENS)
                 .context("open pairing token table")?;
-            let stale_tokens = {
-                let mut out = Vec::new();
-                for item in tokens.iter().context("iterate pairing tokens")? {
-                    let (key, value) = item.context("read pairing token row")?;
-                    let record: PairingTokenRecord = serde_json::from_slice(value.value())
-                        .context("decode pairing token row")?;
-                    if record.vault_id == vault_id {
-                        out.push(key.value().to_string());
-                    }
+            let mut stale_tokens = Vec::new();
+            for item in tokens.iter().context("iterate pairing tokens")? {
+                let (key, value) = item.context("read pairing token row")?;
+                let record: PairingTokenRecord =
+                    serde_json::from_slice(value.value()).context("decode pairing token row")?;
+                if record.vault_id == vault_id {
+                    stale_tokens.push(key.value().to_string());
                 }
-                out
-            };
+            }
             for key in stale_tokens {
                 tokens
                     .remove(key.as_str())
@@ -289,24 +363,18 @@ impl Storage {
 
     #[cfg(test)]
     fn issue_pairing_token(&self, vault_id: &str) -> anyhow::Result<PairingTokenRecord> {
-        let now = now_unix()?;
-        let read = self.db.begin_read().context("begin read")?;
-        {
-            let vaults = read.open_table(VAULTS).context("open vault table")?;
-            if vaults.get(vault_id).context("read vault")?.is_none() {
-                bail!("vault not found");
-            }
-        }
-        drop(read);
-
         let token = PairingTokenRecord {
             token: format!("p{}", random_hex(24)),
             vault_id: vault_id.to_string(),
-            expires_at_unix: now + 15 * 60,
+            expires_at_unix: now_unix()? + 15 * 60,
             consumed_at_unix: None,
         };
         let write = self.db.begin_write().context("begin write")?;
         {
+            read_vault(
+                &write.open_table(VAULTS).context("open vault table")?,
+                vault_id,
+            )?;
             let mut tokens = write
                 .open_table(PAIRING_TOKENS)
                 .context("open pairing token table")?;
@@ -328,31 +396,28 @@ impl Storage {
             let mut tokens = write
                 .open_table(PAIRING_TOKENS)
                 .context("open pairing token table")?;
-            let Some(stored) = tokens.get(token).context("read pairing token")? else {
+            let Some(mut token_record) = read_json::<PairingTokenRecord>(&tokens, token)? else {
                 bail!("pairing token not found");
             };
-            let stored_bytes = stored.value().to_vec();
-            drop(stored);
-            let mut token_record: PairingTokenRecord =
-                serde_json::from_slice(&stored_bytes).context("decode pairing token")?;
             if token_record.consumed_at_unix.is_some() {
                 bail!("pairing token already consumed");
             }
             if token_record.expires_at_unix < now {
                 bail!("pairing token expired");
             }
+            let mut devices = write.open_table(DEVICES).context("open device table")?;
+            if vault_rows(&devices, &token_record.vault_id)?
+                .next()
+                .is_some()
             {
-                let devices = write.open_table(DEVICES).context("open device table")?;
-                if vault_has_any_device(&devices, &token_record.vault_id)? {
-                    bail!(
-                        "vault already has a paired device; use the Request / Authorize flow from an existing device instead of a pairing token"
-                    );
-                }
+                bail!(
+                    "vault already has a paired device; use the Request / Authorize flow from an existing device instead of a pairing token"
+                );
             }
             token_record.consumed_at_unix = Some(now);
             write_json(&mut tokens, token, &token_record)?;
 
-            DeviceRecord {
+            let device = DeviceRecord {
                 vault_id: token_record.vault_id,
                 device_id: format!("d{}", random_hex(16)),
                 label: label.to_string(),
@@ -360,16 +425,14 @@ impl Storage {
                 created_at_unix: now,
                 revoked_at_unix: None,
                 last_seen_at_unix: None,
-            }
-        };
-        {
-            let mut devices = write.open_table(DEVICES).context("open device table")?;
+            };
             write_json(
                 &mut devices,
                 device_key(&device.vault_id, &device.device_id),
                 &device,
             )?;
-        }
+            device
+        };
         write.commit().context("commit device")?;
         Ok(device)
     }
@@ -383,32 +446,40 @@ impl Storage {
     ) -> anyhow::Result<DeviceRecord> {
         let now = now_unix()?;
         let write = self.db.begin_write().context("begin write")?;
-        {
-            let vaults = write.open_table(VAULTS).context("open vault table")?;
-            if vaults.get(vault_id).context("read vault")?.is_none() {
-                bail!("vault not found");
-            }
-        }
-        let device = DeviceRecord {
-            vault_id: vault_id.to_string(),
-            device_id: format!("d{}", random_hex(16)),
-            label: label.to_string(),
-            verifying_key: verifying_key.to_string(),
-            created_at_unix: now,
-            revoked_at_unix: None,
-            last_seen_at_unix: None,
-        };
-        {
+        let device = {
+            read_vault(
+                &write.open_table(VAULTS).context("open vault table")?,
+                vault_id,
+            )?;
             let mut devices = write.open_table(DEVICES).context("open device table")?;
-            if active_device_count(&devices, vault_id)? >= max_active_devices {
+            let mut active = 0;
+            for item in vault_rows(&devices, vault_id)? {
+                let (_, value) = item.context("read device row")?;
+                let device: DeviceRecord =
+                    serde_json::from_slice(value.value()).context("decode device row")?;
+                if device.revoked_at_unix.is_none() {
+                    active += 1;
+                }
+            }
+            if active >= max_active_devices {
                 bail!("vault device limit reached");
             }
+            let device = DeviceRecord {
+                vault_id: vault_id.to_string(),
+                device_id: format!("d{}", random_hex(16)),
+                label: label.to_string(),
+                verifying_key: verifying_key.to_string(),
+                created_at_unix: now,
+                revoked_at_unix: None,
+                last_seen_at_unix: None,
+            };
             write_json(
                 &mut devices,
                 device_key(&device.vault_id, &device.device_id),
                 &device,
             )?;
-        }
+            device
+        };
         write.commit().context("commit authorized device")?;
         Ok(device)
     }
@@ -416,13 +487,10 @@ impl Storage {
     pub fn list_devices(&self, vault_id: &str) -> anyhow::Result<Vec<DeviceRecord>> {
         let read = self.db.begin_read().context("begin read")?;
         let table = read.open_table(DEVICES).context("open device table")?;
-        let prefix = format!("{vault_id}:");
         let mut out = Vec::new();
-        for item in table.iter().context("iterate devices")? {
-            let (key, value) = item.context("read device row")?;
-            if key.value().starts_with(&prefix) {
-                out.push(serde_json::from_slice(value.value()).context("decode device row")?);
-            }
+        for item in vault_rows(&table, vault_id)? {
+            let (_, value) = item.context("read device row")?;
+            out.push(serde_json::from_slice(value.value()).context("decode device row")?);
         }
         Ok(out)
     }
@@ -434,12 +502,10 @@ impl Storage {
     ) -> anyhow::Result<DeviceRecord> {
         let read = self.db.begin_read().context("begin read")?;
         let table = read.open_table(DEVICES).context("open device table")?;
-        let key = device_key(vault_id, device_id);
-        let Some(stored) = table.get(key.as_str()).context("read device")? else {
+        let Some(device) = read_json::<DeviceRecord>(&table, &device_key(vault_id, device_id))?
+        else {
             bail!("device not found");
         };
-        let device: DeviceRecord =
-            serde_json::from_slice(stored.value()).context("decode device")?;
         if device.revoked_at_unix.is_some() {
             bail!("device revoked");
         }
@@ -452,59 +518,66 @@ impl Storage {
         let write = self.db.begin_write().context("begin write")?;
         {
             let mut table = write.open_table(DEVICES).context("open device table")?;
-            let Some(stored) = table.get(key.as_str()).context("read device")? else {
+            let Some(mut device) = read_json::<DeviceRecord>(&table, &key)? else {
                 bail!("device not found");
             };
-            let stored_bytes = stored.value().to_vec();
-            drop(stored);
-            let mut device: DeviceRecord =
-                serde_json::from_slice(&stored_bytes).context("decode device")?;
             device.revoked_at_unix = Some(now);
             write_json(&mut table, key, &device)?;
         }
         write.commit().context("commit device revoke")
     }
 
-    pub fn append_op(&self, mut op: EncryptedOpRecord) -> anyhow::Result<AppendOpResult> {
+    /// Appends ops in one transaction. Ops with a known client op id are not
+    /// stored again and keep their original sequence.
+    pub fn append_ops(
+        &self,
+        vault_id: &str,
+        format: u8,
+        ops: Vec<EncryptedOpRecord>,
+    ) -> anyhow::Result<Vec<AppendedOp>> {
+        let now = now_unix()?;
         let write = self.db.begin_write().context("begin write")?;
-        let seq = {
-            let mut client_ops = write.open_table(CLIENT_OPS).context("open client ops")?;
-            let client_key = client_op_key(&op.vault_id, &op.client_op_id);
-            if let Some(existing) = client_ops
-                .get(client_key.as_str())
-                .context("read client op")?
-            {
-                return Ok(AppendOpResult {
-                    server_seq: existing.value(),
-                    inserted: false,
-                });
-            }
-
+        let appended = {
             let mut vaults = write.open_table(VAULTS).context("open vault table")?;
-            let Some(stored_vault) = vaults.get(op.vault_id.as_str()).context("read vault")? else {
-                bail!("vault not found");
-            };
-            let stored_bytes = stored_vault.value().to_vec();
-            drop(stored_vault);
-            let mut vault: VaultRecord =
-                serde_json::from_slice(&stored_bytes).context("decode vault")?;
-            vault.current_seq += 1;
-            op.server_seq = vault.current_seq;
-            op.accepted_at_unix = now_unix()?;
-            write_json(&mut vaults, vault.id.as_str(), &vault)?;
-            client_ops
-                .insert(client_key.as_str(), op.server_seq)
-                .context("insert client op")?;
-
+            let mut client_ops = write.open_table(CLIENT_OPS).context("open client ops")?;
             let mut oplog = write.open_table(OPLOG).context("open oplog")?;
-            write_json(&mut oplog, op_key(&op.vault_id, op.server_seq), &op)?;
-            op.server_seq
+            let mut vault = read_vault(&vaults, vault_id)?;
+            if vault.format >= CURRENT_FORMAT && format < CURRENT_FORMAT {
+                bail!(PLUGIN_UPDATE_REQUIRED);
+            }
+            if vault.format < CURRENT_FORMAT && format >= CURRENT_FORMAT {
+                bail!(VAULT_UPGRADE_REQUIRED);
+            }
+            let mut appended = Vec::with_capacity(ops.len());
+            for mut op in ops {
+                let client_key = client_op_key(vault_id, &op.client_op_id);
+                let existing = client_ops
+                    .get(client_key.as_str())
+                    .context("read client op")?
+                    .map(|seq| seq.value());
+                if let Some(seq) = existing {
+                    op.server_seq = seq;
+                    appended.push(AppendedOp {
+                        op,
+                        inserted: false,
+                    });
+                    continue;
+                }
+                vault.current_seq += 1;
+                op.vault_id = vault_id.to_string();
+                op.server_seq = vault.current_seq;
+                op.accepted_at_unix = now;
+                client_ops
+                    .insert(client_key.as_str(), op.server_seq)
+                    .context("insert client op")?;
+                write_json(&mut oplog, op_key(vault_id, op.server_seq), &op)?;
+                appended.push(AppendedOp { op, inserted: true });
+            }
+            write_json(&mut vaults, vault_id, &vault)?;
+            appended
         };
-        write.commit().context("commit op")?;
-        Ok(AppendOpResult {
-            server_seq: seq,
-            inserted: true,
-        })
+        write.commit().context("commit ops")?;
+        Ok(appended)
     }
 
     pub fn list_ops_after(
@@ -515,24 +588,18 @@ impl Storage {
     ) -> anyhow::Result<Vec<EncryptedOpRecord>> {
         let read = self.db.begin_read().context("begin read")?;
         let table = read.open_table(OPLOG).context("open oplog")?;
-        let prefix = format!("{vault_id}:");
         let start = op_key(vault_id, after_seq.saturating_add(1));
-        let end = format!("{vault_id};");
+        let end = vault_range(vault_id).1;
         let mut out = Vec::new();
         for item in table
             .range(start.as_str()..end.as_str())
             .context("range oplog")?
         {
-            let (key, value) = item.context("read op row")?;
-            if !key.value().starts_with(&prefix) {
-                break;
-            }
-            let op: EncryptedOpRecord =
-                serde_json::from_slice(value.value()).context("decode op row")?;
-            out.push(op);
             if u64::try_from(out.len()).unwrap_or(u64::MAX) >= limit {
                 break;
             }
+            let (_, value) = item.context("read op row")?;
+            out.push(serde_json::from_slice(value.value()).context("decode op row")?);
         }
         Ok(out)
     }
@@ -544,77 +611,77 @@ impl Storage {
         bytes: &[u8],
         max_vault_size_bytes: u64,
     ) -> anyhow::Result<BlobRecord> {
-        self.ensure_blob_fits_vault_limit(vault_id, blob_id, bytes, max_vault_size_bytes)?;
+        let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let key = blob_key(vault_id, blob_id);
         let path = self.blob_path(vault_id, blob_id);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        {
+            let read = self.db.begin_read().context("begin read")?;
+            let vault = read_vault(
+                &read.open_table(VAULTS).context("open vault table")?,
+                vault_id,
+            )?;
+            let index = read.open_table(BLOB_INDEX).context("open blob index")?;
+            let existing = read_json::<BlobRecord>(&index, &key)?;
+            let existing_size = existing.as_ref().map_or(0, |record| record.size);
+            let usage = match vault.blob_bytes {
+                Some(bytes) => bytes,
+                None => sum_blob_bytes(&index, vault_id)?,
+            };
+            if usage.saturating_sub(existing_size).saturating_add(size) > max_vault_size_bytes {
+                bail!("vault exceeds configured size limit");
+            }
         }
-        fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
+
+        write_file_atomic(&path, bytes)?;
+
         let record = BlobRecord {
             vault_id: vault_id.to_string(),
             blob_id: blob_id.to_string(),
-            size: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            size,
             created_at_unix: now_unix()?,
         };
         let write = self.db.begin_write().context("begin write")?;
         {
-            let mut table = write.open_table(BLOB_INDEX).context("open blob index")?;
-            write_json(&mut table, blob_key(vault_id, blob_id), &record)?;
+            let mut vaults = write.open_table(VAULTS).context("open vault table")?;
+            let mut index = write.open_table(BLOB_INDEX).context("open blob index")?;
+            let mut vault = read_vault(&vaults, vault_id)?;
+            let previous_size = read_json::<BlobRecord>(&index, &key)?.map_or(0, |old| old.size);
+            let usage = match vault.blob_bytes {
+                Some(bytes) => bytes,
+                None => sum_blob_bytes(&index, vault_id)?,
+            };
+            vault.blob_bytes = Some(usage.saturating_sub(previous_size).saturating_add(size));
+            write_json(&mut index, key, &record)?;
+            write_json(&mut vaults, vault_id, &vault)?;
         }
         write.commit().context("commit blob")?;
         Ok(record)
     }
 
-    fn ensure_blob_fits_vault_limit(
-        &self,
-        vault_id: &str,
-        blob_id: &str,
-        bytes: &[u8],
-        max_vault_size_bytes: u64,
-    ) -> anyhow::Result<()> {
-        let read = self.db.begin_read().context("begin read")?;
-        {
-            let vaults = read.open_table(VAULTS).context("open vault table")?;
-            if vaults.get(vault_id).context("read vault")?.is_none() {
-                bail!("vault not found");
-            }
-        }
-
-        let table = read.open_table(BLOB_INDEX).context("open blob index")?;
-        let prefix = format!("{vault_id}:");
-        let current_key = blob_key(vault_id, blob_id);
-        let mut current_total = 0_u64;
-        let mut existing_size = 0_u64;
-        for item in table.iter().context("iterate blob index")? {
-            let (key, value) = item.context("read blob row")?;
-            if !key.value().starts_with(&prefix) {
-                continue;
-            }
-            let record: BlobRecord =
-                serde_json::from_slice(value.value()).context("decode blob row")?;
-            current_total = current_total.saturating_add(record.size);
-            if key.value() == current_key {
-                existing_size = record.size;
-            }
-        }
-
-        let next_total = current_total
-            .saturating_sub(existing_size)
-            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-        if next_total > max_vault_size_bytes {
-            bail!("vault exceeds configured size limit");
-        }
-        Ok(())
-    }
-
     pub fn get_blob(&self, vault_id: &str, blob_id: &str) -> anyhow::Result<Option<Vec<u8>>> {
         let path = self.blob_path(vault_id, blob_id);
-        if !path.exists() {
-            return Ok(None);
+        match fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
         }
-        Ok(Some(
-            fs::read(&path).with_context(|| format!("read {}", path.display()))?,
-        ))
+    }
+
+    pub fn missing_blobs(
+        &self,
+        vault_id: &str,
+        blob_ids: &[String],
+    ) -> anyhow::Result<Vec<String>> {
+        let read = self.db.begin_read().context("begin read")?;
+        let index = read.open_table(BLOB_INDEX).context("open blob index")?;
+        let mut missing = Vec::new();
+        for blob_id in blob_ids {
+            let key = blob_key(vault_id, blob_id);
+            if index.get(key.as_str()).context("read blob row")?.is_none() {
+                missing.push(blob_id.clone());
+            }
+        }
+        Ok(missing)
     }
 
     pub fn put_snapshot(&self, mut snapshot: SnapshotRecord) -> anyhow::Result<()> {
@@ -634,16 +701,32 @@ impl Storage {
     pub fn list_snapshots(&self, vault_id: &str) -> anyhow::Result<Vec<SnapshotRecord>> {
         let read = self.db.begin_read().context("begin read")?;
         let table = read.open_table(SNAPSHOTS).context("open snapshots")?;
-        let prefix = format!("{vault_id}:");
         let mut out = Vec::new();
-        for item in table.iter().context("iterate snapshots")? {
-            let (key, value) = item.context("read snapshot row")?;
-            if key.value().starts_with(&prefix) {
-                out.push(serde_json::from_slice(value.value()).context("decode snapshot row")?);
-            }
+        for item in vault_rows(&table, vault_id)? {
+            let (_, value) = item.context("read snapshot row")?;
+            out.push(serde_json::from_slice(value.value()).context("decode snapshot row")?);
         }
         out.sort_by_key(|snapshot: &SnapshotRecord| snapshot.covers_through_seq);
         Ok(out)
+    }
+
+    pub fn latest_snapshot(&self, vault_id: &str) -> anyhow::Result<Option<SnapshotRecord>> {
+        let read = self.db.begin_read().context("begin read")?;
+        let table = read.open_table(SNAPSHOTS).context("open snapshots")?;
+        let mut latest: Option<(u64, String)> = None;
+        for item in vault_rows(&table, vault_id)? {
+            let (key, value) = item.context("read snapshot row")?;
+            let seq = serde_json::from_slice::<SnapshotSeq>(value.value())
+                .context("decode snapshot row")?
+                .covers_through_seq;
+            if latest.as_ref().is_none_or(|(best, _)| seq >= *best) {
+                latest = Some((seq, key.value().to_string()));
+            }
+        }
+        match latest {
+            Some((_, key)) => read_json(&table, &key),
+            None => Ok(None),
+        }
     }
 
     pub fn prune_snapshots(&self, vault_id: &str, retain: usize) -> anyhow::Result<()> {
@@ -738,17 +821,12 @@ fn upgrade_v2_database(db_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn now_unix() -> anyhow::Result<u64> {
-    Ok(SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock before unix epoch")?
-        .as_secs())
-}
-
-fn random_hex(byte_len: usize) -> String {
-    let mut bytes = vec![0; byte_len];
-    rand::rng().fill_bytes(&mut bytes);
-    hex_encode(&bytes)
+fn write_file_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let parent = path.parent().context("blob path has no parent")?;
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let temp = parent.join(format!(".tmp-{}", random_hex(8)));
+    fs::write(&temp, bytes).with_context(|| format!("write {}", temp.display()))?;
+    fs::rename(&temp, path).with_context(|| format!("rename {}", path.display()))
 }
 
 fn validate_vault_name(name: &str) -> anyhow::Result<String> {
@@ -762,10 +840,7 @@ fn validate_vault_name(name: &str) -> anyhow::Result<String> {
     Ok(name.to_string())
 }
 
-fn reject_duplicate_vault_name(
-    vaults: &redb::Table<'_, &str, &[u8]>,
-    name: &str,
-) -> anyhow::Result<()> {
+fn reject_duplicate_vault_name(vaults: &Table<'_, &str, &[u8]>, name: &str) -> anyhow::Result<()> {
     for item in vaults.iter().context("iterate vaults")? {
         let (_, value) = item.context("read vault row")?;
         let record: VaultRecord =
@@ -777,18 +852,27 @@ fn reject_duplicate_vault_name(
     Ok(())
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    out
+fn read_vault(
+    vaults: &impl ReadableTable<&'static str, &'static [u8]>,
+    vault_id: &str,
+) -> anyhow::Result<VaultRecord> {
+    read_json(vaults, vault_id)?.context("vault not found")
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+    key: &str,
+) -> anyhow::Result<Option<T>> {
+    let Some(value) = table.get(key).context("read row")? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        serde_json::from_slice(value.value()).context("decode row")?,
+    ))
 }
 
 fn write_json<T: Serialize>(
-    table: &mut redb::Table<'_, &str, &[u8]>,
+    table: &mut Table<'_, &str, &[u8]>,
     key: impl AsRef<str>,
     value: &T,
 ) -> anyhow::Result<()> {
@@ -799,6 +883,45 @@ fn write_json<T: Serialize>(
     Ok(())
 }
 
+/// Keys of one vault are `"{vault_id}:..."`, so they sort between these bounds.
+fn vault_range(vault_id: &str) -> (String, String) {
+    (format!("{vault_id}:"), format!("{vault_id};"))
+}
+
+fn vault_rows<'a, V: redb::Value + 'static>(
+    table: &'a impl ReadableTable<&'static str, V>,
+    vault_id: &str,
+) -> anyhow::Result<redb::Range<'a, &'static str, V>> {
+    let (start, end) = vault_range(vault_id);
+    table
+        .range(start.as_str()..end.as_str())
+        .context("range vault rows")
+}
+
+fn remove_vault_rows<V: redb::Value + 'static>(
+    table: &mut Table<'_, &str, V>,
+    vault_id: &str,
+) -> anyhow::Result<()> {
+    let (start, end) = vault_range(vault_id);
+    table
+        .retain_in(start.as_str()..end.as_str(), |_, _| false)
+        .context("remove vault rows")
+}
+
+fn sum_blob_bytes(
+    index: &impl ReadableTable<&'static str, &'static [u8]>,
+    vault_id: &str,
+) -> anyhow::Result<u64> {
+    let mut total = 0_u64;
+    for item in vault_rows(index, vault_id)? {
+        let (_, value) = item.context("read blob row")?;
+        let record: BlobRecord =
+            serde_json::from_slice(value.value()).context("decode blob row")?;
+        total = total.saturating_add(record.size);
+    }
+    Ok(total)
+}
+
 fn count_rows<V>(
     read: &ReadTransaction,
     table: TableDefinition<&str, V>,
@@ -807,17 +930,10 @@ fn count_rows<V>(
 where
     V: redb::Value + 'static,
 {
-    let mut count = 0_u64;
-    for item in read
-        .open_table(table)
+    read.open_table(table)
         .with_context(|| format!("open {table_name} table"))?
-        .iter()
-        .with_context(|| format!("iterate {table_name}"))?
-    {
-        item.with_context(|| format!("read {table_name} row"))?;
-        count = count.saturating_add(1);
-    }
-    Ok(count)
+        .len()
+        .with_context(|| format!("count {table_name}"))
 }
 
 fn collect_device_stats(read: &ReadTransaction) -> anyhow::Result<DeviceStats> {
@@ -922,62 +1038,9 @@ fn snapshot_key(vault_id: &str, snapshot_id: &str) -> String {
     format!("{vault_id}:{snapshot_id}")
 }
 
-fn active_device_count(
-    devices: &redb::Table<'_, &str, &[u8]>,
-    vault_id: &str,
-) -> anyhow::Result<usize> {
-    let prefix = format!("{vault_id}:");
-    let mut count = 0;
-    for item in devices.iter().context("iterate devices")? {
-        let (key, value) = item.context("read device row")?;
-        if key.value().starts_with(&prefix) {
-            let device: DeviceRecord =
-                serde_json::from_slice(value.value()).context("decode device row")?;
-            if device.revoked_at_unix.is_none() {
-                count += 1;
-            }
-        }
-    }
-    Ok(count)
-}
-
-fn vault_has_any_device(
-    devices: &redb::Table<'_, &str, &[u8]>,
-    vault_id: &str,
-) -> anyhow::Result<bool> {
-    let prefix = format!("{vault_id}:");
-    for item in devices.iter().context("iterate devices")? {
-        let (key, _) = item.context("read device row")?;
-        if key.value().starts_with(&prefix) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn remove_prefixed_keys<V>(table: &mut redb::Table<'_, &str, V>, prefix: &str) -> anyhow::Result<()>
-where
-    V: redb::Value + 'static,
-{
-    let stale = {
-        let mut out = Vec::new();
-        for item in table.iter().context("iterate table")? {
-            let (key, _) = item.context("read table row")?;
-            if key.value().starts_with(prefix) {
-                out.push(key.value().to_string());
-            }
-        }
-        out
-    };
-    for key in stale {
-        table.remove(key.as_str()).context("remove table row")?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{EncryptedOpRecord, SnapshotRecord, Storage};
+    use super::{EncryptedOpRecord, LEGACY_FORMAT, SnapshotRecord, Storage};
     use std::{fs, path::PathBuf};
 
     #[test]
@@ -1105,22 +1168,16 @@ mod tests {
         let storage = test_storage();
         let vault = storage.create_vault("test vault").expect("create vault");
 
-        let first = storage
-            .append_op(test_op(&vault.id, "op-a"))
-            .expect("append op");
-        let second = storage
-            .append_op(test_op(&vault.id, "op-a"))
-            .expect("append op again");
-        let next = storage
-            .append_op(test_op(&vault.id, "op-b"))
-            .expect("append next op");
+        let first = append(&storage, &vault.id, "op-a");
+        let second = append(&storage, &vault.id, "op-a");
+        let next = append(&storage, &vault.id, "op-b");
         let ops = storage.list_ops_after(&vault.id, 0, 10).expect("list ops");
 
-        assert_eq!(first.server_seq, 1);
+        assert_eq!(first.op.server_seq, 1);
         assert!(first.inserted);
-        assert_eq!(second.server_seq, first.server_seq);
+        assert_eq!(second.op.server_seq, first.op.server_seq);
         assert!(!second.inserted);
-        assert_eq!(next.server_seq, 2);
+        assert_eq!(next.op.server_seq, 2);
         assert!(next.inserted);
         assert_eq!(ops.len(), 2);
     }
@@ -1214,9 +1271,7 @@ mod tests {
         storage
             .issue_pairing_token(&vault.id)
             .expect("issue active pairing token");
-        storage
-            .append_op(test_op(&vault.id, "op-a"))
-            .expect("append op");
+        append(&storage, &vault.id, "op-a");
         storage
             .put_blob_with_vault_limit(&vault.id, "blob-a", b"1234", 1024)
             .expect("put blob");
@@ -1255,9 +1310,7 @@ mod tests {
         storage
             .issue_pairing_token(&doomed.id)
             .expect("issue extra token");
-        storage
-            .append_op(test_op(&doomed.id, "op-a"))
-            .expect("append op");
+        append(&storage, &doomed.id, "op-a");
         storage
             .put_blob_with_vault_limit(&doomed.id, "blob-a", b"1234", 1024)
             .expect("put blob");
@@ -1310,6 +1363,10 @@ mod tests {
                 created_at_unix: 0,
                 revoked_at_unix: None,
                 current_seq: 0,
+                format: LEGACY_FORMAT,
+                upgrade_seq: 0,
+                upgrade_base: 0,
+                blob_bytes: None,
             };
             let db = redb2::Database::create(&db_path).expect("create v2 database");
             let write = db.begin_write().expect("begin v2 write");
@@ -1333,6 +1390,17 @@ mod tests {
         assert_eq!(vaults.len(), 1);
         assert_eq!(vaults[0].id, "v-legacy");
         assert_eq!(vaults[0].name, "legacy vault");
+    }
+
+    fn append(storage: &Storage, vault_id: &str, client_op_id: &str) -> super::AppendedOp {
+        storage
+            .append_ops(
+                vault_id,
+                super::CURRENT_FORMAT,
+                vec![test_op(vault_id, client_op_id)],
+            )
+            .expect("append op")
+            .remove(0)
     }
 
     fn test_storage() -> Storage {

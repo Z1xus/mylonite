@@ -7,17 +7,13 @@ use axum::{
 };
 use futures_util::StreamExt;
 use mylonite_protocol::{ClientMsgKind, Frame, ServerMsgKind};
-use rand::Rng;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::{
-    task,
-    time::{Duration, timeout},
-};
+use tokio::time::{Duration, timeout};
 use tracing::warn;
 
 use super::{ApiError, AppState, auth::verify_ws_challenge_signature, validation};
-use crate::storage::EncryptedOpRecord;
+use crate::util::random_hex;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct WsQuery {
@@ -70,7 +66,9 @@ async fn handle_socket(state: AppState, vault_id: String, device_id: String, soc
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    // closing makes the client reconnect and catch up from its cursor
                     warn!(skipped, "websocket op broadcast receiver lagged");
+                    break;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             },
@@ -117,34 +115,15 @@ async fn append_pushed_op(
         )));
     }
     let request: super::routes::AppendOpRequest = serde_json::from_slice(payload)?;
-    validation::validate_op_request(&request, state.max_op_ciphertext_bytes)?;
-    if request.device_id != authenticated_device_id {
-        return Err(ApiError::bad_request(anyhow::anyhow!(
-            "request body device id does not match websocket device"
-        )));
-    }
-    let mut op = EncryptedOpRecord {
-        vault_id: vault_id.to_string(),
-        server_seq: 0,
-        client_op_id: request.client_op_id,
-        device_id: request.device_id,
-        lamport: request.lamport,
-        kind: request.kind,
-        key_version: request.key_version,
-        nonce_hex: request.nonce_hex,
-        ciphertext_hex: request.ciphertext_hex,
-        accepted_at_unix: 0,
-    };
-    let storage = state.storage.clone();
-    let append_op = op.clone();
-    let append = task::spawn_blocking(move || storage.append_op(append_op))
-        .await
-        .map_err(|error| ApiError::internal(anyhow::anyhow!("storage task failed: {error}")))?
-        .map_err(ApiError::from_storage)?;
-    op.server_seq = append.server_seq;
-    if append.inserted {
-        let _ = state.op_broadcast.send(op);
-    }
+    let format = request.format;
+    super::routes::append_ops(
+        state,
+        vault_id,
+        authenticated_device_id,
+        format,
+        vec![request],
+    )
+    .await?;
     Ok(())
 }
 
@@ -206,17 +185,4 @@ async fn authenticate_socket(
         return false;
     };
     socket.send(Message::Binary(ack_frame.into())).await.is_ok()
-}
-
-fn random_hex(byte_len: usize) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-
-    let mut bytes = vec![0_u8; byte_len];
-    rand::rng().fill_bytes(&mut bytes);
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    out
 }

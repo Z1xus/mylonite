@@ -25,7 +25,7 @@ use tracing::{error, info};
 
 use crate::{
     config::{LimitsConfig, SnapshotConfig, TlsConfig},
-    storage::{EncryptedOpRecord, Storage},
+    storage::{self, EncryptedOpRecord, Storage},
 };
 
 #[derive(Debug, Clone)]
@@ -36,6 +36,7 @@ struct AppState {
     max_devices_per_vault: usize,
     max_json_body_bytes: usize,
     max_op_json_body_bytes: usize,
+    max_batch_json_body_bytes: usize,
     max_op_ciphertext_bytes: usize,
     max_ops_per_push: u64,
     max_snapshot_json_body_bytes: usize,
@@ -91,6 +92,7 @@ pub async fn serve(
     )
     .unwrap_or(usize::MAX);
     let max_op_json_body_bytes = encrypted_json_body_limit(max_op_ciphertext_bytes);
+    let max_batch_json_body_bytes = max_op_json_body_bytes.saturating_mul(8);
     let max_snapshot_json_body_bytes = encrypted_json_body_limit(max_snapshot_ciphertext_bytes);
     let state = AppState {
         storage,
@@ -99,6 +101,7 @@ pub async fn serve(
         max_devices_per_vault: usize::try_from(limits.max_devices_per_vault).unwrap_or(usize::MAX),
         max_json_body_bytes,
         max_op_json_body_bytes,
+        max_batch_json_body_bytes,
         max_op_ciphertext_bytes,
         max_ops_per_push: u64::from(limits.max_ops_per_push).max(1),
         max_snapshot_json_body_bytes,
@@ -107,13 +110,7 @@ pub async fn serve(
         op_broadcast: broadcast::channel(1024).0,
         pairing_sessions: Arc::new(Mutex::new(HashMap::new())),
     };
-    let app = build_router(
-        state,
-        max_json_body_bytes,
-        max_op_json_body_bytes,
-        max_blob_size_bytes,
-        max_snapshot_json_body_bytes,
-    );
+    let app = build_router(state);
 
     match tls::load_server_config(&tls, data_dir).await? {
         tls::ServerTls::Off => {
@@ -139,33 +136,13 @@ pub async fn serve(
     Ok(())
 }
 
-fn build_router(
-    state: AppState,
-    max_json_body_bytes: usize,
-    max_op_json_body_bytes: usize,
-    max_blob_size_bytes: usize,
-    max_snapshot_json_body_bytes: usize,
-) -> Router {
-    let admin_routes = Router::new()
-        .route(
-            "/api/v1/admin/vaults",
-            get(routes::admin_list_vaults)
-                .post(routes::admin_create_vault)
-                .layer(DefaultBodyLimit::max(max_json_body_bytes)),
-        )
-        .route(
-            "/api/v1/admin/vaults/{vault_id}",
-            delete(routes::admin_delete_vault),
-        )
-        .route(
-            "/api/v1/admin/vaults/{vault_id}/devices",
-            get(routes::admin_list_devices),
-        )
-        .route(
-            "/api/v1/admin/vaults/{vault_id}/devices/{device_id}/revoke",
-            post(routes::admin_revoke_device),
-        )
-        .route("/api/v1/admin/stats", get(routes::admin_stats));
+fn build_router(state: AppState) -> Router {
+    let max_json_body_bytes = state.max_json_body_bytes;
+    let max_op_json_body_bytes = state.max_op_json_body_bytes;
+    let max_batch_json_body_bytes = state.max_batch_json_body_bytes;
+    let max_blob_size_bytes = state.max_blob_size_bytes;
+    let max_snapshot_json_body_bytes = state.max_snapshot_json_body_bytes;
+    let admin_routes = admin_router(max_json_body_bytes);
 
     let api_routes = Router::new()
         .route(
@@ -180,6 +157,11 @@ fn build_router(
         .route(
             "/api/v1/pair/sessions/{session_id}/grant",
             get(routes::get_pairing_session_grant),
+        )
+        .route("/api/v1/vaults/{vault_id}", get(routes::vault_info))
+        .route(
+            "/api/v1/vaults/{vault_id}/upgrade",
+            post(routes::upgrade_vault).layer(DefaultBodyLimit::max(max_json_body_bytes)),
         )
         .route(
             "/api/v1/vaults/{vault_id}/devices",
@@ -211,6 +193,14 @@ fn build_router(
                 .layer(DefaultBodyLimit::max(max_op_json_body_bytes)),
         )
         .route(
+            "/api/v1/vaults/{vault_id}/ops/batch",
+            post(routes::append_ops_batch).layer(DefaultBodyLimit::max(max_batch_json_body_bytes)),
+        )
+        .route(
+            "/api/v1/vaults/{vault_id}/blobs/missing",
+            post(routes::missing_blobs).layer(DefaultBodyLimit::max(max_json_body_bytes)),
+        )
+        .route(
             "/api/v1/vaults/{vault_id}/blobs/{blob_id}",
             get(routes::get_blob)
                 .put(routes::put_blob)
@@ -221,6 +211,10 @@ fn build_router(
             get(routes::list_snapshots)
                 .post(routes::put_snapshot)
                 .layer(DefaultBodyLimit::max(max_snapshot_json_body_bytes)),
+        )
+        .route(
+            "/api/v1/vaults/{vault_id}/snapshots/latest",
+            get(routes::latest_snapshot),
         )
         .route("/ws", get(ws::ws_handler))
         .layer(api_cors_layer());
@@ -234,6 +228,29 @@ fn build_router(
         .merge(admin_routes)
         .merge(api_routes)
         .with_state(state)
+}
+
+fn admin_router(max_json_body_bytes: usize) -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/v1/admin/vaults",
+            get(routes::admin_list_vaults)
+                .post(routes::admin_create_vault)
+                .layer(DefaultBodyLimit::max(max_json_body_bytes)),
+        )
+        .route(
+            "/api/v1/admin/vaults/{vault_id}",
+            delete(routes::admin_delete_vault),
+        )
+        .route(
+            "/api/v1/admin/vaults/{vault_id}/devices",
+            get(routes::admin_list_devices),
+        )
+        .route(
+            "/api/v1/admin/vaults/{vault_id}/devices/{device_id}/revoke",
+            post(routes::admin_revoke_device),
+        )
+        .route("/api/v1/admin/stats", get(routes::admin_stats))
 }
 
 fn encrypted_json_body_limit(max_ciphertext_bytes: usize) -> usize {
@@ -296,6 +313,14 @@ impl ApiError {
     fn from_storage(error: anyhow::Error) -> Self {
         let message = error.to_string();
         match message.as_str() {
+            storage::PLUGIN_UPDATE_REQUIRED => Self::new(
+                StatusCode::CONFLICT,
+                "This vault needs a newer Mylonite plugin. Update the plugin on this device.",
+                error,
+            ),
+            storage::VAULT_UPGRADE_REQUIRED => {
+                Self::new(StatusCode::CONFLICT, "vault upgrade required", error)
+            }
             "vault name is required" | "vault name is too long" => Self::bad_request(error),
             "vault not found" | "pairing token not found" | "device not found" => {
                 Self::not_found(error)

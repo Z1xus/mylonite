@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod config;
 mod storage;
+mod util;
 
 use std::{
     io::{self, Write},

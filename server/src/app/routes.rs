@@ -7,28 +7,26 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{
-    net::SocketAddr,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::net::SocketAddr;
 use tokio::task;
 
 use super::{
     ApiError, AppState, PairingSession, PairingSessionGrant, PairingSessionRequest,
     auth::verify_device_signature, validation,
 };
-use crate::storage::{
-    BlobRecord, CreatedVault, DeviceRecord, EncryptedOpRecord, SnapshotRecord, StorageStats,
+use crate::{
+    storage::{
+        BlobRecord, CreatedVault, DeviceRecord, EncryptedOpRecord, LEGACY_FORMAT, SnapshotRecord,
+        StorageStats, VaultInfo,
+    },
+    util::{hex_encode, now_unix},
 };
 
 const PAIRING_SESSION_TTL_SECS: u64 = 10 * 60;
 const MAX_PAIRING_SESSIONS: usize = 1024;
 
-pub(super) async fn health(State(app_state): State<AppState>) -> impl IntoResponse {
-    match storage_call(app_state.storage.clone(), |storage| storage.stats()).await {
-        Ok(storage_stats) => format!("ok vaults={}\n", storage_stats.vault_count),
-        Err(error) => format!("degraded error={error}\n"),
-    }
+pub(super) async fn health() -> &'static str {
+    "ok\n"
 }
 
 #[derive(Debug, Deserialize)]
@@ -684,11 +682,43 @@ pub(super) struct AppendOpRequest {
     pub(super) key_version: u32,
     pub(super) nonce_hex: String,
     pub(super) ciphertext_hex: String,
+    #[serde(default = "legacy_format")]
+    pub(super) format: u8,
+}
+
+fn legacy_format() -> u8 {
+    LEGACY_FORMAT
 }
 
 #[derive(Debug, Serialize)]
 pub(super) struct AppendOpResponse {
     server_seq: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct AppendOpsRequest {
+    format: u8,
+    ops: Vec<AppendOpRequest>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct AppendOpsResponse {
+    server_seqs: Vec<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct UpgradeVaultRequest {
+    base: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct MissingBlobsRequest {
+    blob_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct MissingBlobsResponse {
+    missing: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -719,32 +749,195 @@ pub(super) async fn append_op(
     )
     .await?;
     let request: AppendOpRequest = serde_json::from_slice(&body)?;
-    validation::validate_op_request(&request, app_state.max_op_ciphertext_bytes)?;
-    validate_body_device_matches_signer(&request.device_id, &signed_device_id)?;
-    let mut op = EncryptedOpRecord {
-        vault_id: vault_id.clone(),
-        server_seq: 0,
-        client_op_id: request.client_op_id,
-        device_id: request.device_id,
-        lamport: request.lamport,
-        kind: request.kind,
-        key_version: request.key_version,
-        nonce_hex: request.nonce_hex,
-        ciphertext_hex: request.ciphertext_hex,
-        accepted_at_unix: 0,
-    };
-    let append = storage_call(app_state.storage.clone(), {
-        let op = op.clone();
-        move |storage| storage.append_op(op)
+    let format = request.format;
+    let seqs = append_ops(
+        &app_state,
+        &vault_id,
+        &signed_device_id,
+        format,
+        vec![request],
+    )
+    .await?;
+    Ok(Json(AppendOpResponse {
+        server_seq: seqs[0],
+    }))
+}
+
+pub(super) async fn append_ops_batch(
+    State(app_state): State<AppState>,
+    Path(vault_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<AppendOpsResponse>, ApiError> {
+    validation::validate_vault_id(&vault_id)?;
+    validate_body_len(&body, app_state.max_batch_json_body_bytes)?;
+    let signed_device_id = verify_device_signature(
+        &app_state,
+        &vault_id,
+        "POST",
+        &format!("/api/v1/vaults/{vault_id}/ops/batch"),
+        &body,
+        &headers,
+    )
+    .await?;
+    let request: AppendOpsRequest = serde_json::from_slice(&body)?;
+    if request.ops.is_empty() || request.ops.len() as u64 > app_state.max_ops_per_push {
+        return Err(ApiError::bad_request(anyhow::anyhow!(
+            "op batch size is out of range"
+        )));
+    }
+    let server_seqs = append_ops(
+        &app_state,
+        &vault_id,
+        &signed_device_id,
+        request.format,
+        request.ops,
+    )
+    .await?;
+    Ok(Json(AppendOpsResponse { server_seqs }))
+}
+
+/// Validates, stores, and broadcasts ops pushed by one authenticated device.
+pub(super) async fn append_ops(
+    app_state: &AppState,
+    vault_id: &str,
+    device_id: &str,
+    format: u8,
+    requests: Vec<AppendOpRequest>,
+) -> Result<Vec<u64>, ApiError> {
+    let mut ops = Vec::with_capacity(requests.len());
+    for request in requests {
+        validation::validate_op_request(&request, app_state.max_op_ciphertext_bytes)?;
+        validate_body_device_matches_signer(&request.device_id, device_id)?;
+        ops.push(EncryptedOpRecord {
+            vault_id: vault_id.to_string(),
+            server_seq: 0,
+            client_op_id: request.client_op_id,
+            device_id: request.device_id,
+            lamport: request.lamport,
+            kind: request.kind,
+            key_version: request.key_version,
+            nonce_hex: request.nonce_hex,
+            ciphertext_hex: request.ciphertext_hex,
+            accepted_at_unix: 0,
+        });
+    }
+    let vault_id = vault_id.to_string();
+    let appended = storage_call(app_state.storage.clone(), move |storage| {
+        storage.append_ops(&vault_id, format, ops)
     })
     .await?;
-    op.server_seq = append.server_seq;
-    if append.inserted {
-        let _ = app_state.op_broadcast.send(op);
+    let mut seqs = Vec::with_capacity(appended.len());
+    for appended in appended {
+        seqs.push(appended.op.server_seq);
+        if appended.inserted {
+            let _ = app_state.op_broadcast.send(appended.op);
+        }
     }
-    Ok(Json(AppendOpResponse {
-        server_seq: append.server_seq,
+    Ok(seqs)
+}
+
+pub(super) async fn vault_info(
+    State(app_state): State<AppState>,
+    Path(vault_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<VaultInfo>, ApiError> {
+    validation::validate_vault_id(&vault_id)?;
+    verify_device_signature(
+        &app_state,
+        &vault_id,
+        "GET",
+        &format!("/api/v1/vaults/{vault_id}"),
+        &[],
+        &headers,
+    )
+    .await?;
+    Ok(Json(
+        storage_call(app_state.storage.clone(), move |storage| {
+            storage.vault_info(&vault_id)
+        })
+        .await?,
+    ))
+}
+
+pub(super) async fn upgrade_vault(
+    State(app_state): State<AppState>,
+    Path(vault_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<VaultInfo>, ApiError> {
+    validation::validate_vault_id(&vault_id)?;
+    validate_json_body_len(&app_state, &body)?;
+    verify_device_signature(
+        &app_state,
+        &vault_id,
+        "POST",
+        &format!("/api/v1/vaults/{vault_id}/upgrade"),
+        &body,
+        &headers,
+    )
+    .await?;
+    let request: UpgradeVaultRequest = serde_json::from_slice(&body)?;
+    Ok(Json(
+        storage_call(app_state.storage.clone(), move |storage| {
+            storage.upgrade_vault(&vault_id, request.base)
+        })
+        .await?,
+    ))
+}
+
+pub(super) async fn missing_blobs(
+    State(app_state): State<AppState>,
+    Path(vault_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<MissingBlobsResponse>, ApiError> {
+    validation::validate_vault_id(&vault_id)?;
+    validate_json_body_len(&app_state, &body)?;
+    verify_device_signature(
+        &app_state,
+        &vault_id,
+        "POST",
+        &format!("/api/v1/vaults/{vault_id}/blobs/missing"),
+        &body,
+        &headers,
+    )
+    .await?;
+    let request: MissingBlobsRequest = serde_json::from_slice(&body)?;
+    for blob_id in &request.blob_ids {
+        validation::validate_blob_id(blob_id)?;
+    }
+    Ok(Json(MissingBlobsResponse {
+        missing: storage_call(app_state.storage.clone(), move |storage| {
+            storage.missing_blobs(&vault_id, &request.blob_ids)
+        })
+        .await?,
     }))
+}
+
+pub(super) async fn latest_snapshot(
+    State(app_state): State<AppState>,
+    Path(vault_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    validation::validate_vault_id(&vault_id)?;
+    verify_device_signature(
+        &app_state,
+        &vault_id,
+        "GET",
+        &format!("/api/v1/vaults/{vault_id}/snapshots/latest"),
+        &[],
+        &headers,
+    )
+    .await?;
+    match storage_call(app_state.storage.clone(), move |storage| {
+        storage.latest_snapshot(&vault_id)
+    })
+    .await?
+    {
+        Some(snapshot) => Ok(Json(snapshot).into_response()),
+        None => Ok(StatusCode::NOT_FOUND.into_response()),
+    }
 }
 
 pub(super) async fn put_blob(
@@ -950,25 +1143,11 @@ fn invite_code_hash(session_id: &str, invite_code: &str) -> String {
     hex_encode(&Sha256::digest(material.as_bytes()))
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    out
-}
-
 fn prune_pairing_sessions(
     sessions: &mut std::collections::HashMap<String, PairingSession>,
     now: u64,
 ) {
     sessions.retain(|_, session| session.expires_at_unix >= now);
-}
-
-fn now_unix() -> anyhow::Result<u64> {
-    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
 }
 
 fn validate_pairing_invite_text(invite: &str) -> Result<(), ApiError> {

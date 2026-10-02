@@ -233,6 +233,7 @@ mod tests {
             key_version: 1,
             nonce_hex: "c".repeat(48),
             ciphertext_hex: ciphertext_hex.to_string(),
+            format: 3,
         }
     }
 
