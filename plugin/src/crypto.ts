@@ -5,6 +5,8 @@ import { blake3 } from "@noble/hashes/blake3.js";
 import { hkdf } from "@noble/hashes/hkdf.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 
+import { idle } from "./idle";
+
 const textEncoder = new TextEncoder();
 
 export interface DeviceKeypair {
@@ -38,8 +40,9 @@ export function generateDeviceKeypair(): DeviceKeypair {
   };
 }
 
-export function signRequest(privateKeyHex: string, method: string, path: string, body: Uint8Array): string {
-  const payload = new TextEncoder().encode(`${method.toUpperCase()}\n${path}\n${bytesToHex(body)}`);
+export async function signRequest(privateKeyHex: string, method: string, path: string, body: Uint8Array): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", body as BufferSource));
+  const payload = textEncoder.encode(`${method.toUpperCase()}\n${path}\n${bytesToHex(digest)}`);
   return bytesToHex(ed25519.sign(payload, hexToBytes(privateKeyHex)));
 }
 
@@ -84,12 +87,18 @@ export async function deriveVaultKeys(passphrase: string, saltHex: string): Prom
   };
 }
 
-export function keyedBlobId(blobIdKey: Uint8Array, vaultId: string, plaintext: Uint8Array): string {
-  const context = new TextEncoder().encode(`mylonite-blob-id-v1|${vaultId}|`);
-  const material = new Uint8Array(context.byteLength + plaintext.byteLength);
-  material.set(context, 0);
-  material.set(plaintext, context.byteLength);
-  return bytesToHex(blake3(material, { key: blobIdKey }));
+const HASH_CHUNK = 4 * 1024 * 1024;
+
+export async function keyedBlobId(blobIdKey: Uint8Array, vaultId: string, plaintext: Uint8Array): Promise<string> {
+  const hasher = blake3.create({ key: blobIdKey });
+  hasher.update(textEncoder.encode(`mylonite-blob-id-v1|${vaultId}|`));
+  for (let offset = 0; offset < plaintext.byteLength; offset += HASH_CHUNK) {
+    hasher.update(plaintext.subarray(offset, offset + HASH_CHUNK));
+    if (offset + HASH_CHUNK < plaintext.byteLength) {
+      await idle();
+    }
+  }
+  return bytesToHex(hasher.digest());
 }
 
 export function encryptPayload(key: Uint8Array, plaintext: Uint8Array, aad: Uint8Array): EncryptedPayload {
@@ -114,17 +123,37 @@ function pairingSecretKey(privateKeyHex: string, peerPublicKeyHex: string): Uint
   return hkdf(sha256, shared, undefined, textEncoder.encode("mylonite/device-pairing-key/v1"), 32);
 }
 
+const HEX_PAIRS = new Uint16Array(256);
+for (let byte = 0; byte < 256; byte += 1) {
+  const pair = byte.toString(16).padStart(2, "0");
+  HEX_PAIRS[byte] = pair.charCodeAt(0) | (pair.charCodeAt(1) << 8);
+}
+const latin1 = new TextDecoder("latin1");
+const NIBBLES = new Int8Array(128).fill(-1);
+for (let value = 0; value < 16; value += 1) {
+  NIBBLES[value.toString(16).charCodeAt(0)] = value;
+}
+
 export function bytesToHex(bytes: Uint8Array): string {
-  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  const out = new Uint16Array(bytes.length);
+  for (let index = 0; index < bytes.length; index += 1) {
+    out[index] = HEX_PAIRS[bytes[index]];
+  }
+  return latin1.decode(out);
 }
 
 export function hexToBytes(hex: string): Uint8Array {
-  if (hex.length % 2 !== 0 || /[^0-9a-f]/.test(hex)) {
+  if (hex.length % 2 !== 0) {
     throw new Error("invalid hex");
   }
   const out = new Uint8Array(hex.length / 2);
   for (let index = 0; index < out.length; index += 1) {
-    out[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
+    const high = NIBBLES[hex.charCodeAt(index * 2)] ?? -1;
+    const low = NIBBLES[hex.charCodeAt(index * 2 + 1)] ?? -1;
+    if (high < 0 || low < 0) {
+      throw new Error("invalid hex");
+    }
+    out[index] = (high << 4) | low;
   }
   return out;
 }

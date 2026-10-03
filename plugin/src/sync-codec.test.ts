@@ -17,11 +17,11 @@ describe("sync codec", () => {
     expect(decryptOp(keys, "vault-a", op)).toEqual(payload);
   });
 
-  it("round-trips blob envelopes", () => {
+  it("round-trips blob envelopes", async () => {
     const plaintext = new TextEncoder().encode("binary contents");
-    const encrypted = encryptBlob(keys, "vault-a", plaintext);
+    const encrypted = await encryptBlob(keys, "vault-a", plaintext);
 
-    const decrypted = decryptBlob(keys, "vault-a", encrypted.blobId, encrypted.envelope);
+    const decrypted = await decryptBlob(keys, "vault-a", encrypted.blobId, encrypted.envelope);
 
     expect(Array.from(decrypted)).toEqual(Array.from(plaintext));
   });

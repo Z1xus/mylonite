@@ -2,6 +2,7 @@ import { Notice, Plugin, TAbstractFile, TFile } from "obsidian";
 
 import { ApiError, EncryptedOpRecord, MyloniteApiClient } from "./api";
 import { VaultKeys, randomHex } from "./crypto";
+import { idle } from "./idle";
 import { LegacyState, isLegacyAncestor, isLegacyClean, markLegacyEdit } from "./migrate";
 import { RemoteOp, parseWire, toBase64, toWire } from "./ops";
 import { Replica } from "./replica";
@@ -13,6 +14,7 @@ import { LegacyHint, OutboxEntry, SyncOp } from "./sync-types";
 import { ObsidianVaultIO } from "./vault-io";
 
 const PAGE_SIZE = 512;
+const YIELD_EVERY = 32;
 const BATCH_OPS = 128;
 const BATCH_BYTES = 1_000_000;
 const INLINE_UPDATE_BYTES = 256 * 1024;
@@ -367,7 +369,10 @@ export class SyncEngine {
     if (payload.version !== 3 || !Array.isArray(payload.files)) {
       return false;
     }
-    for (const file of payload.files as Array<Record<string, unknown>>) {
+    for (const [index, file] of (payload.files as Array<Record<string, unknown>>).entries()) {
+      if (index % YIELD_EVERY === YIELD_EVERY - 1) {
+        await idle();
+      }
       const wire = file.kind === "text"
         ? { v: 3, t: "text", id: file.id, path: file.path, hash: file.init, u: file.state }
         : { v: 3, t: "blob", id: file.id, path: file.path, blob: file.hash, size: file.size };
@@ -384,8 +389,11 @@ export class SyncEngine {
     const client = this.host.createApiClient();
     for (;;) {
       const records = await client.listOps(this.settings.vaultId, session.cursor ?? 0, PAGE_SIZE);
-      for (const record of records) {
+      for (const [index, record] of records.entries()) {
         await this.applyRecord(session, record);
+        if (index % YIELD_EVERY === YIELD_EVERY - 1) {
+          await idle();
+        }
       }
       session.replica.setMeta("cursor", session.cursor);
       await session.replica.commit();
@@ -490,6 +498,7 @@ export class SyncEngine {
     const keys = await this.host.loadVaultKeys();
     const { replica } = session;
     while (replica.outbox.length > 0) {
+      await idle();
       const ready: OutboxEntry[] = [];
       const uploads = new Map<string, Uint8Array>();
       let bytes = 0;
@@ -542,7 +551,7 @@ export class SyncEngine {
         continue;
       }
       try {
-        await client.putBlob(this.settings.vaultId, blobId, encryptBlob(keys, this.settings.vaultId, plaintext).envelope);
+        await client.putBlob(this.settings.vaultId, blobId, (await encryptBlob(keys, this.settings.vaultId, plaintext)).envelope);
       } catch (error) {
         if (!(error instanceof ApiError) || error.status !== 413) {
           throw error;
@@ -558,12 +567,12 @@ export class SyncEngine {
     if (op.t !== "text" || op.update.byteLength <= INLINE_UPDATE_BYTES) {
       return toWire(op);
     }
-    const { blobId, envelope } = encryptBlob(keys, this.settings.vaultId, op.update);
+    const { blobId, envelope } = await encryptBlob(keys, this.settings.vaultId, op.update);
     await client.putBlob(this.settings.vaultId, blobId, envelope);
     return toWire(op, blobId);
   }
 
-  private blobId(bytes: Uint8Array): string {
+  private blobId(bytes: Uint8Array): Promise<string> {
     if (!this.blobKeys) {
       throw new Error("vault keys are not loaded");
     }
@@ -572,7 +581,7 @@ export class SyncEngine {
 
   private async fetchBlob(blobId: string): Promise<Uint8Array | null> {
     const envelope = await this.host.createApiClient().getBlob(this.settings.vaultId, blobId);
-    return envelope ? decryptBlob(await this.host.loadVaultKeys(), this.settings.vaultId, blobId, envelope) : null;
+    return envelope ? await decryptBlob(await this.host.loadVaultKeys(), this.settings.vaultId, blobId, envelope) : null;
   }
 
   private handleError(label: string, error: unknown): void {

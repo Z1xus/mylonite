@@ -1,5 +1,6 @@
 import * as Y from "yjs";
 
+import { idle } from "./idle";
 import { newFileId, newOpId } from "./ops";
 import { StoreTx, SyncStore } from "./store";
 import { FileKind, FileRecord, OutboxEntry, SyncOp } from "./sync-types";
@@ -14,7 +15,7 @@ export interface ReplicaDeps {
   deviceId: string;
   store: SyncStore;
   clientId: number;
-  blobId(bytes: Uint8Array): string;
+  blobId(bytes: Uint8Array): Promise<string>;
   fetchBlob(blobId: string): Promise<Uint8Array | null>;
   legacyClean(path: string, content: string | Uint8Array, stat: FileStat): boolean;
   legacyAncestor(path: string, content: string | Uint8Array): boolean;
@@ -159,7 +160,7 @@ export class Replica {
       if (candidates.length === 0) {
         continue;
       }
-      const hash = kind === "text" ? hashText(await io.readText(stat.path)) : this.deps.blobId(await io.readBytes(stat.path));
+      const hash = kind === "text" ? hashText(await io.readText(stat.path)) : await this.deps.blobId(await io.readBytes(stat.path));
       const matches = candidates.filter((record) => record.hash === hash);
       if (matches.length !== 1) {
         continue;
@@ -200,7 +201,7 @@ export class Replica {
       return null;
     }
     const bytes = await this.deps.io.readBytes(record.path);
-    const blob = this.deps.blobId(bytes);
+    const blob = await this.deps.blobId(bytes);
     if (op.blob === blob) {
       return { entry, bytes };
     }
@@ -405,7 +406,7 @@ export class Replica {
     const room = await this.makeRoom(target, {
       id,
       content: bytes,
-      matches: async (at) => this.deps.blobId(await this.deps.io.readBytes(at)) === blob,
+      matches: async (at) => await this.deps.blobId(await this.deps.io.readBytes(at)) === blob,
     });
     if (room === "write") {
       await this.deps.io.writeBytes(target, bytes);
@@ -486,7 +487,7 @@ export class Replica {
     }
     const same = holder !== undefined && !holder.deleted && io.stat(holder.path) !== null && (record.kind === "text"
       ? await io.readText(record.path) === await io.readText(holder.path)
-      : this.deps.blobId(await io.readBytes(record.path)) === holder.hash);
+      : await this.deps.blobId(await io.readBytes(record.path)) === holder.hash);
     if (same) {
       await io.trash(record.path);
     } else {
@@ -577,7 +578,7 @@ export class Replica {
       return false;
     }
     const { io } = this.deps;
-    const hash = record.kind === "text" ? hashText(await io.readText(record.path)) : this.deps.blobId(await io.readBytes(record.path));
+    const hash = record.kind === "text" ? hashText(await io.readText(record.path)) : await this.deps.blobId(await io.readBytes(record.path));
     return hash !== record.hash;
   }
 
@@ -724,8 +725,4 @@ function creationOf(op: SyncOp, author: string): Creation | undefined {
     return { kind: "blob", hash: op.blob, author };
   }
   return undefined;
-}
-
-function idle(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 0));
 }

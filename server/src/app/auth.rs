@@ -1,5 +1,6 @@
 use axum::http::HeaderMap;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use sha2::{Digest, Sha256};
 use tokio::task;
 
 use super::{ApiError, AppState};
@@ -36,7 +37,12 @@ pub(super) async fn verify_device_signature(
             .try_into()
             .map_err(|_| anyhow::anyhow!("invalid Ed25519 signature length"))?,
     );
-    let payload = format!("{}\n{}\n{}", method.to_uppercase(), path, hex_encode(body));
+    let body_part = if headers.contains_key("x-mylonite-body-sha256") {
+        hex_encode(&Sha256::digest(body))
+    } else {
+        hex_encode(body)
+    };
+    let payload = format!("{}\n{}\n{}", method.to_uppercase(), path, body_part);
     verifying_key.verify(payload.as_bytes(), &signature)?;
     Ok(device_id)
 }

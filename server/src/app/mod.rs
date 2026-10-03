@@ -267,6 +267,7 @@ fn api_cors_layer() -> CorsLayer {
             HeaderName::from_static("content-type"),
             HeaderName::from_static("x-mylonite-device-id"),
             HeaderName::from_static("x-mylonite-signature"),
+            HeaderName::from_static("x-mylonite-body-sha256"),
         ])
 }
 
