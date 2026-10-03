@@ -79,9 +79,8 @@ export class MyloniteSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Server URL")
-      .setDesc("Used to reach your Mylonite server.")
+      .setDesc("The address of your sync server.")
       .addText((text) => text
-        .setPlaceholder("http://127.0.0.1:9821")
         .setValue(this.host.settings.serverUrl)
         .onChange(async (value) => {
           this.host.settings.serverUrl = value.trim();
@@ -193,7 +192,6 @@ export class MyloniteSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Pairing token")
       .addText((text) => text
-        .setPlaceholder("p...")
         .setValue(this.host.settings.pairingToken)
         .onChange(async (value) => {
           this.host.settings.pairingToken = value.trim();
@@ -209,7 +207,7 @@ export class MyloniteSettingTab extends PluginSettingTab {
 
     new Setting(containerEl).setName("Join an existing vault").setHeading();
     containerEl.createEl("p", {
-      text: "Scan the invite QR code or enter the invite code from a paired device.",
+      text: "Scan the invite or enter the invite code from a paired device.",
       cls: "setting-item-description",
     });
 
@@ -273,11 +271,11 @@ export class MyloniteSettingTab extends PluginSettingTab {
       cls: "mylonite-invite-qr",
     });
     const details = wrap.createDiv({ cls: "mylonite-invite-details" });
-    details.createEl("div", { text: invite.invite_code, cls: "mylonite-invite-code" });
-    details.createEl("div", { text: invite.server_url, cls: "setting-item-description mylonite-invite-server" });
+    details.createDiv({ text: invite.invite_code, cls: "mylonite-invite-code" });
+    details.createDiv({ text: invite.server_url, cls: "setting-item-description mylonite-invite-server" });
     new Setting(details)
       .setName("Invite link")
-      .setDesc("Use this when the QR code is unavailable.")
+      .setDesc("Use this when you can't scan the code.")
       .addButton((button) => button
         .setButtonText("Copy")
         .onClick(async () => {

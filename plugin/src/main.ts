@@ -59,12 +59,12 @@ export default class MylonitePlugin extends Plugin {
 
     this.addCommand({
       id: "show-sync-status",
-      name: "show sync status",
+      name: "Show sync status",
       callback: () => new Notice(this.syncEngine.statusSummary()),
     });
     this.addCommand({
       id: "sync-now",
-      name: "sync now",
+      name: "Sync now",
       callback: () => void this.syncEngine.syncNow().catch((error: unknown) => new Notice(`Couldn't sync. Check the server URL and connection. ${String(error)}`)),
     });
 

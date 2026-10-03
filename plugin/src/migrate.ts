@@ -41,7 +41,8 @@ export function readLegacyState(stored: Record<string, unknown>): LegacyState | 
 
 export function markLegacyEdit(hints: Record<string, LegacyHint>, change: unknown): void {
   const value = change as { kind?: unknown; path?: unknown; oldPath?: unknown; newPath?: unknown; affectedPaths?: unknown; baseHash?: unknown } | null;
-  const paths = [value?.path, value?.oldPath, value?.newPath, ...(Array.isArray(value?.affectedPaths) ? value.affectedPaths : [])]
+  const affected: unknown[] = Array.isArray(value?.affectedPaths) ? value.affectedPaths : [];
+  const paths = [value?.path, value?.oldPath, value?.newPath, ...affected]
     .filter((path): path is string => typeof path === "string");
   for (const path of new Set(paths)) {
     if (hints[path]?.dirty) {

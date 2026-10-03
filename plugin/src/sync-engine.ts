@@ -226,7 +226,7 @@ export class SyncEngine {
       io,
       deviceId: this.settings.deviceId,
       store,
-      clientId: clientId as number,
+      clientId,
       blobId: (bytes) => this.blobId(bytes),
       fetchBlob: async (blobId) => this.fetchBlob(blobId),
       legacyClean: (path, content, stat) => isLegacyClean(session.hints, path, content, stat),

@@ -117,6 +117,14 @@ Manual install: download [mylonite-obsidian-plugin.zip](https://github.com/z1xus
 
 Enable Mylonite in Obsidian's community plugins list, then open its settings.
 
+### Disclosures
+
+- The plugin needs a Mylonite server that you host. There is no account and no paid service.
+- It connects only to the server URL you enter. It sends vault data encrypted on your device.
+- It has no telemetry and no ads.
+- It reads and writes files only in your vault and in its own plugin folder.
+- The bundle includes [Loro](https://github.com/loro-dev/loro) (MIT) compiled to WebAssembly.
+
 ## Pairing
 
 The first device must be paired with the pairing token. Every other device joins through a short-lived invite approved by an already-paired device.

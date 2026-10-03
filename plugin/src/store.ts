@@ -54,7 +54,7 @@ class IdbStore implements SyncStore {
       request(tx.objectStore("meta").getAll()),
     ]);
     const meta = new Map<string, unknown>();
-    metaKeys.forEach((key, index) => meta.set(String(key), metaValues[index]));
+    metaKeys.forEach((key, index) => meta.set(key as string, metaValues[index]));
     return {
       files: files as FileRecord[],
       outbox: (outbox as OutboxEntry[]).sort((a, b) => a.key - b.key),
