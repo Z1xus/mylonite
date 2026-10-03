@@ -2,7 +2,7 @@ import esbuild from "esbuild";
 import { readFile } from "fs/promises";
 import { createRequire } from "module";
 import process from "process";
-import { gzipSync } from "zlib";
+import { constants, zstdCompressSync } from "zlib";
 
 const production = process.argv[2] === "production";
 // SecretStorage is missing on mobile, so secrets fall back to plugin data
@@ -24,13 +24,13 @@ await esbuild.build({
   minify: production,
   outfile: "main.js",
   plugins: [{
-    name: "loro-wasm-gzip",
+    name: "loro-wasm-zstd",
     setup(build) {
-      build.onResolve({ filter: /^loro-wasm-gzip$/ }, () => ({
+      build.onResolve({ filter: /^loro-wasm-zstd$/ }, () => ({
         path: createRequire(import.meta.url).resolve("loro-crdt/web/loro_wasm_bg.wasm"),
       }));
       build.onLoad({ filter: /\.wasm$/ }, async (args) => ({
-        contents: gzipSync(await readFile(args.path), { level: 9 }),
+        contents: zstdCompressSync(await readFile(args.path), { params: { [constants.ZSTD_c_compressionLevel]: 22 } }),
         loader: "binary",
       }));
     },

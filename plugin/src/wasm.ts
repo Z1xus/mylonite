@@ -1,6 +1,6 @@
-import loroWasmGzip from "loro-wasm-gzip";
+import { decompress } from "fzstd";
+import loroWasmZstd from "loro-wasm-zstd";
 
-export function loroWasm(): Promise<ArrayBuffer> {
-  const stream = new Blob([loroWasmGzip as BlobPart]).stream().pipeThrough(new DecompressionStream("gzip"));
-  return new Response(stream).arrayBuffer();
+export function loroWasm(): Uint8Array {
+  return decompress(loroWasmZstd);
 }

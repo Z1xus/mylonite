@@ -211,7 +211,7 @@ export class SyncEngine {
     while (typeof clientId !== "number" || clientId === 0) {
       clientId = crypto.getRandomValues(new Uint32Array(1))[0];
     }
-    await initText(await loroWasm());
+    await initText(loroWasm());
     const io = new ObsidianVaultIO(this.host.app);
     this.blobKeys = await this.host.loadVaultKeys();
     const session = {

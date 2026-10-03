@@ -11,6 +11,7 @@
     "@noble/hashes": "^2.4.0",
     "@types/node": "^26.6.4",
     "esbuild": "^0.28.2",
+    "fzstd": "^0.1.1",
     "loro-crdt": "1.16.4",
     "obsidian": "^1.13.1",
     "qrcode-generator": "^2.0.4",
