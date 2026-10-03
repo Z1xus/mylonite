@@ -53,11 +53,7 @@ pub struct LimitsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotConfig {
-    pub ops_interval: u64,
-    pub time_interval_hours: u64,
-    pub tail_size_mb: u64,
     pub retain: u32,
-    pub safety_tail_ops: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,13 +88,7 @@ impl Default for Config {
                 max_op_ciphertext_kb: default_max_op_ciphertext_kb(),
                 max_snapshot_ciphertext_mb: default_max_snapshot_ciphertext_mb(),
             },
-            snapshots: SnapshotConfig {
-                ops_interval: 1000,
-                time_interval_hours: 24,
-                tail_size_mb: 16,
-                retain: 3,
-                safety_tail_ops: 100,
-            },
+            snapshots: SnapshotConfig { retain: 3 },
             log: LogConfig {
                 level: "info".to_string(),
                 format: "compact".to_string(),

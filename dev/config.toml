@@ -20,11 +20,7 @@ max_op_ciphertext_kb = 1024
 max_snapshot_ciphertext_mb = 256
 
 [snapshots]
-ops_interval = 1000
-time_interval_hours = 24
-tail_size_mb = 16
 retain = 3
-safety_tail_ops = 100
 
 [log]
 level = "info"

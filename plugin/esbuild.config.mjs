@@ -2,8 +2,7 @@ import esbuild from "esbuild";
 import process from "process";
 
 const production = process.argv[2] === "production";
-// mylonite falls back to storing secrets in plugin data storage because SecretStorage is not available on mobile
-// maybe the day will come when they actually implement it, then we can remove this fallback
+// SecretStorage is missing on mobile, so secrets fall back to plugin data
 const allowPluginDataSecrets =
   process.env.MYLONITE_DISABLE_PLUGIN_DATA_SECRETS !== "1";
 

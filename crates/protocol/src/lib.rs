@@ -95,12 +95,9 @@ impl Frame {
         }
     }
 
-    /// Encodes the frame into the public Mylonite wire format.
-    ///
     /// # Errors
     ///
-    /// Returns [`FrameError::PayloadTooLarge`] when the payload cannot fit in
-    /// the protocol length field or exceeds the configured frame limit.
+    /// Returns [`FrameError::PayloadTooLarge`] for payloads over the frame limit.
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
         let payload_len =
             u32::try_from(self.payload.len()).map_err(|_| FrameError::PayloadTooLarge)?;
@@ -118,12 +115,9 @@ impl Frame {
         Ok(out)
     }
 
-    /// Decodes a complete public Mylonite wire-format frame.
-    ///
     /// # Errors
     ///
-    /// Returns a [`FrameError`] when the header is malformed, the version is not
-    /// supported, the announced payload is too large, or the payload is incomplete.
+    /// Returns a [`FrameError`] for malformed or incomplete frames.
     pub fn decode(bytes: &[u8]) -> Result<Self, FrameError> {
         if bytes.len() < HEADER_LEN {
             return Err(FrameError::ShortHeader);
