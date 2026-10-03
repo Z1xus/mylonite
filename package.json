@@ -11,6 +11,7 @@
     "@noble/hashes": "^2.4.0",
     "@types/node": "^26.6.4",
     "esbuild": "^0.28.2",
+    "lib0": "^0.2.119",
     "obsidian": "^1.13.1",
     "qrcode-generator": "^2.0.4",
     "typescript": "^7.0.2",

@@ -20,7 +20,7 @@
     "@noble/ciphers": "^2.4.0",
     "@noble/curves": "^2.4.0",
     "@noble/hashes": "^2.4.0",
-    "lib0": "0.2.117",
+    "lib0": "^0.2.119",
     "qrcode-generator": "^2.0.4",
     "yjs": "^13.6.33"
   }
