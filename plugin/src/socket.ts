@@ -33,6 +33,12 @@ export class LiveSocket {
     this.drop();
   }
 
+  push(op: object): void {
+    if (this.socket) {
+      this.send(this.socket, ClientMsgKind.OpPush, JSON.stringify(op));
+    }
+  }
+
   private connect(): void {
     if (this.stopped || this.socket) {
       return;

@@ -6,6 +6,12 @@ import { bytesToHex } from "./crypto";
 
 export type TextDoc = LoroDoc;
 
+export interface TextChange {
+  from: number;
+  to: number;
+  insert: string;
+}
+
 const TEXT_KEY = "t";
 const LINE_DIFF_CHARS = 64 * 1024;
 const encoder = new TextEncoder();
@@ -33,6 +39,29 @@ export function encodeDoc(doc: TextDoc): Uint8Array {
 
 export function applyUpdate(doc: TextDoc, update: Uint8Array): void {
   doc.import(update);
+}
+
+export function importChanges(doc: TextDoc, update: Uint8Array): TextChange[] {
+  const from = doc.frontiers();
+  doc.import(update);
+  const changes: TextChange[] = [];
+  for (const [, diff] of doc.diff(from, doc.frontiers(), false)) {
+    if (diff.type !== "text") {
+      continue;
+    }
+    let position = 0;
+    for (const op of diff.diff) {
+      if (op.retain !== undefined) {
+        position += op.retain;
+      } else if (op.delete !== undefined) {
+        changes.push({ from: position, to: position + op.delete, insert: "" });
+        position += op.delete;
+      } else if (op.insert !== undefined) {
+        changes.push({ from: position, to: position, insert: op.insert });
+      }
+    }
+  }
+  return changes;
 }
 
 export function setText(doc: TextDoc, next: string): Uint8Array | null {

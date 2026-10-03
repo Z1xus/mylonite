@@ -1,6 +1,6 @@
 import { Notice, Plugin, TAbstractFile, TFile } from "obsidian";
 
-import { ApiError, EncryptedOpRecord, MyloniteApiClient } from "./api";
+import { ApiError, EncryptedOpRecord, MyloniteApiClient, OP_FORMAT } from "./api";
 import { VaultKeys, randomHex } from "./crypto";
 import { idle } from "./idle";
 import { LegacyState, isLegacyAncestor, isLegacyClean, markLegacyEdit } from "./migrate";
@@ -20,7 +20,8 @@ const YIELD_EVERY = 32;
 const BATCH_OPS = 128;
 const BATCH_BYTES = 1_000_000;
 const INLINE_UPDATE_BYTES = 256 * 1024;
-const LOCAL_DEBOUNCE_MS = 300;
+const LIVE_UPDATE_BYTES = 64 * 1024;
+const LOCAL_DEBOUNCE_MS = 100;
 const TICK_MS = 15_000;
 const LIVE_POLL_MS = 60_000;
 const RETRY_DELAYS_MS = [2_000, 5_000, 15_000, 30_000, 60_000];
@@ -53,6 +54,7 @@ export class SyncEngine {
   private chain: Promise<unknown> = Promise.resolve();
   private readonly pendingPaths = new Set<string>();
   private readonly pendingRenames: Array<[string, string]> = [];
+  private readonly pushed = new Set<string>();
   private localTimer: number | null = null;
   private retryTimer: number | null = null;
   private retryAttempt = 0;
@@ -106,7 +108,7 @@ export class SyncEngine {
   async resync(): Promise<void> {
     await this.run("flush before resync", async () => {
       if (this.session) {
-        await this.flush(this.session);
+        await this.flush(this.session, false);
       }
     }).catch(() => undefined);
     await this.destroy();
@@ -159,7 +161,7 @@ export class SyncEngine {
     if (!session) {
       return "Sync stopped.";
     }
-    const waiting = session.replica.outbox.length;
+    const waiting = this.waiting(session);
     return [
       `${session.replica.fileCount} files tracked`,
       `${waiting} ${waiting === 1 ? "change" : "changes"} waiting`,
@@ -191,6 +193,11 @@ export class SyncEngine {
         this.scheduleLocal();
       } else {
         mark(file);
+      }
+    }));
+    this.host.registerEvent(this.host.app.workspace.on("editor-change", (_editor, info) => {
+      if (info.file) {
+        this.syncEditor(info.file.path);
       }
     }));
     this.host.registerInterval(window.setInterval(() => {
@@ -251,6 +258,7 @@ export class SyncEngine {
       onRecord: (record) => void this.run("live op", async () => this.applyLive(record)).catch(() => undefined),
       onLive: (live) => {
         this.live = live;
+        this.pushed.clear();
         if (live) {
           void this.run("reconnect", async () => this.syncOnce()).catch(() => undefined);
         }
@@ -305,7 +313,7 @@ export class SyncEngine {
     }
     await this.catchUp(session);
     await this.drainLocal(session);
-    await this.flush(session);
+    await this.flush(session, false);
     this.lastSyncAt = Date.now();
   }
 
@@ -416,9 +424,11 @@ export class SyncEngine {
       await this.applyRecord(session, record as EncryptedOpRecord);
       session.replica.setMeta("cursor", session.cursor);
       await session.replica.commit();
-      await this.drainLocal(session);
     } else if (seq > session.cursor + 1) {
       await this.catchUp(session);
+    }
+    if (session.replica.dirty.size > 0) {
+      this.scheduleLocal();
     }
   }
 
@@ -469,6 +479,17 @@ export class SyncEngine {
     }, LOCAL_DEBOUNCE_MS);
   }
 
+  private syncEditor(path: string): void {
+    void this.run("editor change", async () => {
+      const session = this.session;
+      if (session && session.cursor !== undefined) {
+        await session.replica.scanOpen(path);
+        await session.replica.commit();
+        await this.flush(session);
+      }
+    });
+  }
+
   private async drainLocal(session: Session): Promise<void> {
     if (session.cursor === undefined) {
       return;
@@ -496,10 +517,20 @@ export class SyncEngine {
     await session.replica.commit();
   }
 
-  private async flush(session: Session): Promise<void> {
+  private async flush(session: Session, live = this.live): Promise<void> {
     const client = this.host.createApiClient();
     const keys = await this.host.loadVaultKeys();
     const { replica } = session;
+    if (live && replica.outbox.every((entry) => isLiveOp(entry.op))) {
+      for (const entry of replica.outbox) {
+        if (!this.pushed.has(entry.opId)) {
+          session.socket.push({ format: OP_FORMAT, ...encryptOp(keys, this.settings.vaultId, this.settings.deviceId, entry.opId, toWire(entry.op)) });
+          this.pushed.add(entry.opId);
+        }
+      }
+      return;
+    }
+    this.pushed.clear();
     while (replica.outbox.length > 0) {
       await idle();
       const ready: OutboxEntry[] = [];
@@ -593,7 +624,7 @@ export class SyncEngine {
       this.host.updateStatus("Update server to sync");
       return;
     }
-    const waiting = this.session?.replica.outbox.length ?? 0;
+    const waiting = this.session ? this.waiting(this.session) : 0;
     this.host.updateStatus(waiting > 0 ? `Can't sync, ${waiting} waiting` : "Can't sync");
     this.scheduleRetry();
   }
@@ -615,8 +646,12 @@ export class SyncEngine {
     if (!session) {
       return;
     }
-    const waiting = session.replica.outbox.length;
+    const waiting = this.waiting(session);
     this.host.updateStatus(waiting > 0 ? `${waiting} waiting` : "Synced");
+  }
+
+  private waiting(session: Session): number {
+    return session.replica.outbox.filter((entry) => !this.pushed.has(entry.opId)).length;
   }
 
   private showNotices(): void {
@@ -637,6 +672,10 @@ export class SyncEngine {
     this.localTimer = null;
     this.retryTimer = null;
   }
+}
+
+function isLiveOp(op: SyncOp): boolean {
+  return op.t === "move" || op.t === "delete" || (op.t === "text" && op.update.byteLength <= LIVE_UPDATE_BYTES);
 }
 
 function numberOrUndefined(value: unknown): number | undefined {

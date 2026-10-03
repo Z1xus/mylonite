@@ -1,6 +1,7 @@
-import { App, TFile, normalizePath } from "obsidian";
+import { App, MarkdownView, TFile, normalizePath } from "obsidian";
 
 import { FileKind } from "./sync-types";
+import { TextChange } from "./text";
 
 export interface FileStat {
   path: string;
@@ -8,9 +9,15 @@ export interface FileStat {
   size: number;
 }
 
+export interface OpenText {
+  read(): string;
+  apply(changes: TextChange[]): void;
+}
+
 export interface VaultIO {
   list(): FileStat[];
   stat(path: string): FileStat | null;
+  openText(path: string): OpenText | null;
   readText(path: string): Promise<string>;
   readBytes(path: string): Promise<Uint8Array>;
   writeText(path: string, text: string): Promise<void>;
@@ -51,6 +58,22 @@ export class ObsidianVaultIO implements VaultIO {
   stat(path: string): FileStat | null {
     const file = this.app.vault.getFileByPath(path);
     return file ? toStat(file) : null;
+  }
+
+  openText(path: string): OpenText | null {
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const view = leaf.view;
+      if (view instanceof MarkdownView && view.file?.path === path && view.getMode() === "source") {
+        const editor = view.editor;
+        return {
+          read: () => editor.getValue(),
+          apply: (changes) => editor.transaction({
+            changes: changes.map((change) => ({ from: editor.offsetToPos(change.from), to: editor.offsetToPos(change.to), text: change.insert })),
+          }),
+        };
+      }
+    }
+    return null;
   }
 
   readText(path: string): Promise<string> {

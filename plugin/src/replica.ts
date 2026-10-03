@@ -2,7 +2,7 @@ import { idle } from "./idle";
 import { newFileId, newOpId } from "./ops";
 import { StoreTx, SyncStore } from "./store";
 import { FileKind, FileRecord, OutboxEntry, SyncOp } from "./sync-types";
-import { TextDoc, applyUpdate, encodeDoc, hashText, openDoc, setText, textOf } from "./text";
+import { TextDoc, applyUpdate, encodeDoc, hashText, importChanges, openDoc, setText, textOf } from "./text";
 import { FileStat, VaultIO, conflictPath, kindOf } from "./vault-io";
 
 const DOC_CACHE_SIZE = 32;
@@ -109,11 +109,24 @@ export class Replica {
       return;
     }
     const doc = await this.doc(record.id);
+    const open = io.openText(path)?.read();
+    if (open !== undefined && open !== content) {
+      this.ingestOpen(record, doc, open);
+      return;
+    }
     if (record.ahead && hashText(content) === record.hash) {
       await this.writeAhead(record, doc, content);
       return;
     }
     this.ingest(record, doc, content, stat);
+  }
+
+  async scanOpen(path: string): Promise<void> {
+    const record = this.recordAt(path);
+    const open = this.deps.io.openText(path)?.read();
+    if (record?.kind === "text" && open !== undefined) {
+      this.ingestOpen(record, await this.doc(record.id), open);
+    }
   }
 
   async rename(from: string, to: string): Promise<void> {
@@ -294,6 +307,18 @@ export class Replica {
   private async applyTextUpdate(record: FileRecord, update: Uint8Array): Promise<void> {
     const { io } = this.deps;
     const doc = await this.doc(record.id);
+    const open = io.openText(record.path);
+    if (open) {
+      record = this.ingestOpen(record, doc, open.read());
+      const changes = importChanges(doc, update);
+      this.saveDoc(record.id, doc);
+      if (changes.length > 0) {
+        open.apply(changes);
+        this.put({ ...record, ahead: true });
+        await this.commit();
+      }
+      return;
+    }
     const stat = io.stat(record.path);
     let disk: string | undefined;
     if (stat && (record.ahead || stat.mtime !== record.mtime || stat.size !== record.size)) {
@@ -329,12 +354,21 @@ export class Replica {
   }
 
   private ingest(record: FileRecord, doc: TextDoc, content: string, stat: FileStat): FileRecord {
+    this.absorb(record.id, doc, content);
+    return this.put({ ...record, ahead: false, hash: hashText(content), size: stat.size, mtime: stat.mtime });
+  }
+
+  private ingestOpen(record: FileRecord, doc: TextDoc, content: string): FileRecord {
+    return this.absorb(record.id, doc, content) ? this.put({ ...record, ahead: true }) : record;
+  }
+
+  private absorb(id: string, doc: TextDoc, content: string): boolean {
     const update = setText(doc, content);
     if (update) {
-      this.saveDoc(record.id, doc);
-      this.enqueueText(record.id, update);
+      this.saveDoc(id, doc);
+      this.enqueueText(id, update);
     }
-    return this.put({ ...record, ahead: false, hash: hashText(content), size: stat.size, mtime: stat.mtime });
+    return update !== null;
   }
 
   private async applyBlob(op: Extract<SyncOp, { t: "blob" }>, author: string): Promise<void> {
