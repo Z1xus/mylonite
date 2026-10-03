@@ -30,7 +30,7 @@ sudo install -m 0755 /tmp/mylonite /usr/local/bin/mylonite
 mylonite --version
 ```
 
-Other platforms: grab the matching binary from Releases and place it on your `PATH`.
+For ARM64 Linux, such as a Raspberry Pi, use `mylonite-aarch64-unknown-linux-gnu`. Other platforms: grab the matching binary from Releases and place it on your `PATH`.
 
 Release assets are signed with GitHub artifact attestations. After downloading a binary or plugin zip, verify its provenance with the GitHub CLI:
 

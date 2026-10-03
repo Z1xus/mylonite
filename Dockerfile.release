@@ -1,7 +1,7 @@
-FROM debian:trixie-slim
+FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
+ARG TARGETARCH
 RUN useradd --system --create-home --home-dir /var/lib/mylonite mylonite
-COPY dist/mylonite-x86_64-unknown-linux-gnu /usr/local/bin/mylonite
-RUN chmod 755 /usr/local/bin/mylonite
+COPY dist/${TARGETARCH}/mylonite /usr/local/bin/mylonite
 USER mylonite
 WORKDIR /var/lib/mylonite
 EXPOSE 9821

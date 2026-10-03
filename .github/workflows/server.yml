@@ -1,0 +1,37 @@
+name: Server
+
+on:
+  push:
+    branches: [main]
+    paths: [Cargo.*, rust-toolchain.toml, server/**, crates/**, .github/workflows/server.yml]
+  pull_request:
+    paths: [Cargo.*, rust-toolchain.toml, server/**, crates/**, .github/workflows/server.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: server-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: server-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace

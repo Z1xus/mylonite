@@ -1,0 +1,32 @@
+name: Plugin
+
+on:
+  push:
+    branches: [main]
+    paths: [package.json, bun.lock, plugin/**, .github/workflows/plugin.yml]
+  pull_request:
+    paths: [package.json, bun.lock, plugin/**, .github/workflows/plugin.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plugin-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: plugin
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2.2.0
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - run: bun run test
+      - run: bun run build
