@@ -4,121 +4,88 @@ import { MyloniteSettings } from "./settings";
 
 declare const __MYLONITE_ALLOW_PLUGIN_DATA_SECRETS__: boolean | undefined;
 
-export interface SecretStorage {
-  getSecret(id: string): string | null;
-  setSecret(id: string, secret: string): void;
-}
+type SecretField = "devicePrivateKeyHex" | "passphraseDevelopmentFallback" | "devicePairingPrivateKeyHex";
 
-export function secretStorage(app: App): SecretStorage | null {
-  const candidate = (app as unknown as Record<string, unknown>)["secretStorage"];
-  return isSecretStorage(candidate) ? candidate : null;
-}
+const SECRET_IDS: Record<SecretField, string> = {
+  devicePrivateKeyHex: "mylonite-device-key",
+  passphraseDevelopmentFallback: "mylonite-vault-passphrase",
+  devicePairingPrivateKeyHex: "mylonite-device-pairing-x25519-key",
+};
 
-export function loadDevicePrivateKey(app: App, settings: MyloniteSettings): string {
-  const storage = secretStorage(app);
-  if (storage) {
-    return storage.getSecret("mylonite-device-key") ?? "";
+function loadSecret(app: App, settings: MyloniteSettings, field: SecretField): string {
+  const storage = app.secretStorage as App["secretStorage"] | undefined;
+  if (!storage) {
+    assertPluginDataAllowed();
+    return settings[field];
   }
-  assertPluginDataSecretFallbackAllowed();
-  return settings.devicePrivateKeyHex;
-}
-
-export function loadPassphrase(app: App, settings: MyloniteSettings): string {
-  const storage = secretStorage(app);
-  if (storage) {
-    return storage.getSecret("mylonite-vault-passphrase") ?? "";
+  const stored = storage.getSecret(SECRET_IDS[field]);
+  if (stored) {
+    return stored;
   }
-  assertPluginDataSecretFallbackAllowed();
-  return settings.passphraseDevelopmentFallback;
+  if (settings[field]) {
+    storage.setSecret(SECRET_IDS[field], settings[field]);
+    const value = settings[field];
+    settings[field] = "";
+    return value;
+  }
+  return "";
 }
 
-export function storeDevicePrivateKey(app: App, settings: MyloniteSettings, privateKeyHex: string): void {
-  const storage = secretStorage(app);
+function storeSecret(app: App, settings: MyloniteSettings, field: SecretField, value: string): void {
+  const storage = app.secretStorage as App["secretStorage"] | undefined;
   if (storage) {
-    storage.setSecret("mylonite-device-key", privateKeyHex);
-    settings.devicePrivateKeyHex = "";
-    settings.devicePrivateKeyStorage = "secret-storage";
+    storage.setSecret(SECRET_IDS[field], value);
+    settings[field] = "";
     return;
   }
-  assertPluginDataSecretFallbackAllowed();
-  settings.devicePrivateKeyHex = privateKeyHex;
-  settings.devicePrivateKeyStorage = "plugin-data";
-}
-
-export function storePassphrase(app: App, settings: MyloniteSettings, passphrase: string): void {
-  const storage = secretStorage(app);
-  if (storage) {
-    storage.setSecret("mylonite-vault-passphrase", passphrase);
-    settings.passphraseDevelopmentFallback = "";
-    settings.passphraseStorage = "secret-storage";
-    return;
+  if (value) {
+    assertPluginDataAllowed();
   }
-  assertPluginDataSecretFallbackAllowed();
-  settings.passphraseDevelopmentFallback = passphrase;
-  settings.passphraseStorage = "plugin-data";
+  settings[field] = value;
 }
 
-export function clearDevicePrivateKey(app: App, settings: MyloniteSettings): void {
-  const storage = secretStorage(app);
-  if (storage) {
-    storage.setSecret("mylonite-device-key", "");
-  }
-  settings.devicePrivateKeyHex = "";
-  settings.devicePrivateKeyStorage = "none";
-}
-
-export function clearPassphrase(app: App, settings: MyloniteSettings): void {
-  const storage = secretStorage(app);
-  if (storage) {
-    storage.setSecret("mylonite-vault-passphrase", "");
-  }
-  settings.passphraseDevelopmentFallback = "";
-  settings.passphraseStorage = "none";
-}
-
-export function loadDevicePairingPrivateKey(app: App, settings: MyloniteSettings): string {
-  const storage = secretStorage(app);
-  if (storage) {
-    return storage.getSecret("mylonite-device-pairing-x25519-key") ?? "";
-  }
-  assertPluginDataSecretFallbackAllowed();
-  return settings.devicePairingPrivateKeyHex;
-}
-
-export function storeDevicePairingPrivateKey(app: App, settings: MyloniteSettings, privateKeyHex: string): void {
-  const storage = secretStorage(app);
-  if (storage) {
-    storage.setSecret("mylonite-device-pairing-x25519-key", privateKeyHex);
-    settings.devicePairingPrivateKeyHex = "";
-    return;
-  }
-  assertPluginDataSecretFallbackAllowed();
-  settings.devicePairingPrivateKeyHex = privateKeyHex;
-}
-
-export function clearDevicePairingPrivateKey(app: App, settings: MyloniteSettings): void {
-  const storage = secretStorage(app);
-  if (storage) {
-    storage.setSecret("mylonite-device-pairing-x25519-key", "");
-  }
-  settings.devicePairingPrivateKeyHex = "";
-}
-
-function assertPluginDataSecretFallbackAllowed(): void {
-  if (!pluginDataSecretFallbackAllowed()) {
+function assertPluginDataAllowed(): void {
+  if (typeof __MYLONITE_ALLOW_PLUGIN_DATA_SECRETS__ === "boolean" && !__MYLONITE_ALLOW_PLUGIN_DATA_SECRETS__) {
     throw new Error("SecretStorage is unavailable and plugin-data secret fallback is disabled in this build");
   }
 }
 
-function pluginDataSecretFallbackAllowed(): boolean {
-  return typeof __MYLONITE_ALLOW_PLUGIN_DATA_SECRETS__ === "boolean"
-    ? __MYLONITE_ALLOW_PLUGIN_DATA_SECRETS__
-    : true;
+export function loadDevicePrivateKey(app: App, settings: MyloniteSettings): string {
+  return loadSecret(app, settings, "devicePrivateKeyHex");
 }
 
-function isSecretStorage(value: unknown): value is SecretStorage {
-  return typeof value === "object"
-    && value !== null
-    && typeof (value as Record<string, unknown>)["getSecret"] === "function"
-    && typeof (value as Record<string, unknown>)["setSecret"] === "function";
+export function storeDevicePrivateKey(app: App, settings: MyloniteSettings, privateKeyHex: string): void {
+  storeSecret(app, settings, "devicePrivateKeyHex", privateKeyHex);
+  settings.devicePrivateKeyStorage = app.secretStorage ? "secret-storage" : "plugin-data";
+}
+
+export function clearDevicePrivateKey(app: App, settings: MyloniteSettings): void {
+  storeSecret(app, settings, "devicePrivateKeyHex", "");
+  settings.devicePrivateKeyStorage = "none";
+}
+
+export function loadPassphrase(app: App, settings: MyloniteSettings): string {
+  return loadSecret(app, settings, "passphraseDevelopmentFallback");
+}
+
+export function storePassphrase(app: App, settings: MyloniteSettings, passphrase: string): void {
+  storeSecret(app, settings, "passphraseDevelopmentFallback", passphrase);
+  settings.passphraseStorage = app.secretStorage ? "secret-storage" : "plugin-data";
+}
+
+export function clearPassphrase(app: App, settings: MyloniteSettings): void {
+  storeSecret(app, settings, "passphraseDevelopmentFallback", "");
+  settings.passphraseStorage = "none";
+}
+
+export function loadDevicePairingPrivateKey(app: App, settings: MyloniteSettings): string {
+  return loadSecret(app, settings, "devicePairingPrivateKeyHex");
+}
+
+export function storeDevicePairingPrivateKey(app: App, settings: MyloniteSettings, privateKeyHex: string): void {
+  storeSecret(app, settings, "devicePairingPrivateKeyHex", privateKeyHex);
+}
+
+export function clearDevicePairingPrivateKey(app: App, settings: MyloniteSettings): void {
+  storeSecret(app, settings, "devicePairingPrivateKeyHex", "");
 }

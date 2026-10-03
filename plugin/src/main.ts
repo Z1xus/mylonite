@@ -598,7 +598,7 @@ export default class MylonitePlugin extends Plugin {
   }
 
   refreshSettingsTab(): void {
-    this.settingTab?.render();
+    this.settingTab?.update();
   }
 
   updateStatus(state: string): void {

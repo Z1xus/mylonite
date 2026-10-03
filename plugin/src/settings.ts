@@ -1,4 +1,4 @@
-import { App, Plugin, PluginSettingTab, Setting } from "obsidian";
+import { App, Plugin, PluginSettingTab, Setting, SettingDefinition, SettingDefinitionItem } from "obsidian";
 
 import {
   DevicePairingInvitePayload,
@@ -68,170 +68,168 @@ export class MyloniteSettingTab extends PluginSettingTab {
     super(app, plugin);
   }
 
-  override display(): void {
-    this.render();
-  }
-
-  render(): void {
-    const { containerEl } = this;
-    containerEl.empty();
-    const paired = Boolean(this.host.settings.vaultId && this.host.settings.deviceId);
-
-    new Setting(containerEl)
-      .setName("Server URL")
-      .setDesc("The address of your sync server.")
-      .addText((text) => text
-        .setValue(this.host.settings.serverUrl)
-        .onChange(async (value) => {
-          this.host.settings.serverUrl = value.trim();
-          await this.host.saveSettings();
-        }));
-
-    new Setting(containerEl)
-      .setName("Device label")
-      .setDesc("Shown in the device list.")
-      .addText((text) => text
-        .setPlaceholder("Obsidian device")
-        .setValue(this.host.settings.deviceLabel)
-        .onChange(async (value) => {
-          this.host.settings.deviceLabel = value.trim();
-          await this.host.saveSettings();
-        }));
-
-    if (paired) {
-      this.renderPairedSections(containerEl);
-    } else {
-      this.renderUnpairedSections(containerEl);
-    }
-
-    new Setting(containerEl)
-      .setName("Debug logging")
-      .setDesc("Writes sync details to the developer console.")
-      .addToggle((toggle) => toggle
-        .setValue(this.host.settings.debugLogging)
-        .onChange(async (value) => {
-          this.host.settings.debugLogging = value;
-          await this.host.saveSettings();
-        }));
-  }
-
-  private renderPairedSections(containerEl: HTMLElement): void {
-    new Setting(containerEl).setName("This device").setHeading();
-
-    new Setting(containerEl)
-      .setName("Paired")
-      .setDesc(`Vault ${this.host.settings.vaultId}, device ${this.host.settings.deviceId}.`);
-
-    new Setting(containerEl)
-      .setName("Resync")
-      .setDesc("Downloads the vault again and compares it with your files.")
-      .addButton((button) => button
-        .setButtonText("Resync")
-        .onClick(async () => {
-          await this.host.resync();
-        }));
-
-    new Setting(containerEl)
-      .setName("Unpair device")
-      .setDesc("Removes local credentials and stops syncing this vault.")
-      .addButton((button) => button
-        .setButtonText("Unpair")
-        .onClick(async () => {
-          await this.host.unpairDevice();
-          this.render();
-        }));
-
-    new Setting(containerEl).setName("Add another device").setHeading();
+  override getSettingDefinitions(): SettingDefinitionItem[] {
+    const settings = this.host.settings;
+    const paired = () => Boolean(settings.vaultId && settings.deviceId);
+    const unpaired = () => !paired();
     const invite = this.currentPairingInvite();
     const request = this.currentPairingRequest();
-
-    new Setting(containerEl)
-      .setName(invite ? "Device invite" : "Create invite")
-      .setDesc(invite ? "Scan the QR code or enter the code on the new device." : "Creates a short-lived invite for a new device.")
-      .addButton((button) => button
-        .setButtonText(invite ? "Regenerate" : "Create")
-        .onClick(async () => {
-          await this.host.createDevicePairingInvite();
-          this.render();
-        }));
-
-    if (invite) {
-      this.addInviteDisplay(containerEl, invite);
-    }
-
-    if (request) {
-      this.addSafetyCode(containerEl, request.request_hash);
-      new Setting(containerEl)
-        .setName("Pending device")
-        .setDesc(`Approve ${request.label} only if the safety code matches on the new device.`)
-        .addButton((button) => button
-          .setButtonText("Approve")
-          .setCta()
-          .onClick(async () => {
-            await this.host.authorizeDevicePairingRequest();
-            this.render();
-          }));
-    }
+    return [
+      { name: "Server URL", desc: "The address of your sync server.", control: { type: "text", key: "serverUrl" } },
+      { name: "Device label", desc: "Shown in the device list.", control: { type: "text", key: "deviceLabel", placeholder: "Obsidian device" } },
+      {
+        type: "group",
+        heading: "This device",
+        visible: paired,
+        items: [
+          { name: "Paired", desc: `Vault ${settings.vaultId}, device ${settings.deviceId}.` },
+          {
+            name: "Resync",
+            desc: "Downloads the vault again and compares it with your files.",
+            render: (setting) => void setting.addButton((button) => button.setButtonText("Resync").onClick(() => this.host.resync())),
+          },
+          {
+            name: "Unpair device",
+            desc: "Removes local credentials and stops syncing this vault.",
+            render: (setting) => void setting.addButton((button) => button.setButtonText("Unpair").setDestructive().onClick(async () => {
+              await this.host.unpairDevice();
+              this.update();
+            })),
+          },
+        ],
+      },
+      {
+        type: "group",
+        heading: "Add another device",
+        visible: paired,
+        items: [
+          {
+            name: invite ? "Device invite" : "Create invite",
+            desc: invite ? "Scan the code on the new device, or copy the invite." : "Creates a short-lived invite for a new device.",
+            render: (setting) => void setting.addButton((button) => button.setButtonText(invite ? "Regenerate" : "Create").onClick(async () => {
+              await this.host.createDevicePairingInvite();
+              this.update();
+            })),
+          },
+          {
+            name: "Invite",
+            searchable: false,
+            visible: invite !== null,
+            render: (setting) => {
+              if (invite) {
+                this.renderInvite(setting, invite);
+              }
+            },
+          },
+          this.safetyCode(request),
+          {
+            name: "Pending device",
+            desc: request ? `Approve ${request.label} only if the safety code matches on the new device.` : "",
+            visible: request !== null,
+            render: (setting) => void setting.addButton((button) => button.setButtonText("Approve").setCta().onClick(async () => {
+              await this.host.authorizeDevicePairingRequest();
+              this.update();
+            })),
+          },
+        ],
+      },
+      {
+        type: "group",
+        heading: "First device for a new vault",
+        visible: unpaired,
+        items: [
+          {
+            name: "Pairing token",
+            desc: "Paste the token from `mylonite init`.",
+            render: (setting) => void setting
+              .addText((text) => text.setValue(settings.pairingToken).onChange(async (value) => {
+                settings.pairingToken = value.trim();
+                await this.host.saveSettings();
+              }))
+              .addButton((button) => button.setButtonText("Pair").setCta().onClick(async () => {
+                await this.host.pairFirstDevice();
+                this.update();
+              })),
+          },
+        ],
+      },
+      {
+        type: "group",
+        heading: "Join an existing vault",
+        visible: unpaired,
+        items: [
+          {
+            name: "Invite code",
+            desc: request ? "Waiting for approval on the paired device." : "Scan the invite or enter the code from a paired device.",
+            render: (setting) => {
+              setting.settingEl.addClass("mylonite-code-setting");
+              setting
+                .addTextArea((text) => {
+                  text.setValue(settings.devicePairingInvite).onChange(async (value) => {
+                    settings.devicePairingInvite = value.trim();
+                    await this.host.saveSettings();
+                  });
+                  text.inputEl.rows = 3;
+                  text.inputEl.spellcheck = false;
+                  text.inputEl.addClass("mylonite-code-field");
+                })
+                .addButton((button) => {
+                  button.setButtonText(request ? "Retry" : "Join").onClick(async () => {
+                    await this.host.submitDevicePairingInvite(settings.devicePairingInvite);
+                    this.update();
+                  });
+                  if (!request) {
+                    button.setCta();
+                  }
+                });
+            },
+          },
+          this.safetyCode(request),
+        ],
+      },
+      { name: "Debug logging", desc: "Writes sync details to the developer console.", control: { type: "toggle", key: "debugLogging" } },
+    ];
   }
 
-  private renderUnpairedSections(containerEl: HTMLElement): void {
-    const request = this.currentPairingRequest();
+  override getControlValue(key: string): unknown {
+    return this.host.settings[key as keyof MyloniteSettings];
+  }
 
-    new Setting(containerEl).setName("Pair this device").setHeading();
-    containerEl.createEl("p", {
-      text: request ? "Waiting for approval on an already-paired device." : "Pick the option that matches your situation.",
-      cls: "setting-item-description",
+  override async setControlValue(key: string, value: unknown): Promise<void> {
+    Object.assign(this.host.settings, { [key]: typeof value === "string" ? value.trim() : value });
+    await this.host.saveSettings();
+  }
+
+  private safetyCode(request: DevicePairingRequestPayload | null): SettingDefinition {
+    return {
+      name: "Safety code",
+      desc: "Approve only when this code matches on both devices.",
+      visible: request !== null,
+      render: (setting) => void setting.addText((text) => {
+        text.setValue(request ? pairingSafetyCode(request.request_hash) : "").setDisabled(true);
+        text.inputEl.addClass("mylonite-safety-code");
+      }),
+    };
+  }
+
+  private renderInvite(setting: Setting, invite: DevicePairingInvitePayload): void {
+    setting.settingEl.empty();
+    const wrap = setting.settingEl.createDiv({ cls: "mylonite-invite-panel" });
+    wrap.createEl("img", {
+      attr: { src: qrSvgDataUrl(devicePairingInviteQrUrl(invite)), alt: "Device invite code" },
+      cls: "mylonite-invite-qr",
     });
-
-    new Setting(containerEl).setName("First device for a new vault").setHeading();
-    containerEl.createEl("p", {
-      text: "Paste the pairing token from `mylonite init`.",
-      cls: "setting-item-description",
-    });
-
-    new Setting(containerEl)
-      .setName("Pairing token")
-      .addText((text) => text
-        .setValue(this.host.settings.pairingToken)
-        .onChange(async (value) => {
-          this.host.settings.pairingToken = value.trim();
-          await this.host.saveSettings();
-        }))
-      .addButton((button) => button
-        .setButtonText("Pair")
-        .setCta()
-        .onClick(async () => {
-          await this.host.pairFirstDevice();
-          this.render();
-        }));
-
-    new Setting(containerEl).setName("Join an existing vault").setHeading();
-    containerEl.createEl("p", {
-      text: "Scan the invite or enter the invite code from a paired device.",
-      cls: "setting-item-description",
-    });
-
-    this.addCodeInput(containerEl, {
-      name: "Invite code",
-      desc: "Enter the grouped invite code shown on the paired device.",
-      placeholder: "ABCD-2345-WXYZ",
-      value: this.host.settings.devicePairingInvite,
-      buttonText: request ? "Retry" : "Join",
-      cta: !request,
-      rows: 3,
-      onChange: async (value) => {
-        this.host.settings.devicePairingInvite = value.trim();
-        await this.host.saveSettings();
-      },
-      onButtonClick: async () => {
-        await this.host.submitDevicePairingInvite(this.host.settings.devicePairingInvite);
-        this.render();
-      },
-    });
-
-    if (request) {
-      this.addSafetyCode(containerEl, request.request_hash);
-    }
+    const details = wrap.createDiv({ cls: "mylonite-invite-details" });
+    details.createDiv({ text: invite.invite_code, cls: "mylonite-invite-code" });
+    details.createDiv({ text: invite.server_url, cls: "setting-item-description mylonite-invite-server" });
+    new Setting(details)
+      .setName("Invite link")
+      .setDesc("Use this when you can't scan the code.")
+      .addButton((button) => button.setButtonText("Copy").onClick(() => navigator.clipboard.writeText(devicePairingInviteUrl(invite))));
+    new Setting(details)
+      .setName("Invite code")
+      .setDesc("Use this with the server URL if the link does not open.")
+      .addButton((button) => button.setButtonText("Copy").onClick(() => navigator.clipboard.writeText(devicePairingInviteText(invite))));
   }
 
   private currentPairingInvite(): DevicePairingInvitePayload | null {
@@ -256,96 +254,5 @@ export class MyloniteSettingTab extends PluginSettingTab {
     } catch {
       return null;
     }
-  }
-
-  private addInviteDisplay(containerEl: HTMLElement, invite: DevicePairingInvitePayload): void {
-    const inviteText = devicePairingInviteText(invite);
-    const inviteQrUrl = devicePairingInviteQrUrl(invite);
-    const inviteUrl = devicePairingInviteUrl(invite);
-    const wrap = containerEl.createDiv({ cls: "mylonite-invite-panel" });
-    wrap.createEl("img", {
-      attr: {
-        src: qrSvgDataUrl(inviteQrUrl),
-        alt: "Mylonite device invite QR code",
-      },
-      cls: "mylonite-invite-qr",
-    });
-    const details = wrap.createDiv({ cls: "mylonite-invite-details" });
-    details.createDiv({ text: invite.invite_code, cls: "mylonite-invite-code" });
-    details.createDiv({ text: invite.server_url, cls: "setting-item-description mylonite-invite-server" });
-    new Setting(details)
-      .setName("Invite link")
-      .setDesc("Use this when you can't scan the code.")
-      .addButton((button) => button
-        .setButtonText("Copy")
-        .onClick(async () => {
-          await navigator.clipboard.writeText(inviteUrl);
-        }));
-    new Setting(details)
-      .setName("Invite code")
-      .setDesc("Use this with the server URL if the link does not open.")
-      .addButton((button) => button
-        .setButtonText("Copy")
-        .onClick(async () => {
-          await navigator.clipboard.writeText(inviteText);
-        }));
-  }
-
-  private addSafetyCode(containerEl: HTMLElement, requestHash: string): void {
-    new Setting(containerEl)
-      .setName("Safety code")
-      .setDesc("Approve only when this code matches on both devices.")
-      .addText((text) => {
-        text
-          .setValue(pairingSafetyCode(requestHash))
-          .setDisabled(true);
-        text.inputEl.addClass("mylonite-safety-code");
-        return text;
-      });
-  }
-
-  private addCodeInput(
-    containerEl: HTMLElement,
-    options: {
-      name: string;
-      desc?: string;
-      placeholder: string;
-      value: string;
-      buttonText: string;
-      cta?: boolean;
-      rows?: number;
-      onChange(value: string): Promise<void>;
-      onButtonClick(): Promise<void>;
-    },
-  ): void {
-    const setting = new Setting(containerEl)
-      .setName(options.name)
-      .addTextArea((text) => {
-        text
-          .setPlaceholder(options.placeholder)
-          .setValue(options.value)
-          .onChange(async (value) => {
-            await options.onChange(value);
-          });
-        text.inputEl.rows = options.rows ?? 6;
-        text.inputEl.spellcheck = false;
-        text.inputEl.addClass("mylonite-code-field");
-        return text;
-      })
-      .addButton((button) => {
-        button
-          .setButtonText(options.buttonText)
-          .onClick(async () => {
-            await options.onButtonClick();
-          });
-        if (options.cta) {
-          button.setCta();
-        }
-        return button;
-      });
-    if (options.desc) {
-      setting.setDesc(options.desc);
-    }
-    setting.settingEl.addClass("mylonite-code-setting");
   }
 }
