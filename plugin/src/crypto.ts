@@ -47,7 +47,7 @@ export async function signRequest(privateKeyHex: string, method: string, path: s
 }
 
 export function signWebSocketChallenge(privateKeyHex: string, path: string, challengeHex: string): string {
-  const payload = new TextEncoder().encode(`WS\n${path}\n${challengeHex}`);
+  const payload = textEncoder.encode(`WS\n${path}\n${challengeHex}`);
   return bytesToHex(ed25519.sign(payload, hexToBytes(privateKeyHex)));
 }
 
@@ -62,17 +62,17 @@ export function generateX25519Keypair(): X25519Keypair {
 
 export function encryptDevicePairingSecret(privateKeyHex: string, peerPublicKeyHex: string, plaintext: Uint8Array): EncryptedPayload {
   const key = pairingSecretKey(privateKeyHex, peerPublicKeyHex);
-  return encryptPayload(key, plaintext, new TextEncoder().encode("mylonite/device-pairing/v1"));
+  return encryptPayload(key, plaintext, textEncoder.encode("mylonite/device-pairing/v1"));
 }
 
 export function decryptDevicePairingSecret(privateKeyHex: string, peerPublicKeyHex: string, payload: EncryptedPayload): Uint8Array {
   const key = pairingSecretKey(privateKeyHex, peerPublicKeyHex);
-  return decryptPayload(key, payload.nonceHex, payload.ciphertextHex, new TextEncoder().encode("mylonite/device-pairing/v1"));
+  return decryptPayload(key, payload.nonceHex, payload.ciphertextHex, textEncoder.encode("mylonite/device-pairing/v1"));
 }
 
 export async function deriveVaultKeys(passphrase: string, saltHex: string): Promise<VaultKeys> {
   const salt = hexToBytes(saltHex);
-  const passphraseBytes = new TextEncoder().encode(passphrase);
+  const passphraseBytes = textEncoder.encode(passphrase);
   const masterKey = await argon2idAsync(passphraseBytes, salt, {
     t: 3,
     m: 64 * 1024,

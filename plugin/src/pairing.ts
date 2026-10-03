@@ -95,6 +95,24 @@ export function parseDevicePairingInviteInput(value: string): DevicePairingInvit
   return payload;
 }
 
+export function storedPairingInvite(value: string): DevicePairingInvitePayload | null {
+  try {
+    return value ? parseDevicePairingInviteInput(value) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function storedPairingRequest(value: string): DevicePairingRequestPayload | null {
+  try {
+    const request = JSON.parse(value) as DevicePairingRequestPayload;
+    validatePairingRequestShape(request);
+    return request;
+  } catch {
+    return null;
+  }
+}
+
 export function pairingSafetyCode(requestHash: string): string {
   if (!isHex(requestHash, 64)) {
     throw new Error("invalid request hash");
@@ -129,20 +147,16 @@ export function validateDevicePairingInvite(payload: DevicePairingInvitePayload)
 }
 
 export function validateDevicePairingRequest(payload: DevicePairingRequestPayload, inviteCode: string): void {
+  validatePairingRequestShape(payload);
   if (
-    payload.version !== 1
-    || !validInviteCode(inviteCode)
-    || !isHex(payload.request_hash, 64)
-    || !validDeviceLabel(payload.label)
-    || !isHex(payload.verifying_key, 64)
-    || !isHex(payload.x25519_public_key, 64)
+    !validInviteCode(inviteCode)
     || payload.request_hash !== devicePairingRequestHash(inviteCode, payload.label, payload.verifying_key, payload.x25519_public_key)
   ) {
     throw new Error("invalid device pairing request");
   }
 }
 
-export function validatePairingRequestShape(payload: DevicePairingRequestPayload): void {
+function validatePairingRequestShape(payload: DevicePairingRequestPayload): void {
   if (
     payload.version !== 1
     || !isHex(payload.request_hash, 64)

@@ -7,13 +7,7 @@ pub const MAX_PAYLOAD_LEN: u32 = 16 * 1024 * 1024;
 #[repr(u8)]
 pub enum ClientMsgKind {
     Hello = 1,
-    OpLogRequest = 2,
     OpPush = 3,
-    BlobPut = 4,
-    BlobGet = 5,
-    SnapshotPut = 6,
-    PairingOpen = 7,
-    PairingGrant = 8,
     Ping = 9,
 }
 
@@ -22,15 +16,8 @@ pub enum ClientMsgKind {
 pub enum ServerMsgKind {
     HelloChallenge = 1,
     HelloAck = 2,
-    OpLog = 3,
     OpBroadcast = 4,
-    BlobAck = 5,
-    Blob = 6,
-    BlobMissing = 7,
-    Snapshot = 8,
-    PairingEvent = 9,
     Pong = 10,
-    Error = 255,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

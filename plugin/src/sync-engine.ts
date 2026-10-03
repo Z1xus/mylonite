@@ -62,7 +62,6 @@ export class SyncEngine {
   private live = false;
   private registered = false;
   private notices: string[] = [];
-  private blobKeys: VaultKeys | null = null;
 
   constructor(private readonly host: SyncEngineHost) {}
 
@@ -220,7 +219,6 @@ export class SyncEngine {
     }
     await initText(loroWasm());
     const io = new ObsidianVaultIO(this.host.app);
-    this.blobKeys = await this.host.loadVaultKeys();
     const session = {
       store,
       cursor: numberOrUndefined(snapshot.meta.get("cursor")),
@@ -234,7 +232,7 @@ export class SyncEngine {
       deviceId: this.settings.deviceId,
       store,
       clientId,
-      blobId: (bytes) => this.blobId(bytes),
+      blobId: async (bytes) => blobIdOf(await this.host.loadVaultKeys(), this.settings.vaultId, bytes),
       fetchBlob: async (blobId) => this.fetchBlob(blobId),
       legacyClean: (path, content, stat) => isLegacyClean(session.hints, path, content, stat),
       legacyAncestor: (path, content) => isLegacyAncestor(session.hints, path, content),
@@ -604,13 +602,6 @@ export class SyncEngine {
     const { blobId, envelope } = await encryptBlob(keys, this.settings.vaultId, op.update);
     await client.putBlob(this.settings.vaultId, blobId, envelope);
     return toWire(op, blobId);
-  }
-
-  private blobId(bytes: Uint8Array): Promise<string> {
-    if (!this.blobKeys) {
-      throw new Error("vault keys are not loaded");
-    }
-    return blobIdOf(this.blobKeys, this.settings.vaultId, bytes);
   }
 
   private async fetchBlob(blobId: string): Promise<Uint8Array | null> {

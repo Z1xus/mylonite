@@ -3,6 +3,7 @@ import { Notice, Plugin } from "obsidian";
 import { MyloniteApiClient, PairingGrantPayload } from "./api";
 import { confirmAction } from "./confirm-modal";
 import {
+  DeviceKeypair,
   VaultKeys,
   decryptDevicePairingSecret,
   deriveVaultKeys,
@@ -11,17 +12,7 @@ import {
   generateX25519Keypair,
   randomHex,
 } from "./crypto";
-import {
-  clearDevicePrivateKey,
-  clearDevicePairingPrivateKey,
-  clearPassphrase,
-  loadDevicePairingPrivateKey,
-  loadDevicePrivateKey,
-  loadPassphrase,
-  storeDevicePairingPrivateKey,
-  storeDevicePrivateKey,
-  storePassphrase,
-} from "./secrets";
+import { loadSecret, storeSecret } from "./secrets";
 import { DEFAULT_SETTINGS, MyloniteSettings, MyloniteSettingTab } from "./settings";
 import {
   DevicePairingInvitePayload,
@@ -35,11 +26,12 @@ import {
   normalizeInviteCode,
   pairingSafetyCode,
   parseDevicePairingInviteInput,
+  storedPairingInvite,
+  storedPairingRequest,
   validateDevicePairingInvite,
   validateDevicePairingRequest,
   validateDevicePairingResponse,
   validateDevicePairingSecret,
-  validatePairingRequestShape,
 } from "./pairing";
 import { LEGACY_SETTING_KEYS, LegacyState, readLegacyState } from "./migrate";
 import { SyncEngine } from "./sync-engine";
@@ -125,15 +117,7 @@ export default class MylonitePlugin extends Plugin {
   }
 
   async saveSettings(): Promise<void> {
-    const started = performance.now();
-    try {
-      await this.saveData(this.settings);
-    } finally {
-      const elapsedMs = performance.now() - started;
-      if (elapsedMs >= 50) {
-        this.debug(`slow sync span saveData settings: ${elapsedMs.toFixed(1)}ms`);
-      }
-    }
+    await this.saveData(this.settings);
   }
 
   async pairFirstDevice(): Promise<void> {
@@ -144,10 +128,7 @@ export default class MylonitePlugin extends Plugin {
 
     this.updateStatus("pairing");
     try {
-      const existingPrivateKey = loadDevicePrivateKey(this.app, this.settings);
-      const keypair = existingPrivateKey && this.settings.devicePublicKeyHex
-        ? { privateKeyHex: existingPrivateKey, publicKeyHex: this.settings.devicePublicKeyHex }
-        : generateDeviceKeypair();
+      const keypair = this.deviceKeypair();
       const client = new MyloniteApiClient(this.settings.serverUrl);
       const response = await client.pairFirstDevice(
         this.settings.pairingToken,
@@ -161,8 +142,8 @@ export default class MylonitePlugin extends Plugin {
       this.settings.deviceId = response.device_id;
       this.settings.devicePublicKeyHex = keypair.publicKeyHex;
       this.settings.pairingToken = "";
-      storeDevicePrivateKey(this.app, this.settings, keypair.privateKeyHex);
-      storePassphrase(this.app, this.settings, randomHex(32));
+      storeSecret(this.app, this.settings, "devicePrivateKeyHex", keypair.privateKeyHex);
+      storeSecret(this.app, this.settings, "passphraseDevelopmentFallback", randomHex(32));
       this.vaultKeys = null;
       await this.saveSettings();
       this.updateStatus("paired");
@@ -187,7 +168,6 @@ export default class MylonitePlugin extends Plugin {
       this.settings.devicePairingInvite = JSON.stringify(invite);
       this.settings.devicePairingSessionId = sessionId;
       this.settings.devicePairingRequest = "";
-      this.settings.devicePairingResponse = "";
       await this.saveSettings();
       this.startPairingPolling();
       new Notice(`Device invite ready. Code ${invite.invite_code}.`);
@@ -214,10 +194,7 @@ export default class MylonitePlugin extends Plugin {
       }
     }
     try {
-      const existingPrivateKey = loadDevicePrivateKey(this.app, this.settings);
-      const deviceKeypair = existingPrivateKey && this.settings.devicePublicKeyHex
-        ? { privateKeyHex: existingPrivateKey, publicKeyHex: this.settings.devicePublicKeyHex }
-        : generateDeviceKeypair();
+      const deviceKeypair = this.deviceKeypair();
       const exchangeKeypair = generateX25519Keypair();
       const request = createDevicePairingRequestPayload(
         invite.invite_code,
@@ -236,10 +213,9 @@ export default class MylonitePlugin extends Plugin {
       this.settings.devicePairingInvite = JSON.stringify(invite);
       this.settings.devicePairingSessionId = submitted.session_id;
       this.settings.devicePairingRequest = JSON.stringify(request);
-      this.settings.devicePairingResponse = "";
       this.settings.devicePublicKeyHex = deviceKeypair.publicKeyHex;
-      storeDevicePrivateKey(this.app, this.settings, deviceKeypair.privateKeyHex);
-      storeDevicePairingPrivateKey(this.app, this.settings, exchangeKeypair.privateKeyHex);
+      storeSecret(this.app, this.settings, "devicePrivateKeyHex", deviceKeypair.privateKeyHex);
+      storeSecret(this.app, this.settings, "devicePairingPrivateKeyHex", exchangeKeypair.privateKeyHex);
       await this.saveSettings();
       this.startPairingPolling();
       new Notice(`Join request sent. Safety code ${pairingSafetyCode(request.request_hash)}.`);
@@ -312,13 +288,7 @@ export default class MylonitePlugin extends Plugin {
         ciphertext_hex: encrypted.ciphertextHex,
       };
       await client.putPairingSessionGrant(this.settings.vaultId, this.settings.devicePairingSessionId, request.request_hash, grant);
-      this.settings.devicePairingInvite = "";
-      this.settings.devicePairingSessionId = "";
-      this.settings.devicePairingRequest = "";
-      this.settings.devicePairingResponse = "";
-      await this.saveSettings();
-      this.stopPairingPolling();
-      this.refreshSettingsTab();
+      await this.endPairing();
       new Notice("Device approved. The new device will finish automatically.");
     } catch (error) {
       new Notice(`Authorization failed. Check the request and try again. ${String(error)}`);
@@ -331,20 +301,15 @@ export default class MylonitePlugin extends Plugin {
     }
   }
 
-  async completeDevicePairing(): Promise<void> {
+  private async completeDevicePairing(response: DevicePairingResponsePayload): Promise<void> {
     const request = this.currentPairingRequest();
-    const privateKeyHex = loadDevicePrivateKey(this.app, this.settings);
-    const pairingPrivateKeyHex = loadDevicePairingPrivateKey(this.app, this.settings);
+    const privateKeyHex = loadSecret(this.app, this.settings, "devicePrivateKeyHex");
+    const pairingPrivateKeyHex = loadSecret(this.app, this.settings, "devicePairingPrivateKeyHex");
     if (!request || !privateKeyHex || !this.settings.devicePublicKeyHex || !pairingPrivateKeyHex) {
       new Notice("Missing join request. Enter the invite again.");
       return;
     }
-    if (!this.settings.devicePairingResponse) {
-      new Notice("Still waiting for approval from a paired device.");
-      return;
-    }
     try {
-      const response = JSON.parse(this.settings.devicePairingResponse) as DevicePairingResponsePayload;
       validateDevicePairingResponse(response);
       const plaintext = decryptDevicePairingSecret(pairingPrivateKeyHex, response.x25519_public_key, {
         nonceHex: response.nonce_hex,
@@ -355,27 +320,26 @@ export default class MylonitePlugin extends Plugin {
       this.settings.vaultId = secret.vault_id;
       this.settings.vaultSaltHex = secret.vault_salt_hex;
       this.settings.deviceId = secret.device_id;
-      clearDevicePairingPrivateKey(this.app, this.settings);
-      this.settings.devicePairingInvite = "";
-      this.settings.devicePairingSessionId = "";
-      this.settings.devicePairingResponse = "";
-      this.settings.devicePairingRequest = "";
-      storeDevicePrivateKey(this.app, this.settings, privateKeyHex);
-      storePassphrase(this.app, this.settings, secret.passphrase);
+      storeSecret(this.app, this.settings, "devicePairingPrivateKeyHex", "");
+      storeSecret(this.app, this.settings, "devicePrivateKeyHex", privateKeyHex);
+      storeSecret(this.app, this.settings, "passphraseDevelopmentFallback", secret.passphrase);
       this.vaultKeys = null;
-      await this.saveSettings();
-      this.stopPairingPolling();
+      await this.endPairing();
       this.updateStatus("Paired");
       this.syncEngine.start();
-      this.refreshSettingsTab();
       new Notice("Device paired.");
     } catch (error) {
       new Notice(`Pairing failed. Check the approval and try again. ${String(error)}`);
     }
   }
 
-  async checkDevicePairingStatus(): Promise<void> {
-    await this.pollPairingState(true);
+  private async endPairing(): Promise<void> {
+    this.settings.devicePairingInvite = "";
+    this.settings.devicePairingSessionId = "";
+    this.settings.devicePairingRequest = "";
+    await this.saveSettings();
+    this.stopPairingPolling();
+    this.refreshSettingsTab();
   }
 
   private startPairingPolling(): void {
@@ -419,12 +383,7 @@ export default class MylonitePlugin extends Plugin {
     try {
       const session = await this.createApiClient().getPairingSession(this.settings.vaultId, this.settings.devicePairingSessionId);
       if (session.status === "expired") {
-        this.settings.devicePairingInvite = "";
-        this.settings.devicePairingSessionId = "";
-        this.settings.devicePairingRequest = "";
-        await this.saveSettings();
-        this.stopPairingPolling();
-        this.refreshSettingsTab();
+        await this.endPairing();
         if (showNotice) {
           new Notice("Invite expired. Create a new one.");
         }
@@ -437,22 +396,12 @@ export default class MylonitePlugin extends Plugin {
         return;
       }
       if (session.status === "granted") {
-        this.settings.devicePairingInvite = "";
-        this.settings.devicePairingSessionId = "";
-        this.settings.devicePairingRequest = "";
-        await this.saveSettings();
-        this.stopPairingPolling();
-        this.refreshSettingsTab();
+        await this.endPairing();
         return;
       }
       const invite = this.currentPairingInvite();
       if (!invite) {
-        this.settings.devicePairingInvite = "";
-        this.settings.devicePairingSessionId = "";
-        this.settings.devicePairingRequest = "";
-        await this.saveSettings();
-        this.stopPairingPolling();
-        this.refreshSettingsTab();
+        await this.endPairing();
         if (showNotice) {
           new Notice("Invite state is invalid. Create a new invite.");
         }
@@ -492,13 +441,8 @@ export default class MylonitePlugin extends Plugin {
       const client = new MyloniteApiClient(this.settings.serverUrl);
       const response = await client.getPairingSessionGrant(this.settings.devicePairingSessionId);
       if (response.status === "expired") {
-        clearDevicePairingPrivateKey(this.app, this.settings);
-        this.settings.devicePairingSessionId = "";
-        this.settings.devicePairingRequest = "";
-        this.settings.devicePairingResponse = "";
-        await this.saveSettings();
-        this.stopPairingPolling();
-        this.refreshSettingsTab();
+        storeSecret(this.app, this.settings, "devicePairingPrivateKeyHex", "");
+        await this.endPairing();
         new Notice("Invite expired. Enter a new one.");
         return;
       }
@@ -508,15 +452,7 @@ export default class MylonitePlugin extends Plugin {
         }
         return;
       }
-      const grant: DevicePairingResponsePayload = {
-        version: 1,
-        x25519_public_key: response.grant.x25519_public_key,
-        nonce_hex: response.grant.nonce_hex,
-        ciphertext_hex: response.grant.ciphertext_hex,
-      };
-      this.settings.devicePairingResponse = JSON.stringify(grant);
-      await this.saveSettings();
-      await this.completeDevicePairing();
+      await this.completeDevicePairing({ version: 1, ...response.grant });
     } catch (error) {
       if (showNotice) {
         new Notice(`Could not check for approval. ${String(error)}`);
@@ -527,31 +463,22 @@ export default class MylonitePlugin extends Plugin {
   }
 
   private currentPairingInvite(): DevicePairingInvitePayload | null {
-    if (!this.settings.devicePairingInvite) {
-      return null;
-    }
-    try {
-      return parseDevicePairingInviteInput(this.settings.devicePairingInvite);
-    } catch {
-      return null;
-    }
+    return storedPairingInvite(this.settings.devicePairingInvite);
   }
 
   private currentPairingRequest(): DevicePairingRequestPayload | null {
-    if (!this.settings.devicePairingRequest) {
-      return null;
-    }
-    try {
-      const request = JSON.parse(this.settings.devicePairingRequest) as DevicePairingRequestPayload;
-      validatePairingRequestShape(request);
-      return request;
-    } catch {
-      return null;
-    }
+    return storedPairingRequest(this.settings.devicePairingRequest);
+  }
+
+  private deviceKeypair(): DeviceKeypair {
+    const privateKeyHex = loadSecret(this.app, this.settings, "devicePrivateKeyHex");
+    return privateKeyHex && this.settings.devicePublicKeyHex
+      ? { privateKeyHex, publicKeyHex: this.settings.devicePublicKeyHex }
+      : generateDeviceKeypair();
   }
 
   createApiClient(): MyloniteApiClient {
-    const privateKeyHex = loadDevicePrivateKey(this.app, this.settings);
+    const privateKeyHex = loadSecret(this.app, this.settings, "devicePrivateKeyHex");
     return new MyloniteApiClient(this.settings.serverUrl, privateKeyHex && this.settings.deviceId
       ? { deviceId: this.settings.deviceId, privateKeyHex }
       : undefined);
@@ -579,20 +506,16 @@ export default class MylonitePlugin extends Plugin {
     }
     this.stopPairingPolling();
     await this.syncEngine.destroy();
-    clearDevicePrivateKey(this.app, this.settings);
-    clearDevicePairingPrivateKey(this.app, this.settings);
-    clearPassphrase(this.app, this.settings);
+    storeSecret(this.app, this.settings, "devicePrivateKeyHex", "");
+    storeSecret(this.app, this.settings, "devicePairingPrivateKeyHex", "");
+    storeSecret(this.app, this.settings, "passphraseDevelopmentFallback", "");
     this.settings.vaultId = "";
     this.settings.vaultSaltHex = "";
     this.settings.deviceId = "";
     this.settings.devicePublicKeyHex = "";
     this.settings.pairingToken = "";
-    this.settings.devicePairingInvite = "";
-    this.settings.devicePairingSessionId = "";
-    this.settings.devicePairingRequest = "";
-    this.settings.devicePairingResponse = "";
     this.vaultKeys = null;
-    await this.saveSettings();
+    await this.endPairing();
     this.updateStatus("unpaired");
     new Notice("Device unpaired.");
   }
@@ -627,10 +550,10 @@ export default class MylonitePlugin extends Plugin {
       this.settings.vaultSaltHex = randomHex(16);
       changed = true;
     }
-    let passphrase = loadPassphrase(this.app, this.settings);
+    let passphrase = loadSecret(this.app, this.settings, "passphraseDevelopmentFallback");
     if (!passphrase) {
       passphrase = randomHex(32);
-      storePassphrase(this.app, this.settings, passphrase);
+      storeSecret(this.app, this.settings, "passphraseDevelopmentFallback", passphrase);
       changed = true;
     }
     if (changed) {

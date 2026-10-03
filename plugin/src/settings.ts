@@ -7,8 +7,8 @@ import {
   devicePairingInviteText,
   devicePairingInviteUrl,
   pairingSafetyCode,
-  parseDevicePairingInviteInput,
-  validatePairingRequestShape,
+  storedPairingInvite,
+  storedPairingRequest,
 } from "./pairing";
 import { qrSvgDataUrl } from "./qr";
 
@@ -16,17 +16,14 @@ export interface MyloniteSettings {
   serverUrl: string;
   vaultId: string;
   vaultSaltHex: string;
-  passphraseStorage: "none" | "secret-storage" | "plugin-data";
   passphraseDevelopmentFallback: string;
   deviceId: string;
   devicePrivateKeyHex: string;
   devicePublicKeyHex: string;
-  devicePrivateKeyStorage: "none" | "secret-storage" | "plugin-data";
   pairingToken: string;
   devicePairingInvite: string;
   devicePairingSessionId: string;
   devicePairingRequest: string;
-  devicePairingResponse: string;
   devicePairingPrivateKeyHex: string;
   deviceLabel: string;
   debugLogging: boolean;
@@ -36,17 +33,14 @@ export const DEFAULT_SETTINGS: MyloniteSettings = {
   serverUrl: "http://127.0.0.1:9821",
   vaultId: "",
   vaultSaltHex: "",
-  passphraseStorage: "none",
   passphraseDevelopmentFallback: "",
   deviceId: "",
   devicePrivateKeyHex: "",
   devicePublicKeyHex: "",
-  devicePrivateKeyStorage: "none",
   pairingToken: "",
   devicePairingInvite: "",
   devicePairingSessionId: "",
   devicePairingRequest: "",
-  devicePairingResponse: "",
   devicePairingPrivateKeyHex: "",
   deviceLabel: "Obsidian device",
   debugLogging: false,
@@ -72,8 +66,8 @@ export class MyloniteSettingTab extends PluginSettingTab {
     const settings = this.host.settings;
     const paired = () => Boolean(settings.vaultId && settings.deviceId);
     const unpaired = () => !paired();
-    const invite = this.currentPairingInvite();
-    const request = this.currentPairingRequest();
+    const invite = storedPairingInvite(settings.devicePairingInvite);
+    const request = storedPairingRequest(settings.devicePairingRequest);
     return [
       { name: "Server URL", desc: "The address of your sync server.", control: { type: "text", key: "serverUrl" } },
       { name: "Device label", desc: "Shown in the device list.", control: { type: "text", key: "deviceLabel", placeholder: "Obsidian device" } },
@@ -230,29 +224,5 @@ export class MyloniteSettingTab extends PluginSettingTab {
       .setName("Invite code")
       .setDesc("Use this with the server URL if the link does not open.")
       .addButton((button) => button.setButtonText("Copy").onClick(() => navigator.clipboard.writeText(devicePairingInviteText(invite))));
-  }
-
-  private currentPairingInvite(): DevicePairingInvitePayload | null {
-    if (!this.host.settings.devicePairingInvite) {
-      return null;
-    }
-    try {
-      return parseDevicePairingInviteInput(this.host.settings.devicePairingInvite);
-    } catch {
-      return null;
-    }
-  }
-
-  private currentPairingRequest(): DevicePairingRequestPayload | null {
-    if (!this.host.settings.devicePairingRequest) {
-      return null;
-    }
-    try {
-      const request = JSON.parse(this.host.settings.devicePairingRequest) as DevicePairingRequestPayload;
-      validatePairingRequestShape(request);
-      return request;
-    } catch {
-      return null;
-    }
   }
 }
