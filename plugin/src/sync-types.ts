@@ -17,10 +17,10 @@ export interface FileRecord {
 }
 
 export type SyncOp =
-  | { v: 3; t: "text"; id: string; path?: string; hash?: string; update: Uint8Array }
-  | { v: 3; t: "blob"; id: string; path?: string; blob?: string; size?: number }
-  | { v: 3; t: "move"; id: string; path: string }
-  | { v: 3; t: "delete"; id: string };
+  | { v: 4; t: "text"; id: string; path?: string; hash?: string; update: Uint8Array }
+  | { v: 4; t: "blob"; id: string; path?: string; blob?: string; size?: number }
+  | { v: 4; t: "move"; id: string; path: string }
+  | { v: 4; t: "delete"; id: string };
 
 export interface OutboxEntry {
   key: number;

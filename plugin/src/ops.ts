@@ -2,7 +2,7 @@ import { randomHex } from "./crypto";
 import { SyncOp } from "./sync-types";
 import { isValidVaultPath } from "./vault-io";
 
-export type TextRefOp = { v: 3; t: "text"; id: string; path?: string; hash?: string; ref: string };
+export type TextRefOp = { v: 4; t: "text"; id: string; path?: string; hash?: string; ref: string };
 export type RemoteOp = SyncOp | TextRefOp;
 
 export function newFileId(): string {
@@ -22,7 +22,7 @@ export function toWire(op: SyncOp, ref?: string): Record<string, unknown> {
 }
 
 export function parseWire(value: unknown): RemoteOp | null {
-  if (!isRecord(value) || value.v !== 3 || !isFileId(value.id)) {
+  if (!isRecord(value) || value.v !== 4 || !isFileId(value.id)) {
     return null;
   }
   const id = value.id;
@@ -36,7 +36,7 @@ export function parseWire(value: unknown): RemoteOp | null {
       if (path !== undefined && !isHex(hash, 32)) {
         return null;
       }
-      const base = { v: 3, t: "text", id, ...(path === undefined ? {} : { path, hash: hash as string }) } as const;
+      const base = { v: 4, t: "text", id, ...(path === undefined ? {} : { path, hash: hash as string }) } as const;
       if (typeof value.u === "string") {
         const update = fromBase64(value.u);
         return update ? { ...base, update } : null;
@@ -47,11 +47,11 @@ export function parseWire(value: unknown): RemoteOp | null {
       if (!isHex(value.blob, 64) || !isSize(value.size)) {
         return null;
       }
-      return { v: 3, t: "blob", id, blob: value.blob, size: value.size, ...(path === undefined ? {} : { path }) };
+      return { v: 4, t: "blob", id, blob: value.blob, size: value.size, ...(path === undefined ? {} : { path }) };
     case "move":
-      return path === undefined ? null : { v: 3, t: "move", id, path };
+      return path === undefined ? null : { v: 4, t: "move", id, path };
     case "delete":
-      return { v: 3, t: "delete", id };
+      return { v: 4, t: "delete", id };
     default:
       return null;
   }

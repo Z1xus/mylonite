@@ -1,62 +1,53 @@
 import { blake3 } from "@noble/hashes/blake3.js";
-import { simpleDiffString } from "lib0/diff";
-import { diffAuto } from "lib0/diff/patience";
-import * as Y from "yjs";
+import { LoroDoc } from "loro-crdt/web";
+import init from "loro-crdt/web/loro_wasm.js";
 
 import { bytesToHex } from "./crypto";
 
+export type TextDoc = LoroDoc;
+
 const TEXT_KEY = "t";
+const LINE_DIFF_CHARS = 64 * 1024;
 const encoder = new TextEncoder();
 
-export function openDoc(clientId: number, state?: Uint8Array): Y.Doc {
-  const doc = new Y.Doc();
+export async function initText(wasm: BufferSource | WebAssembly.Module): Promise<void> {
+  await init({ module_or_path: wasm });
+}
+
+export function openDoc(peerId: number, state?: Uint8Array): TextDoc {
+  const doc = new LoroDoc();
   if (state) {
-    Y.applyUpdate(doc, state);
+    doc.import(state);
   }
-  doc.clientID = clientId;
+  doc.setPeerId(peerId);
   return doc;
 }
 
-export function textOf(doc: Y.Doc): string {
+export function textOf(doc: TextDoc): string {
   return doc.getText(TEXT_KEY).toString();
 }
 
-export function encodeDoc(doc: Y.Doc): Uint8Array {
-  return Y.encodeStateAsUpdate(doc);
+export function encodeDoc(doc: TextDoc): Uint8Array {
+  return doc.export({ mode: "snapshot" });
 }
 
-export function applyUpdate(doc: Y.Doc, update: Uint8Array): void {
-  Y.applyUpdate(doc, update);
+export function applyUpdate(doc: TextDoc, update: Uint8Array): void {
+  doc.import(update);
 }
 
-export function mergeUpdates(updates: Uint8Array[]): Uint8Array {
-  return Y.mergeUpdates(updates);
-}
-
-export function setText(doc: Y.Doc, next: string): Uint8Array | null {
+export function setText(doc: TextDoc, next: string): Uint8Array | null {
   const text = doc.getText(TEXT_KEY);
-  const previous = text.toString();
-  if (previous === next) {
+  if (text.toString() === next) {
     return null;
   }
-  const before = Y.encodeStateVector(doc);
-  doc.transact(() => {
-    for (const change of diffAuto(previous, next).reverse()) {
-      if (change.remove.length > 0) {
-        text.delete(change.index, change.remove.length);
-      }
-      if (change.insert.length > 0) {
-        text.insert(change.index, change.insert);
-      }
-    }
-    const current = text.toString();
-    if (current !== next) {
-      const fix = simpleDiffString(current, next);
-      text.delete(fix.index, fix.remove);
-      text.insert(fix.index, fix.insert);
-    }
-  });
-  return Y.encodeStateAsUpdate(doc, before);
+  const before = doc.oplogVersion();
+  if (next.length > LINE_DIFF_CHARS) {
+    text.updateByLine(next);
+  } else {
+    text.update(next);
+  }
+  doc.commit();
+  return doc.export({ mode: "update", from: before });
 }
 
 export function hashText(value: string): string {

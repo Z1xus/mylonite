@@ -11,7 +11,9 @@ import { LiveSocket } from "./socket";
 import { SyncStore, deleteIdbStore, openIdbStore } from "./store";
 import { blobIdOf, decryptBlob, decryptOp, decryptSnapshot, encryptBlob, encryptOp, encryptSnapshot } from "./sync-codec";
 import { LegacyHint, OutboxEntry, SyncOp } from "./sync-types";
+import { initText } from "./text";
 import { ObsidianVaultIO } from "./vault-io";
+import { loroWasm } from "./wasm";
 
 const PAGE_SIZE = 512;
 const YIELD_EVERY = 32;
@@ -137,7 +139,7 @@ export class SyncEngine {
         state: state ? toBase64(state) : undefined,
       }));
       const snapshotId = randomHex(16);
-      const encrypted = encryptSnapshot(keys, this.settings.vaultId, snapshotId, session.cursor, { version: 3, files });
+      const encrypted = encryptSnapshot(keys, this.settings.vaultId, snapshotId, session.cursor, { version: 4, files });
       await this.host.createApiClient().putSnapshot(this.settings.vaultId, {
         snapshot_id: snapshotId,
         device_id: this.settings.deviceId,
@@ -209,6 +211,7 @@ export class SyncEngine {
     while (typeof clientId !== "number" || clientId === 0) {
       clientId = crypto.getRandomValues(new Uint32Array(1))[0];
     }
+    await initText(await loroWasm());
     const io = new ObsidianVaultIO(this.host.app);
     this.blobKeys = await this.host.loadVaultKeys();
     const session = {
@@ -260,7 +263,7 @@ export class SyncEngine {
   }
 
   private storeName(): string | null {
-    return this.paired ? `mylonite-${this.settings.vaultId}-${this.settings.deviceId}` : null;
+    return this.paired ? `mylonite4-${this.settings.vaultId}-${this.settings.deviceId}` : null;
   }
 
   private requireSession(): Session {
@@ -366,7 +369,7 @@ export class SyncEngine {
   private async applySnapshot(session: Session, snapshot: { snapshot_id: string; covers_through_seq: number; nonce_hex: string; ciphertext_hex: string }): Promise<boolean> {
     const keys = await this.host.loadVaultKeys();
     const payload = decryptSnapshot(keys, this.settings.vaultId, snapshot.snapshot_id, snapshot.covers_through_seq, snapshot.nonce_hex, snapshot.ciphertext_hex) as { version?: unknown; files?: unknown };
-    if (payload.version !== 3 || !Array.isArray(payload.files)) {
+    if (payload.version !== 4 || !Array.isArray(payload.files)) {
       return false;
     }
     for (const [index, file] of (payload.files as Array<Record<string, unknown>>).entries()) {
@@ -374,8 +377,8 @@ export class SyncEngine {
         await idle();
       }
       const wire = file.kind === "text"
-        ? { v: 3, t: "text", id: file.id, path: file.path, hash: file.init, u: file.state }
-        : { v: 3, t: "blob", id: file.id, path: file.path, blob: file.hash, size: file.size };
+        ? { v: 4, t: "text", id: file.id, path: file.path, hash: file.init, u: file.state }
+        : { v: 4, t: "blob", id: file.id, path: file.path, blob: file.hash, size: file.size };
       const op = parseWire(wire);
       if (op && !("ref" in op)) {
         await session.replica.apply(op, "", typeof file.device === "string" ? file.device : "");

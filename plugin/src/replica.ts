@@ -1,10 +1,8 @@
-import * as Y from "yjs";
-
 import { idle } from "./idle";
 import { newFileId, newOpId } from "./ops";
 import { StoreTx, SyncStore } from "./store";
 import { FileKind, FileRecord, OutboxEntry, SyncOp } from "./sync-types";
-import { applyUpdate, encodeDoc, hashText, mergeUpdates, openDoc, setText, textOf } from "./text";
+import { TextDoc, applyUpdate, encodeDoc, hashText, openDoc, setText, textOf } from "./text";
 import { FileStat, VaultIO, conflictPath, kindOf } from "./vault-io";
 
 const DOC_CACHE_SIZE = 32;
@@ -28,7 +26,7 @@ export class Replica {
   private readonly files = new Map<string, FileRecord>();
   private readonly byPath = new Map<string, string>();
   private readonly byCpath = new Map<string, string>();
-  private readonly docs = new Map<string, Y.Doc>();
+  private readonly docs = new Map<string, TextDoc>();
   private nextKey: number;
   private tx = new StoreTx();
 
@@ -107,7 +105,7 @@ export class Replica {
       this.cacheDoc(id, doc);
       this.saveDoc(id, doc);
       this.put({ id, path, kind, hash, size: stat.size, mtime: stat.mtime, pendingInitHash: hash });
-      this.enqueue({ v: 3, t: "text", id, path, hash, update: encodeDoc(doc) });
+      this.enqueue({ v: 4, t: "text", id, path, hash, update: encodeDoc(doc) });
       return;
     }
     const doc = await this.doc(record.id);
@@ -122,7 +120,7 @@ export class Replica {
     const record = this.recordAt(from);
     if (record && !this.recordAt(to) && kindOf(to) === record.kind && this.deps.io.stat(to)) {
       this.put({ ...record, path: to });
-      this.enqueue({ v: 3, t: "move", id: record.id, path: to });
+      this.enqueue({ v: 4, t: "move", id: record.id, path: to });
       await this.scan(to);
       return;
     }
@@ -168,7 +166,7 @@ export class Replica {
       const record = matches[0];
       missing.splice(missing.indexOf(record), 1);
       this.put({ ...record, path: stat.path });
-      this.enqueue({ v: 3, t: "move", id: record.id, path: stat.path });
+      this.enqueue({ v: 4, t: "move", id: record.id, path: stat.path });
     }
   }
 
@@ -176,12 +174,12 @@ export class Replica {
     if (!record) {
       const id = newFileId();
       this.put({ id, path: stat.path, kind: "blob", hash: "", size: stat.size, mtime: stat.mtime });
-      this.enqueue({ v: 3, t: "blob", id, path: stat.path });
+      this.enqueue({ v: 4, t: "blob", id, path: stat.path });
       return;
     }
     this.put({ ...record, size: stat.size, mtime: stat.mtime });
     if (!this.outbox.some((entry) => entry.op.id === record.id && entry.op.t === "blob" && entry.op.blob === undefined)) {
-      this.enqueue({ v: 3, t: "blob", id: record.id });
+      this.enqueue({ v: 4, t: "blob", id: record.id });
     }
   }
 
@@ -319,7 +317,7 @@ export class Replica {
     await this.writeAhead({ ...record, ahead: true }, doc, disk ?? before);
   }
 
-  private async writeAhead(record: FileRecord, doc: Y.Doc, expected: string): Promise<void> {
+  private async writeAhead(record: FileRecord, doc: TextDoc, expected: string): Promise<void> {
     const text = textOf(doc);
     const written = await this.deps.io.processText(record.path, (current) => (current === expected || hashText(current) === record.hash ? text : current));
     if (written !== text) {
@@ -330,7 +328,7 @@ export class Replica {
     this.put({ ...record, ahead: false, hash: hashText(text), ...this.statOf(record.path) });
   }
 
-  private ingest(record: FileRecord, doc: Y.Doc, content: string, stat: FileStat): FileRecord {
+  private ingest(record: FileRecord, doc: TextDoc, content: string, stat: FileStat): FileRecord {
     const update = setText(doc, content);
     if (update) {
       this.saveDoc(record.id, doc);
@@ -635,7 +633,7 @@ export class Replica {
     if (record) {
       this.put({ ...record, deleted: true, path: "", ahead: false });
     }
-    this.enqueue({ v: 3, t: "delete", id });
+    this.enqueue({ v: 4, t: "delete", id });
   }
 
   private remove(id: string): void {
@@ -644,13 +642,14 @@ export class Replica {
       this.unindex(record);
     }
     this.files.delete(id);
+    this.docs.get(id)?.free();
     this.docs.delete(id);
     this.tx.files.set(id, null);
     this.tx.docs.set(id, null);
     this.removeEntries((entry) => entry.op.id === id);
   }
 
-  private async doc(id: string): Promise<Y.Doc> {
+  private async doc(id: string): Promise<TextDoc> {
     const cached = this.docs.get(id);
     if (cached) {
       this.docs.delete(id);
@@ -664,18 +663,18 @@ export class Replica {
     return doc;
   }
 
-  private cacheDoc(id: string, doc: Y.Doc): void {
+  private cacheDoc(id: string, doc: TextDoc): void {
     this.docs.set(id, doc);
     for (const [oldest, oldDoc] of this.docs) {
       if (this.docs.size <= DOC_CACHE_SIZE) {
         break;
       }
       this.docs.delete(oldest);
-      oldDoc.destroy();
+      oldDoc.free();
     }
   }
 
-  private saveDoc(id: string, doc: Y.Doc): void {
+  private saveDoc(id: string, doc: TextDoc): void {
     this.tx.docs.set(id, encodeDoc(doc));
   }
 
@@ -687,17 +686,7 @@ export class Replica {
   }
 
   private enqueueText(id: string, update: Uint8Array): void {
-    let last: OutboxEntry | undefined;
-    for (const entry of this.outbox) {
-      if (entry.op.id === id) {
-        last = entry;
-      }
-    }
-    if (last && last.op.t === "text" && last.op.path === undefined) {
-      this.replaceEntry({ key: last.key, opId: newOpId(), op: { ...last.op, update: mergeUpdates([last.op.update, update]) } });
-      return;
-    }
-    this.enqueue({ v: 3, t: "text", id, update });
+    this.enqueue({ v: 4, t: "text", id, update });
   }
 
   private removeEntries(match: (entry: OutboxEntry) => boolean): void {
