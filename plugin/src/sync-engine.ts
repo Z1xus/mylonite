@@ -206,8 +206,8 @@ export class SyncEngine {
     const store = await openIdbStore(name);
     const snapshot = await store.load();
     let clientId = snapshot.meta.get("clientId");
-    if (typeof clientId !== "number") {
-      clientId = (crypto.getRandomValues(new Uint32Array(1))[0] % 0x7fffffff) + 1;
+    while (typeof clientId !== "number" || clientId === 0) {
+      clientId = crypto.getRandomValues(new Uint32Array(1))[0];
     }
     const io = new ObsidianVaultIO(this.host.app);
     this.blobKeys = await this.host.loadVaultKeys();
