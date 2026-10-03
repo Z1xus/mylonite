@@ -180,8 +180,8 @@ Run checks:
 
 ```bash
 cargo fmt --all --check
-cargo clippy -p mylonite --all-targets -- -D warnings
-cargo test -p mylonite
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 cd plugin
 bun run test
 bun run build
